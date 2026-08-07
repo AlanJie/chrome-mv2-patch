@@ -49,3 +49,15 @@ Or test with the classic MV2 build of [uBlock Origin](https://chromewebstore.goo
 ## Porting to a new Chrome version
 
 The patcher relocates automatically across point releases (the signature scan finds a shifted `jg`). A milestone bump can change codegen so the signatures stop matching — the patcher then declines, prints structural candidates, and writes nothing. Re-deriving the seven signatures is a bounded job; the full checklist is in [`mv2-reversing.md`](mv2-reversing.md) §5.
+
+## Donate
+
+If this tool saved you some grief, a tip is appreciated and keeps it maintained across Chrome updates.
+
+- **USDT (TRC20):** TDAr6Lu2sYtArJYAgUpyfuk6rKNvvyMA87
+- **USDC (Base):** 0x762712dcC8e3E757Cf3FC077AeF0b4EDa8692b7B
+- [Boosty](https://boosty.to/sketchystan1)
+
+## License
+
+Released under the [MIT License](LICENSE).
