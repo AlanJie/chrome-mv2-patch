@@ -93,49 +93,115 @@ def parse_rsds(data: bytes, offset: int):
     return pdb_name, f"{guid_str}{age_str}"
 
 
-def find_chrome_dll() -> Path | None:
-    """Locate a Chrome installation and return the first chrome.dll found."""
-    search_roots = []
+def version_key(name: str):
+    """Sort key for a Chrome version directory ("151.0.7922.109" -> (151,0,7922,109))."""
+    parts = []
+    for piece in name.split("."):
+        try:
+            parts.append(int(piece))
+        except ValueError:
+            parts.append(0)
+    return tuple(parts)
 
-    program_files = os.environ.get("ProgramFiles")
-    if program_files:
-        search_roots.append(Path(program_files) / "Google" / "Chrome" / "Application")
 
-    program_files_x86 = os.environ.get("ProgramFiles(x86)")
-    if program_files_x86:
-        search_roots.append(Path(program_files_x86) / "Google" / "Chrome" / "Application")
+# Channel display name -> install directory, relative to an install root. Every
+# channel ships its own chrome.dll with its own build ID, so the PDB that matches
+# one will not match another.
+CHANNELS = [
+    ("Stable", Path("Google") / "Chrome"),
+    ("Beta", Path("Google") / "Chrome Beta"),
+    ("Dev", Path("Google") / "Chrome Dev"),
+    ("Canary", Path("Google") / "Chrome SxS"),
+]
 
-    search_roots.extend(
-        [
-            Path(r"C:\Program Files\Google\Chrome\Application"),
-            Path(r"C:\Program Files (x86)\Google\Chrome\Application"),
-        ]
-    )
 
-    for root in search_roots:
-        if not root.exists():
-            continue
+def install_roots() -> list[Path]:
+    """64-bit installs land in Program Files, 32-bit in (x86), user-scope
+    installs (always the case for Canary) in Local AppData."""
+    roots = []
+    for var, fallback in (
+        ("ProgramFiles", r"C:\Program Files"),
+        ("ProgramFiles(x86)", r"C:\Program Files (x86)"),
+        ("LOCALAPPDATA", None),
+    ):
+        value = os.environ.get(var) or fallback
+        if value:
+            roots.append(Path(value))
+    return roots
 
+
+def newest_dll_under(app_dir: Path) -> Path | None:
+    """Newest versioned chrome.dll under an Application directory, or one
+    sitting directly in it."""
+    if app_dir.is_dir():
         version_dirs = sorted(
-            [p for p in root.iterdir() if p.is_dir() and (p / "chrome.dll").is_file()],
-            key=lambda p: p.name,
+            (p for p in app_dir.iterdir() if p.is_dir() and (p / "chrome.dll").is_file()),
+            key=lambda p: version_key(p.name),
             reverse=True,
         )
         if version_dirs:
             return version_dirs[0] / "chrome.dll"
 
-        for dll_path in root.rglob("chrome.dll"):
-            if dll_path.is_file():
-                return dll_path
-
-    return None
+    direct = app_dir / "chrome.dll"
+    return direct if direct.is_file() else None
 
 
-def download_pdb(dll_path: str, output_dir: str = "."):
+def find_chrome_installs() -> list[tuple[str, Path]]:
+    """Every installed channel, as (channel name, chrome.dll path)."""
+    found: list[tuple[str, Path]] = []
+    seen: set[str] = set()
+
+    for channel, subdir in CHANNELS:
+        for root in install_roots():
+            dll = newest_dll_under(root / subdir / "Application")
+            if dll is None:
+                continue
+            key = str(dll).lower()
+            if key in seen:
+                continue
+            seen.add(key)
+            found.append((channel, dll))
+
+    return found
+
+
+def choose_install(installs: list[tuple[str, Path]]) -> Path | None:
+    """Ask which channel's chrome.dll to fetch symbols for. Returns None if the
+    user quits or stdin is not a terminal."""
+    if len(installs) == 1:
+        channel, dll = installs[0]
+        print(f"Found one Chrome channel: {channel}  {dll.parent.name}")
+        print(f"  {dll}")
+        return dll
+
+    print(f"\n{len(installs)} Chrome release channels found:")
+    for i, (channel, dll) in enumerate(installs, 1):
+        print(f"  {i}) {channel:<7} {dll.parent.name}")
+        print(f"      {dll}")
+
+    if not sys.stdin.isatty():
+        print("\nstdin is not a terminal; pass the chrome.dll path explicitly.")
+        return None
+
+    while True:
+        try:
+            answer = input(f"\nWhich channel's symbols do you want? [1-{len(installs)}, q to quit]: ")
+        except EOFError:
+            return None
+
+        answer = answer.strip()
+        if answer.lower() == "q":
+            return None
+        if answer.isdigit() and 1 <= int(answer) <= len(installs):
+            return installs[int(answer) - 1][1]
+        print(f"Enter a number between 1 and {len(installs)}, or q to quit.")
+
+
+def download_pdb(dll_path: str, output_dir: str = ".") -> bool:
     dll_path = Path(dll_path)
     if not dll_path.is_file():
         print(f"Error: {dll_path} does not exist.")
-        return
+        return False
 
     print(f"Extracting debug info from {dll_path.name}...")
     pdb_name, symbol_key = get_cv_info(str(dll_path))
@@ -162,19 +228,40 @@ def download_pdb(dll_path: str, output_dir: str = "."):
     try:
         urllib.request.urlretrieve(url, out_path, reporthook=progress)
         print(f"\nSaved PDB to: {out_path.resolve()}")
+        return True
     except urllib.error.HTTPError as e:
         print(f"\nFailed to download symbol file (HTTP {e.code}). Symbol might not be indexed.")
+        return False
+
+
+def main() -> int:
+    args = [a for a in sys.argv[1:]]
+
+    if any(a in ("-h", "--help", "/?") for a in args):
+        print(
+            "Usage: fetch-chrome-pdb.py [path\\to\\chrome.dll]\n"
+            "\n"
+            "Downloads the chrome.dll PDB matching a local Chrome install from the\n"
+            "Chromium symbol server. With no path, every installed release channel\n"
+            "(Stable/Beta/Dev/Canary) is listed so you can pick one.\n"
+        )
+        return 0
+
+    paths = [a for a in args if not a.startswith("-")]
+    if paths:
+        chrome_dll_path = Path(paths[0])
+    else:
+        installs = find_chrome_installs()
+        if not installs:
+            print("Could not find a Chrome installation with chrome.dll. Pass the DLL path explicitly.")
+            return 1
+        chrome_dll_path = choose_install(installs)
+        if chrome_dll_path is None:
+            print("No channel selected.")
+            return 0
+
+    return 0 if download_pdb(str(chrome_dll_path)) else 1
 
 
 if __name__ == "__main__":
-    chrome_dll_path = None
-    if len(sys.argv) > 1:
-        chrome_dll_path = Path(sys.argv[1])
-    else:
-        chrome_dll_path = find_chrome_dll()
-
-    if chrome_dll_path is None:
-        print("Could not find a Chrome installation with chrome.dll. Pass the DLL path explicitly.")
-        sys.exit(1)
-
-    download_pdb(str(chrome_dll_path))
+    sys.exit(main())

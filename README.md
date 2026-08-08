@@ -25,16 +25,45 @@ releases. See [`CHANGELOG.md`](CHANGELOG.md) for release notes.
 
 ## Usage
 
-Close Chrome, then run (a UAC prompt appears; the patcher also force-terminates leftover `chrome.exe` processes that hold the profile lock):
+Just run it (a UAC prompt appears). Every installed release channel is detected and
+listed, and you pick the one to patch:
+
+```
+[*] 3 Chrome release channels found:
+  1) Stable  151.0.7922.109  [not running] (backup present)
+      C:\Program Files\Google\Chrome\Application\151.0.7922.109\chrome.dll
+  2) Beta    152.0.7962.4    [RUNNING, 12 process(es)]
+      C:\Program Files\Google\Chrome Beta\Application\152.0.7962.4\chrome.dll
+  3) Canary  153.0.7997.0    [RUNNING, 8 process(es)]
+      C:\Users\me\AppData\Local\Google\Chrome SxS\Application\153.0.7997.0\chrome.dll
+
+[*] Only the channel you pick is modified; the others keep running.
+
+Which channel do you want to patch? [1-3, q to quit]:
+```
+
+Closing Chrome first is the clean path. If the channel you picked is still running you
+get an explicit warning and a `[y/N]` prompt before anything happens — continuing
+**force closes** it and unsaved tabs are lost. Only the processes holding *that*
+`chrome.dll` are closed, via the Restart Manager. Stable, Beta, Dev, and Canary each
+have their own `chrome.dll`, so patching one never disturbs the others.
 
 ```cmd
-.\chrome-mv2-patch.exe                          # patch the newest installed Chrome
-.\chrome-mv2-patch.exe "C:\Path\To\chrome.dll"  # custom path
+.\chrome-mv2-patch.exe                          # list channels and pick one
+.\chrome-mv2-patch.exe "C:\Path\To\chrome.dll"  # target a channel directly
 .\chrome-mv2-patch.exe --restore                # revert from chrome.dll.bak
+.\chrome-mv2-patch.exe --yes                    # force close without asking
 .\chrome-mv2-patch.exe --quiet                  # no final pause (scripting/CI)
 .\chrome-mv2-patch.exe --version                # print version, no elevation
 .\chrome-mv2-patch.exe --help                   # usage, no elevation
 ```
+
+Output is coloured on a VT-capable console and degrades to plain text automatically
+when redirected to a file or pipe. Set `NO_COLOR` to disable it; `FORCE_COLOR` keeps
+it on through a pipe.
+
+`--quiet` cannot prompt, so with more than one channel installed it needs an explicit
+path, and it refuses to force close a running Chrome unless `--yes` is also given.
 
 Flags may be combined. `chrome.dll.bak` is created/refreshed automatically. After writing, every site is re-read and byte-checked, the Security directory is stripped, and the PE `CheckSum` is recalculated.
 

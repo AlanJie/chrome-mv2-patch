@@ -1,9 +1,32 @@
 @echo off
-setlocal enabledelayedexpansion
+REM Delayed expansion is deliberately NOT enabled: it eats the "!" in the [!]
+REM tag, and every escape that survives a `set` was worse than the alternative.
+REM `if errorlevel 1` reads the code at run time, so nothing here needs it.
+setlocal
 
-echo ===================================================
-echo   Building Chrome Manifest V2 Patcher (chrome-mv2-patch.exe)
-echo ===================================================
+REM Console colour. The ESC byte comes from `prompt $E`; if that fails or NO_COLOR
+REM is set, every code stays empty and the output is the plain text as before.
+REM Batch cannot detect a redirected stdout, so NO_COLOR is the way to silence it.
+set "ESC="
+if not defined NO_COLOR for /f %%E in ('echo prompt $E^| cmd') do set "ESC=%%E"
+
+set "C_RST=" & set "C_RED=" & set "C_GRN=" & set "C_YEL=" & set "C_CYN=" & set "C_DIM=" & set "C_BLD="
+if defined ESC (
+    set "C_RST=%ESC%[0m"  & set "C_RED=%ESC%[91m" & set "C_GRN=%ESC%[92m"
+    set "C_YEL=%ESC%[93m" & set "C_CYN=%ESC%[96m" & set "C_DIM=%ESC%[90m"
+    set "C_BLD=%ESC%[1m"
+)
+
+set "T_OK=%C_GRN%[+]%C_RST%"
+set "T_ERR=%C_RED%[-]%C_RST%"
+set "T_INFO=%C_CYN%[*]%C_RST%"
+set "T_WARN=%C_YEL%[!]%C_RST%"
+set "T_FAIL=%C_BLD%%C_RED%[ERROR]%C_RST%"
+set "T_DONE=%C_BLD%%C_GRN%[SUCCESS]%C_RST%"
+
+echo %C_CYN%===================================================%C_RST%
+echo         %C_BLD%Building Chrome Manifest V2 Patcher%C_RST%
+echo %C_CYN%===================================================%C_RST%
 
 REM 0. Read the version from chrome-mv2-patch.cpp (single source of truth).
 set "VMAJ=0"
@@ -15,7 +38,7 @@ for /f "tokens=3" %%i in ('findstr /b /c:"#define APP_VER_MINOR" chrome-mv2-patc
 for /f "tokens=3" %%i in ('findstr /b /c:"#define APP_VER_PATCH" chrome-mv2-patch.cpp') do set "VPAT=%%i"
 for /f "tokens=3" %%i in ('findstr /b /c:"#define APP_VER_BUILD" chrome-mv2-patch.cpp') do set "VBLD=%%i"
 set "APP_VER=%VMAJ%.%VMIN%.%VPAT%"
-echo [*] Patcher version: %APP_VER%
+echo %T_INFO% Patcher version: %C_BLD%%APP_VER%%C_RST%
 
 REM 1. Locate Visual Studio vcvars64.bat (auto-detect any edition/version)
 set "VS_PATH="
@@ -43,15 +66,15 @@ if not defined VS_PATH (
 )
 
 if defined VS_PATH (
-    echo [*] Found Visual Studio vcvars64 at: "%VS_PATH%"
+    echo %T_INFO% Found Visual Studio vcvars64 at: %C_DIM%"%VS_PATH%"%C_RST%
     call "%VS_PATH%" >nul
 ) else (
-    echo [!] vcvars64.bat not found automatically. Checking if cl.exe is in PATH...
+    echo %T_WARN% vcvars64.bat not found automatically. Checking if cl.exe is in PATH...
 )
 
 where cl.exe >nul 2>&1
-if %ERRORLEVEL% NEQ 0 (
-    echo [ERROR] Could not find cl.exe. Please run build.bat from Visual Studio Developer Command Prompt.
+if errorlevel 1 (
+    echo %T_FAIL% Could not find cl.exe. Please run build.bat from Visual Studio Developer Command Prompt.
     exit /b 1
 )
 
@@ -63,8 +86,10 @@ REM    build without the resource rather than failing the whole build.
 set "RES_FILE="
 set "RC_TMP=chrome-mv2-patch.rc"
 where rc.exe >nul 2>&1
-if %ERRORLEVEL% EQU 0 (
-    echo [*] Generating and compiling version resource...
+if errorlevel 1 (
+    echo %T_WARN% rc.exe not found; building without embedded version resource.
+) else (
+    echo %T_INFO% Generating and compiling version resource...
     (
         echo #include ^<winver.h^>
         echo VS_VERSION_INFO VERSIONINFO
@@ -96,48 +121,46 @@ if %ERRORLEVEL% EQU 0 (
         echo END
     ) > "%RC_TMP%"
     rc.exe /nologo /fo chrome-mv2-patch.res "%RC_TMP%"
-    if !ERRORLEVEL! EQU 0 (
-        set "RES_FILE=chrome-mv2-patch.res"
+    if errorlevel 1 (
+        echo %T_WARN% rc.exe failed; building without embedded version resource.
     ) else (
-        echo [!] rc.exe failed; building without embedded version resource.
+        set "RES_FILE=chrome-mv2-patch.res"
     )
     del /q "%RC_TMP%" 2>nul
-) else (
-    echo [!] rc.exe not found; building without embedded version resource.
 )
 
 REM 3. Compile chrome-mv2-patch.exe (Standalone chrome.dll Binary Patcher)
-echo [*] Compiling chrome-mv2-patch.exe (x64)...
-cl.exe /O2 /EHsc /std:c++17 /W3 /D_CRT_SECURE_NO_WARNINGS chrome-mv2-patch.cpp !RES_FILE! /link /OUT:chrome-mv2-patch.exe /MANIFEST /MANIFESTUAC:"level='requireAdministrator' uiAccess='false'" /MANIFEST:EMBED shell32.lib user32.lib advapi32.lib version.lib
+echo %T_INFO% Compiling chrome-mv2-patch.exe (x64)...
+cl.exe /O2 /EHsc /std:c++17 /W3 /D_CRT_SECURE_NO_WARNINGS chrome-mv2-patch.cpp %RES_FILE% /link /OUT:chrome-mv2-patch.exe /MANIFEST /MANIFESTUAC:"level='requireAdministrator' uiAccess='false'" /MANIFEST:EMBED shell32.lib user32.lib advapi32.lib version.lib rstrtmgr.lib
 
-if %ERRORLEVEL% NEQ 0 (
-    echo [ERROR] chrome-mv2-patch.exe compilation failed.
+if errorlevel 1 (
+    echo %T_FAIL% chrome-mv2-patch.exe compilation failed.
     del /q chrome-mv2-patch.obj 2>nul
     del /q chrome-mv2-patch.res 2>nul
     exit /b 1
 )
 
-echo [+] Compilation succeeded: chrome-mv2-patch.exe
+echo %T_OK% Compilation succeeded: %C_BLD%chrome-mv2-patch.exe%C_RST%
 
 REM 4. Clean up intermediate build artifacts
-echo [*] Cleaning up intermediate build artifacts...
+echo %T_INFO% Cleaning up intermediate build artifacts...
 del /q chrome-mv2-patch.obj 2>nul
 del /q chrome-mv2-patch.res 2>nul
 
 REM 5. Package the versioned release zip (exe only) for GitHub releases.
 set "ZIP_NAME=chrome-mv2-patch-v%APP_VER%.zip"
-echo [*] Packaging release archive %ZIP_NAME%...
+echo %T_INFO% Packaging release archive %ZIP_NAME%...
 del /q "%ZIP_NAME%" 2>nul
 powershell -NoProfile -ExecutionPolicy Bypass -Command "Compress-Archive -Path 'chrome-mv2-patch.exe' -DestinationPath '%ZIP_NAME%' -Force"
-if %ERRORLEVEL% NEQ 0 (
-    echo [!] Failed to create %ZIP_NAME%. The exe built fine; is PowerShell available?
+if errorlevel 1 (
+    echo %T_WARN% Failed to create %ZIP_NAME%. The exe built fine; is PowerShell available?
 ) else (
-    echo [+] Release archive ready: %ZIP_NAME%
+    echo %T_OK% Release archive ready: %C_BLD%%ZIP_NAME%%C_RST%
 )
 
 echo.
-echo ===================================================
-echo [SUCCESS] Build process completed successfully!
-echo ===================================================
+echo %C_CYN%===================================================%C_RST%
+echo %T_DONE% Build process completed successfully!
+echo %C_CYN%===================================================%C_RST%
 
 endlocal
