@@ -84,6 +84,59 @@ On a default consumer install the signature-stripped `chrome.dll` loads and runs
 
 ---
 
+## 2a. Chrome 152 (branch-heads/7977) — a milestone rearchitecture
+
+Chrome 152 is **not** a point-release relocation of the 151 sites: Google
+restructured the gates, so five of the seven 151 signatures stopped matching. The
+old build still located the two unchanged sites, applied them, and printed
+`[SUCCESS]` — but with five gates live, MV2 stayed blocked. Symptom to recognize:
+`… layout detected (2/7 …)` followed by a success banner. The engine now carries a
+**per-milestone site table** (`kMilestones` in `chrome-mv2-patch.cpp`), probes 151
+and 152, and applies only the best-matching one. What changed on 152:
+
+- **A shared free predicate.** `IsExtensionAffected` is now a real function,
+  `extensions::manifest_v2_util::IsExtensionAffected`, taking `(mv, type, loc)` in
+  registers (`cmp ecx, 2 ; jg`). `ShouldBlockExtensionInstallation` compiled to a
+  13-byte **thunk** (`mov`/`mov`/`mov ; jmp`) that tail-calls it — it has no
+  inlined check of its own, so flipping the free predicate covers install-blocking
+  and there is no separate install site.
+- **Two byte-identical bodies.** `ManifestV2Handler::IsExtensionAffected` (`jg`
+  @ `0x82d23a4`) and `ShouldBlockExtensionEnable` (`jg` @ `0x3348754`) are the
+  same `0x3e` bytes. No signature can be unique between them, so the site carries
+  `expectedMatches = 2`: the one signature must match — and flip — **both**. A
+  match count other than 2 means the layout changed and the site is declined.
+- **A near `jg`.** `MustRemainDisabled`'s bail-out is out of short-jump range and
+  compiled to a **near** `jg` (`0F 8F rel32`, 6 bytes), not the short `jg` (`7F`,
+  2 bytes) the 1-byte flip model assumes. This is why a short-jg-only scan never
+  even *saw* it. The flip is `0F 8F` → `90 E9` (`nop ; jmp near`), keeping the four
+  `disp32` bytes: the `E9` ends at the same address the `jg` did, so the identical
+  `disp32` targets the same not-affected label. Still a pure direction-only flip
+  to an existing target (CARDINAL RULE), just length-6 instead of length-1.
+
+### The six 152 entries → seven physical flips (152.0.7977.30)
+
+| Entry | `jg` RVA | Enc. | Matches |
+| :--- | :--- | :--- | :--- |
+| `manifest_v2_util::IsExtensionAffected` (free predicate; covers the install thunk) | `0x82d26f5` | short | 1 |
+| `ManifestV2Handler::IsExtensionAffected` + `ShouldBlockExtensionEnable` (shared body) | `0x3348754` | short | **2** |
+| `OnExtensionSystemReady` startup loop | `0x124109c` | short | 1 |
+| `MaybeReEnableExtension` | `0x82d24d6` | short | 1 |
+| `UserMayInstall` (inlined, Load-Unpacked gate) | `0x8ddc241` | short | 1 |
+| `MustRemainDisabled` (inlined) | `0x15a8d31` | **near** | 1 |
+
+`OnExtensionSystemReady` and `MaybeReEnableExtension` have byte-identical
+signatures across 151 and 152, so both milestone tables match them; "most sites
+located wins" disambiguates cleanly (a real 152 build satisfies 6 of the 152
+entries and only ~2 of the 151 entries, and vice-versa on a 151 build).
+
+The derivation is reproducible under `port152/`: `resolve_symbols.py` (dbghelp),
+`disasm_gates.py` (capstone), `sweep_all_gates.py` (finds every short- **and**
+near-jg gate), and `gen_sites.py` (emits the byte arrays and re-verifies each
+entry's match count). `gen_sites.py` printing `ALL SITES VERIFIED: True` against
+the stock 152 DLL is the static check for this table.
+
+---
+
 ## 3. Section layout of the reference build
 
 `151.0.7922.76 chrome.dll`, PE32+, RSDS GUID `30dfcd7159e8bb144c4c44205044422e` (age 1). RVA → file-offset deltas (subtract to convert an RVA to a raw file offset):
@@ -94,7 +147,7 @@ On a default consumer install the signature-stripped `chrome.dll` loads and runs
 | `.rdata` | `0xE00` |
 | `.data` | `0x1400` |
 
-These deltas are build-specific — recompute them from the target's own section headers when porting.
+These deltas are build-specific — recompute them from the target's own section headers when porting. (The stock 152.0.7977.30 build's `.text` delta is `0xA00`, image base `0x180000000`.)
 
 ---
 
@@ -104,11 +157,11 @@ When Chrome bumps a milestone it may reorder `Extension` struct fields or change
 
 1. **Get the matching PDB.** Run `fetch-chrome-pdb.py` (lists the installed channels, asks which one, reads that DLL's RSDS key, pulls the exact PDB from the Chromium symbol server). Pass a `chrome.dll` path to skip the prompt. Symbols for a very fresh Canary are sometimes not indexed yet, which returns HTTP 404 — patch against a channel whose symbols exist.
 2. **Resolve the seven gate symbols** from the PDB with `dbghelp.dll` via `ctypes` (it memory-maps the multi-GB PDB; IDA/Ghidra OOM). Enumerate `IsExtensionAffected`, `ShouldBlockExtensionInstallation`, `ShouldBlockExtensionEnable`, `OnExtensionSystemReady`, `MaybeReEnableExtension`, plus the enclosing functions for the `UserMayInstall` / `MustRemainDisabled` inlined copies (`StandardManagementPolicyProvider::UserMayInstall`, and the `MustRemainDisabled` gate). RVA = symbol address − module base.
-3. **Disassemble each** with capstone and find the opening `cmp <mv>, 2 ; jg` (the inlined copies may sit mid-function; search the function body). For the two inlined-copy sites, confirm you are at the MV2 check (`UserMayInstall`'s copy builds `IDS_EXTENSIONS_CANT_INSTALL_MV2_EXTENSION`).
-4. **Capture a ~24-byte signature** around each `jg`, note the `jg`'s offset within it (`jgOff`), and record the `jg`'s absolute RVA.
-5. **Verify uniqueness**: each signature must occur exactly once across the whole `.text` (with the `jg` byte treated as `0x7F`/`0xEB` and its displacement masked, matching the runtime matcher). If a signature is not unique, widen it.
-6. **Update `kSites`** in `chrome-mv2-patch.cpp` (name, `knownJgRVA`, `sig`, `jgOff`) and rebuild with `build.bat`.
-7. **Re-verify**: run the patcher against a stock copy — it should locate 7/7 and pass on-disk verification — then do the runtime GUI test.
+3. **Disassemble each** with capstone and find the opening `cmp <mv>, 2 ; jg` (the inlined copies may sit mid-function; search the function body). For the two inlined-copy sites, confirm you are at the MV2 check (`UserMayInstall`'s copy builds `IDS_EXTENSIONS_CANT_INSTALL_MV2_EXTENSION`). **Sweep for both `jg` encodings** — short (`0x7F`) *and* near (`0x0F 0x8F`); 152's `MustRemainDisabled` compiled to a near `jg`, which a short-only scan silently misses (`port152/sweep_all_gates.py` covers both).
+4. **Capture a ~24-byte signature** starting at the `cmp`, note the `jg`'s offset within it (`jgOff`), and record the `jg`'s absolute RVA. For a near `jg`, the window spans 4 extra opcode/disp bytes.
+5. **Verify the match count**: each signature must occur exactly `expectedMatches` times across the whole `.text`, with the `jg` opcode and its displacement masked (short: `0x7F`/`0xEB` + 1 disp byte; near: `0F 8F`/`90 E9` + 4 disp bytes), matching the runtime matcher. `expectedMatches` is 1 for a unique site, or 2 when a milestone folds two gates to byte-identical bodies (152's `IsExtensionAffected`/`ShouldBlockExtensionEnable`). If a count is wrong, widen the signature (or set the right `expectedMatches`). `port152/gen_sites.py` automates this check.
+6. **Add a `Milestone` entry** to the `kMilestones` table in `chrome-mv2-patch.cpp` (name + its `AffectedSite` list: `name`, `kind` = `JG_SHORT`/`JG_NEAR`, `knownJgRVA`, `sig`, `jgOff`, `expectedMatches`) and rebuild with `build.bat`. Keep older milestones — the engine probes all and applies the best match, so one build supports several milestones.
+7. **Re-verify**: run the patcher against a stock copy — it should locate every entry (e.g. `6/6` on 152, `7/7` on 151), place the expected number of physical flips, and pass on-disk verification — then do the runtime GUI test. A partial match now reports a `[WARNING] PARTIALLY patched` instead of a false success, which is the signal a milestone shifted and needs re-signing.
 
 **If the `cmp …,2 ; jg` skeleton is gone entirely** (Google changed the check itself, or added a real manifest parser floor that hard-rejects MV2 before these gates), the seven-flip strategy no longer applies; the gate logic must be re-analyzed from source (`manifest_v2_handler.cc` / `mv2_deprecation_impact_checker.cc` at the new `branch-heads/*` tag) before any bytes are touched.
 

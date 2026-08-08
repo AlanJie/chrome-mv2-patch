@@ -1,3 +1,7 @@
 *.exe
 *.zip
 *.pdb
+*.dll
+*.bak
+*/__pycache__/*
+port152/symbols.json

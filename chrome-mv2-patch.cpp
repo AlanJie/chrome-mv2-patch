@@ -17,8 +17,8 @@
 // name the release .zip, so keep this literal form (one number per line).
 // ---------------------------------------------------------------------------
 #define APP_VER_MAJOR 1
-#define APP_VER_MINOR 0
-#define APP_VER_PATCH 1
+#define APP_VER_MINOR 1
+#define APP_VER_PATCH 0
 #define APP_VER_BUILD 0
 #define APP_STRINGIZE2(s) #s
 #define APP_STRINGIZE(s)  APP_STRINGIZE2(s)
@@ -497,130 +497,118 @@ static std::wstring GetFileVersion(const std::wstring& path) {
 // ============================================================================
 // Core Surgical Patching Engine for chrome.dll File Buffer
 //
-// Architecture (Chrome 138+, current layout is 151/branch-heads/7922):
+// Architecture (Chrome 138+):
 //   Google replaced ManifestV2ExperimentManager with a new ManifestV2Handler
 //   KeyedService (extensions/browser/manifest_v2_handler.cc). Every MV2 block
 //   funnels through ShouldDisableLegacyExtensions() (always true in release) and
-//   MV2DeprecationImpactChecker::IsExtensionAffected() (an extension is affected
-//   iff manifest_version < 3, an extension/user-script/login-screen type, and not
-//   a component location). The enforcement paths are ShouldBlockExtensionInstall-
-//   ation() (Load Unpacked), ShouldBlockExtensionEnable() (enable + chrome.manage-
-//   ment), the startup DisableAffectedExtensions() loop, MaybeReEnableExtension(),
-//   and inlined copies inside UserMayInstall()/MustRemainDisabled().
+//   IsExtensionAffected() (an extension is affected iff manifest_version < 3, an
+//   extension/user-script/login-screen type, and not a component location). The
+//   enforcement paths are ShouldBlockExtensionInstallation() (install),
+//   ShouldBlockExtensionEnable() (enable + chrome.management), the startup
+//   DisableAffectedExtensions() loop, MaybeReEnableExtension(), and inlined
+//   copies inside UserMayInstall() (Load Unpacked) / MustRemainDisabled().
 //
-// The patch (Stage 151): the release build INLINES IsExtensionAffected() into
-// seven sites, each starting with `cmp manifest_version, 2 ; jg not_affected`.
-// Flip that jg (0x7F) to an unconditional jmp (0xEB) at all seven sites so every
-// extension takes the "not an affected MV2 extension" path - the release-build
-// equivalent of g_allow_mv2_for_testing == true. See the Stage 151 banner below
-// and mv2-reversing.md. Each site is located by a .text-unique signature (known-RVA
-// fast path first), and only a branch direction is ever changed - no call is
-// removed and no return value is synthesized (see the CARDINAL RULE below).
+// The patch: the release build INLINES IsExtensionAffected() into its enforcement
+// sites, each starting with `cmp manifest_version, 2 ; jg not_affected`. Flip
+// that jg to an unconditional jmp at every site so every extension takes the
+// "not an affected MV2 extension" path - the release-build equivalent of
+// g_allow_mv2_for_testing == true. g_allow_mv2_for_testing itself cannot be used:
+// its only writer (AllowMV2ExtensionsForTesting, IN-TEST) is stripped from
+// release, so LTO constant-folds the gate and deletes the global (it is not even
+// in the PDB). IsExtensionAffected() is the real, reachable gate.
 //
-// CARDINAL RULE (learned the hard way, mv2-reversing.md "lessons"): never delete or
-// blank a call and never invent control flow - only flip the direction of an
-// existing branch. Blanking a side-effecting call is what crashed the browser in
-// an earlier, reverted approach.
+// Milestones: the exact site set and codegen differ per Chrome milestone, so the
+// engine carries one AffectedSite table per known milestone (kMilestones: 151,
+// 152, ...), probes each, and applies only the best-matching one. See the
+// kMilestones table in PatchMilestones() and mv2-reversing.md.
+//   - 151 (branch-heads/7922): seven .text-unique short-jg inlined copies.
+//   - 152 (branch-heads/7977): a rearchitecture. IsExtensionAffected became a
+//     shared free function (manifest_v2_util::IsExtensionAffected) that
+//     ShouldBlockExtensionInstallation tail-calls (a thunk, no site of its own);
+//     ManifestV2Handler::IsExtensionAffected and ShouldBlockExtensionEnable
+//     compile to byte-IDENTICAL bodies (one signature flips both); and
+//     MustRemainDisabled's bail-out is a NEAR jg. Six entries -> seven flips.
 //
-// If the seven signatures do not match (a future Chrome milestone shifted the
-// struct layout or codegen), the engine declines, reports structural candidates,
-// and refuses to write - see mv2-reversing.md "Porting to a new Chrome version".
+// Each site is located by a signature (known-RVA fast path first) and flipped
+// only after byte-verifying the current opcode. A milestone-specific "expected
+// match count" (usually 1, or 2 for a shared body) guards against false matches.
+//
+// CARDINAL RULE (learned the hard way, mv2-reversing.md "lessons"): never delete
+// or blank a call and never invent control flow - only flip the direction of an
+// existing branch to its EXISTING target. Blanking a side-effecting call is what
+// crashed the browser in an earlier, reverted approach.
+//
+// If no milestone's signatures match (a future Chrome shifted the layout), the
+// engine declines, reports structural candidates, and refuses to write - see
+// mv2-reversing.md "Porting to a new Chrome version".
 // ============================================================================
 
-// Records every Stage 151 site written (RVA -> replacement bytes) so the patched
-// buffer can be re-verified byte-for-byte after writing to disk.
+// Records every site written (RVA -> replacement bytes) so the patched buffer
+// can be re-verified byte-for-byte after writing to disk.
 static std::vector<std::pair<DWORD, std::vector<uint8_t>>> g_writtenPatches;
 
-// ============================================================================
-// Stage 151: Chrome 151 (branch-heads/7922) LTO-layout MV2 re-enable
+// The compiler emits the manifest-version bail-out (`manifest_version >= 3 ->
+// not affected`) with one of two `jg` encodings, depending on how far away the
+// not-affected label sits:
 //
-// Verified against Chromium M151 source (extensions/browser/manifest_v2_handler.cc
-// + mv2_deprecation_impact_checker.cc) and the installed build's PDB
-// (C:\ghidra\chrome\chrome.dll.pdb, resolved via dbghelp). See mv2-reversing.md §8.
+//   JG_SHORT  0x7F disp8               2 bytes  (label within +/-127)
+//   JG_NEAR   0x0F 0x8F disp32         6 bytes  (label out of short range)
 //
-// In M151, every MV2 block funnels through:
-//
-//   bool ShouldDisableLegacyExtensions() {
-//     if (g_allow_mv2_for_testing) return false;   // stripped in release
-//     return true;
-//   }
-//   bool IsExtensionAffected(ext) {
-//     if (ext.manifest_version() >= 3) return false;    // <-- the branch we flip
-//     if (type not in {extension, user_script, login_screen}) return false;
-//     if (IsComponentLocation(loc)) return false;
-//     return true;
-//   }
-//
-// g_allow_mv2_for_testing is an anonymous-namespace bool whose ONLY writer
-// (AllowMV2ExtensionsForTesting, PassKey/IN-TEST) is stripped from the release
-// build. With no writer, LTO constant-folds ShouldDisableLegacyExtensions() to
-// `return true` and deletes the global entirely - it is NOT present in the PDB
-// and there is no global read to flip in the disassembly. (This is why the
-// WinDbg "flip the flag" guides only work on Canary/debug, not stable.)
-//
-// So the real gate is IsExtensionAffected(), which the LTO build INLINES into
-// SEVEN sites (not five - UserMayInstall and MustRemainDisabled carry their own
-// inlined copies rather than calling the standalone gate functions). Each site
-// begins with the manifest-version check compiled as:
-//
-//     cmp <manifest_version>, 2
-//     jg  <not_affected>         ; manifest_version >= 3  -> not an MV2 extension
-//
-// Flipping that single `jg` (0x7F) to an unconditional `jmp` (0xEB) forces the
-// "not an affected MV2 extension" outcome for EVERY extension - byte-for-byte
-// identical in effect to g_allow_mv2_for_testing == true, but achievable in the
-// release binary. No call is removed and no return value is synthesized (see the
-// CARDINAL RULE above - blanking a side-effecting call is what crashed a reverted
-// earlier approach), so control flow stays structurally valid.
-//
-// The seven inlined sites (M151 = 151.0.7922.76), each located by a `.text`-
-// UNIQUE ~24-byte signature and, as a fast path, its known absolute RVA:
-//
-//   IsExtensionAffected               jg @ RVA 0x083012E4  -> return false (not affected)
-//   ShouldBlockExtensionInstallation  jg @ RVA 0x08301323  -> return false (don't block install)
-//   ShouldBlockExtensionEnable        jg @ RVA 0x03291F6B  -> return false (don't block enable; also covers chrome.management CheckManifestV2Deprecation, which CALLs this)
-//   OnExtensionSystemReady (inlined)  jg @ RVA 0x01618C4C  -> skip disable in the startup loop
-//   MaybeReEnableExtension            jg @ RVA 0x08301436  -> re-enable already-disabled MV2 extensions
-//   UserMayInstall (inlined)          jg @ RVA 0x08E736BA  -> don't block install / LOAD UNPACKED (emits IDS_..CANT_INSTALL_MV2; the real load-unpacked reject)
-//   MustRemainDisabled (inlined)      jg @ RVA 0x016448AA  -> don't force installed MV2 back to disabled on restart
-//
-// Each flip is byte-verified (must currently be 0x7F, or 0xEB if already applied
-// for idempotent re-runs) before writing, and the signature must match at a
-// UNIQUE offset in .text or the site is declined - never guessed.
-//
-// Returns: 0 = layout declined (no sites found - not this build's layout),
-//          1 = one or more flips freshly applied,
-//          2 = all sites already contain the flip (idempotent re-run).
-// ============================================================================
+// A JG_SHORT flip is `0x7F` -> `0xEB` (jmp short, same disp8). A JG_NEAR flip is
+// `0x0F 0x8F` -> `0x90 0xE9` (nop ; jmp near) keeping the four disp32 bytes: the
+// `0xE9` ends at the same address the `jg` did, so the identical disp32 targets
+// the same not-affected label. Both are pure branch-direction flips to an
+// EXISTING target - no call removed, no control flow invented (CARDINAL RULE).
+enum JgKind { JG_SHORT, JG_NEAR };
 
 // One inlined IsExtensionAffected() manifest-version check. `sig` is a byte run
-// that is unique across .text and contains the `jg` at byte index `jgOff`; the
-// `jg` sits at absolute RVA `knownJgRVA` in the reference 151.0.7922.76 build.
+// (starting at the `cmp`) that contains the `jg` at byte index `jgOff`; the `jg`
+// sits at absolute RVA `knownJgRVA` in the milestone's reference build.
+//
+// `expectedMatches` is how many .text sites this signature is allowed to match:
+// normally 1 (a .text-unique signature), but a milestone can fold two gates to
+// byte-identical bodies (152: ManifestV2Handler::IsExtensionAffected and
+// ShouldBlockExtensionEnable are the same 0x3e bytes), and then the single
+// signature legitimately matches - and must flip - both. A site is accepted only
+// when the match count equals expectedMatches exactly; anything else is a layout
+// change and is declined (never guessed).
 struct AffectedSite {
     const char* name;
-    DWORD knownJgRVA;             // fast-path absolute RVA of the 0x7F byte
-    std::vector<uint8_t> sig;     // .text-unique signature containing the jg
-    size_t jgOff;                 // index of the 0x7F byte within sig
+    JgKind kind;                 // encoding of the jg at jgOff (short/near)
+    DWORD knownJgRVA;            // fast-path absolute RVA of the jg opcode byte
+    std::vector<uint8_t> sig;    // signature starting at the cmp, containing the jg
+    size_t jgOff;                // index of the jg opcode byte within sig
+    int expectedMatches;         // legitimate .text occurrences (usually 1)
 };
 
-// Locate the jg byte for one site. Fast path: if knownJgRVA carries a 0x7F (or
-// already-flipped 0xEB) and the full signature matches around it, use it.
-// Otherwise scan all of .text for the signature and accept it only if UNIQUE.
-// Returns the file offset of the jg byte, or 0 if not found / ambiguous.
-// *relocated reports whether the scan (not the fast path) found it.
+// A Chrome milestone's complete set of inlined IsExtensionAffected sites. The
+// engine probes every milestone and applies only the best-matching one, so a
+// single build supports multiple milestones without their signatures interfering.
+struct Milestone {
+    const char* name;                    // "151", "152", ...
+    std::vector<AffectedSite> sites;
+};
+
+// Locate every jg byte for one site. Fast path: if knownJgRVA carries the site's
+// jg opcode (stock or already-flipped) and the full signature matches around it,
+// use it. Otherwise scan all of .text for the signature. Returns the file offset
+// of every jg opcode byte matched; the caller accepts the site only when the
+// count equals the site's expectedMatches. *relocated reports whether the result
+// came from the scan (not the fast path).
 //
-// Byte matching is exact for every signature byte EXCEPT two: the jg opcode at
-// jgOff (0x7F stock / 0xEB if already flipped) and the jg displacement byte at
-// jgOff+1. The displacement is wildcarded because a point release can move the
-// jg's not-affected target - which usually sits OUTSIDE the ~24-byte signature
-// window - while leaving every byte inside the window (opcodes, register bytes,
-// [ext+off] struct immediates, the 2 constant) identical. Masking only that one
-// displacement lets such a shift relocate cleanly; everything else must still
-// match exactly, so a real layout change (reordered fields, different codegen)
-// still MISSES rather than false-matching.
-static size_t FindAffectedJg(const std::vector<uint8_t>& buf,
-                             DWORD textRVA, DWORD textRaw, DWORD textSize,
-                             const AffectedSite& s, bool* relocated) {
+// Byte matching is exact for every signature byte EXCEPT the jg opcode and its
+// displacement, which are masked per encoding:
+//   JG_SHORT: byte@jgOff in {0x7F stock, 0xEB flipped}; byte@jgOff+1 (disp8) wild.
+//   JG_NEAR : byte@jgOff in {0x0F stock, 0x90 flipped}; byte@jgOff+1 in
+//             {0x8F stock, 0xE9 flipped}; bytes@jgOff+2..+5 (disp32) wild.
+// The displacement is wildcarded because a point release can move the not-affected
+// target - which usually sits OUTSIDE the signature window - while leaving every
+// other byte inside the window identical. Masking only the displacement lets such
+// a shift relocate cleanly; a real layout change still MISSES rather than
+// false-matching.
+static std::vector<size_t> FindAffectedJgSites(const std::vector<uint8_t>& buf,
+                                               DWORD textRVA, DWORD textRaw, DWORD textSize,
+                                               const AffectedSite& s, bool* relocated) {
     *relocated = false;
     const uint8_t* sig = s.sig.data();
     size_t sigLen = s.sig.size();
@@ -630,137 +618,263 @@ static size_t FindAffectedJg(const std::vector<uint8_t>& buf,
         if (sigStartRaw + sigLen > buf.size()) return false;
         const uint8_t* p = buf.data() + sigStartRaw;
         for (size_t k = 0; k < sigLen; ++k) {
-            if (k == jgOff) {
-                // The jg opcode is 0x7F stock, or 0xEB after our flip.
-                if (p[k] != 0x7F && p[k] != 0xEB) return false;
-            } else if (k == jgOff + 1) {
-                // The jg displacement byte is wildcarded (see header comment).
-                continue;
-            } else if (p[k] != sig[k]) {
-                return false;
+            if (s.kind == JG_SHORT) {
+                if (k == jgOff) {
+                    if (p[k] != 0x7F && p[k] != 0xEB) return false;
+                } else if (k == jgOff + 1) {
+                    continue;   // disp8 wildcard
+                } else if (p[k] != sig[k]) {
+                    return false;
+                }
+            } else {  // JG_NEAR: 0F 8F disp32  ->  90 E9 disp32
+                if (k == jgOff) {
+                    if (p[k] != 0x0F && p[k] != 0x90) return false;
+                } else if (k == jgOff + 1) {
+                    if (p[k] != 0x8F && p[k] != 0xE9) return false;
+                } else if (k >= jgOff + 2 && k <= jgOff + 5) {
+                    continue;   // disp32 wildcard
+                } else if (p[k] != sig[k]) {
+                    return false;
+                }
             }
         }
         return true;
     };
 
-    // Fast path: the documented RVA for this reference build.
-    if (s.knownJgRVA >= textRVA && (s.knownJgRVA - textRVA) < textSize) {
+    std::vector<size_t> found;
+
+    // Fast path only when the site is expected to be unique - a shared-body site
+    // (expectedMatches > 1) must always scan so it finds every copy.
+    if (s.expectedMatches == 1 &&
+        s.knownJgRVA >= textRVA && (s.knownJgRVA - textRVA) < textSize) {
         DWORD jgRaw = textRaw + (s.knownJgRVA - textRVA);
         if (jgRaw >= jgOff) {
             size_t sigStart = jgRaw - jgOff;
-            if (sigMatchesAt(sigStart)) return jgRaw;
+            if (sigMatchesAt(sigStart)) {
+                found.push_back(jgRaw);
+                return found;
+            }
         }
     }
 
-    // Slow path: a point release shifted the function. Scan for the unique
-    // signature (matching the jg byte as 0x7F or 0xEB).
-    if (textSize < sigLen) return 0;
-    size_t found = 0;
-    unsigned matches = 0;
+    // Slow path: scan .text for the signature (matching the jg per encoding).
+    if (textSize < sigLen) return found;
     DWORD textEndRaw = textRaw + textSize;
     for (DWORD r = textRaw; r + sigLen <= textEndRaw && r + sigLen <= buf.size(); ++r) {
-        // Fast filter on the first signature byte.
-        if (buf[r] != sig[0]) continue;
+        if (buf[r] != sig[0]) continue;   // fast filter on the first byte
         if (!sigMatchesAt(r)) continue;
-        if (matches == 0) found = r + jgOff;
-        if (++matches > 1) break;   // ambiguous -> decline
+        found.push_back(r + jgOff);
+        // Cap the scan once we have one more than expected: that is enough to
+        // reject the site as ambiguous without walking the rest of .text.
+        if ((int)found.size() > s.expectedMatches) break;
     }
-    if (matches == 1) {
-        *relocated = true;
-        return found;
-    }
-    return 0;
+    if (!found.empty()) *relocated = true;
+    return found;
 }
 
-static int PatchStage151(std::vector<uint8_t>& fileBuffer,
-                         DWORD textRVA, DWORD textRaw, DWORD textSize, int& totalPatches) {
-    // Signatures captured from the stock 151.0.7922.76 chrome.dll and verified
-    // UNIQUE across the whole .text section. Each contains the `jg` (0x7F) at
-    // jgOff; the surrounding bytes pin it to the correct inlined check.
-    const std::vector<AffectedSite> kSites = {
-        { "IsExtensionAffected", 0x083012E4,
-          { 0x83,0x7A,0x50,0x02, 0x7F, 0x34, 0x48,0x8B,0x8A,0x28,0x02,0x00,0x00,
-            0x8B,0x41,0x30, 0x80,0xBA,0x08,0x02,0x00,0x00,0x00, 0x75,0x08 }, 4 },
-        { "ShouldBlockExtensionInstallation", 0x08301323,
-          { 0x83,0xFA,0x02, 0x7F, 0x23, 0x41,0x83,0xF8,0x01, 0x75,0x11,
-            0x41,0x83,0xF9,0x05, 0x0F,0x95,0xC1, 0x41,0x83,0xF9,0x0A }, 3 },
-        { "ShouldBlockExtensionEnable", 0x03291F6B,
-          { 0x8B,0x41,0x68, 0x41,0x83,0xF8,0x02, 0x7F, 0x28, 0x8B,0x49,0x30,
-            0x83,0xF8,0x01, 0x75,0x16, 0x83,0xF9,0x05, 0x0F,0x95,0xC2 }, 7 },
-        { "OnExtensionSystemReady startup loop", 0x01618C4C,
-          { 0x83,0x79,0x50,0x02, 0x7F, 0x2D, 0x48,0x8B,0x91,0x28,0x02,0x00,0x00,
-            0x8B,0x42,0x30, 0x80,0xB9,0x08,0x02,0x00,0x00,0x00, 0x75,0x0C }, 4 },
-        { "MaybeReEnableExtension", 0x08301436,
-          { 0x83,0x7E,0x50,0x02, 0x7F, 0x2D, 0x48,0x8B,0x8E,0x28,0x02,0x00,0x00,
-            0x8B,0x41,0x30, 0x80,0xBE,0x08,0x02,0x00,0x00,0x00, 0x75,0x08 }, 4 },
-        // UserMayInstall inlines its OWN copy of IsExtensionAffected (it does NOT
-        // call ShouldBlockExtensionEnable in the LTO build). This is the site that
-        // rejects "Load unpacked" with IDS_EXTENSIONS_CANT_INSTALL_MV2_EXTENSION
-        // (edx=0x2150) - without this flip the other 5 never get reached on install.
-        { "UserMayInstall (inlined)", 0x08E736BA,
-          { 0x8B,0x41,0x68, 0x83,0xFA,0x02, 0x7F, 0x3B, 0x8B,0x49,0x30,
-            0x83,0xF8,0x01, 0x0F,0x85,0x1A,0x01,0x00,0x00, 0x83,0xF9,0x05, 0x74,0x2A }, 6 },
-        // MustRemainDisabled inlines it too - without this flip an installed MV2
-        // extension is forced back to disabled (DISABLE_UNSUPPORTED_MANIFEST_VERSION)
-        // on the next check / restart even after UserMayInstall lets it in.
-        { "MustRemainDisabled (inlined)", 0x016448AA,
-          { 0x8B,0x41,0x68, 0x83,0xFA,0x02, 0x7F, 0x78, 0x8B,0x49,0x30,
-            0x83,0xF8,0x01, 0x75,0x66, 0x31,0xFF, 0x83,0xF9,0x05, 0x74,0x05, 0x83,0xF9 }, 6 },
+// Outcome of a milestone patch pass, so the caller can report honestly: a
+// partial match (some gates located, some not) must never claim full success.
+struct PatchResult {
+    int status = 0;                 // 0 = declined (no milestone matched at all),
+                                    // 1 = flips applied, 2 = all already applied
+    const char* milestone = nullptr;// name of the milestone that best matched
+    size_t located = 0;             // table entries satisfied (exact match count)
+    size_t total = 0;               // table entries in the chosen milestone
+    int flips = 0;                  // physical jg sites flipped or already flipped
+    bool full = false;              // located == total (every gate covered)
+};
+
+static PatchResult PatchMilestones(std::vector<uint8_t>& fileBuffer,
+                                   DWORD textRVA, DWORD textRaw, DWORD textSize,
+                                   int& totalPatches) {
+    // Each milestone's inlined IsExtensionAffected sites. The engine probes every
+    // milestone and applies only the best-matching one, so one binary supports
+    // several Chrome milestones without their signatures interfering. Two sites
+    // (OnExtensionSystemReady, MaybeReEnableExtension) happen to have byte-
+    // identical signatures across 151/152; "most sites located wins" disambiguates
+    // cleanly because the milestone-specific sites only match their own build.
+    static const std::vector<Milestone> kMilestones = {
+        // -------------------------------------------------------------------
+        // Chrome 151 (branch-heads/7922). Seven .text-unique short-jg sites,
+        // each an inlined copy of IsExtensionAffected. Reference 151.0.7922.76.
+        // -------------------------------------------------------------------
+        { "151", {
+            { "IsExtensionAffected", JG_SHORT, 0x083012E4,
+              { 0x83,0x7A,0x50,0x02, 0x7F, 0x34, 0x48,0x8B,0x8A,0x28,0x02,0x00,0x00,
+                0x8B,0x41,0x30, 0x80,0xBA,0x08,0x02,0x00,0x00,0x00, 0x75,0x08 }, 4, 1 },
+            { "ShouldBlockExtensionInstallation", JG_SHORT, 0x08301323,
+              { 0x83,0xFA,0x02, 0x7F, 0x23, 0x41,0x83,0xF8,0x01, 0x75,0x11,
+                0x41,0x83,0xF9,0x05, 0x0F,0x95,0xC1, 0x41,0x83,0xF9,0x0A }, 3, 1 },
+            { "ShouldBlockExtensionEnable", JG_SHORT, 0x03291F6B,
+              { 0x8B,0x41,0x68, 0x41,0x83,0xF8,0x02, 0x7F, 0x28, 0x8B,0x49,0x30,
+                0x83,0xF8,0x01, 0x75,0x16, 0x83,0xF9,0x05, 0x0F,0x95,0xC2 }, 7, 1 },
+            { "OnExtensionSystemReady startup loop", JG_SHORT, 0x01618C4C,
+              { 0x83,0x79,0x50,0x02, 0x7F, 0x2D, 0x48,0x8B,0x91,0x28,0x02,0x00,0x00,
+                0x8B,0x42,0x30, 0x80,0xB9,0x08,0x02,0x00,0x00,0x00, 0x75,0x0C }, 4, 1 },
+            { "MaybeReEnableExtension", JG_SHORT, 0x08301436,
+              { 0x83,0x7E,0x50,0x02, 0x7F, 0x2D, 0x48,0x8B,0x8E,0x28,0x02,0x00,0x00,
+                0x8B,0x41,0x30, 0x80,0xBE,0x08,0x02,0x00,0x00,0x00, 0x75,0x08 }, 4, 1 },
+            // UserMayInstall inlines its OWN copy of IsExtensionAffected (it does NOT
+            // call ShouldBlockExtensionEnable in the LTO build). This is the site that
+            // rejects "Load unpacked" with IDS_EXTENSIONS_CANT_INSTALL_MV2_EXTENSION
+            // (edx=0x2150) - without this flip the other 5 never get reached on install.
+            { "UserMayInstall (inlined)", JG_SHORT, 0x08E736BA,
+              { 0x8B,0x41,0x68, 0x83,0xFA,0x02, 0x7F, 0x3B, 0x8B,0x49,0x30,
+                0x83,0xF8,0x01, 0x0F,0x85,0x1A,0x01,0x00,0x00, 0x83,0xF9,0x05, 0x74,0x2A }, 6, 1 },
+            // MustRemainDisabled inlines it too - without this flip an installed MV2
+            // extension is forced back to disabled (DISABLE_UNSUPPORTED_MANIFEST_VERSION)
+            // on the next check / restart even after UserMayInstall lets it in.
+            { "MustRemainDisabled (inlined)", JG_SHORT, 0x016448AA,
+              { 0x8B,0x41,0x68, 0x83,0xFA,0x02, 0x7F, 0x78, 0x8B,0x49,0x30,
+                0x83,0xF8,0x01, 0x75,0x66, 0x31,0xFF, 0x83,0xF9,0x05, 0x74,0x05, 0x83,0xF9 }, 6, 1 },
+        } },
+        // -------------------------------------------------------------------
+        // Chrome 152 (branch-heads/7977). A milestone rearchitecture, not a
+        // relocation: IsExtensionAffected became a shared free function
+        // (manifest_v2_util::IsExtensionAffected, register-arg form) that
+        // ShouldBlockExtensionInstallation now tail-calls (a 13-byte thunk - no
+        // inlined check of its own, so no separate site). ManifestV2Handler::
+        // IsExtensionAffected and ShouldBlockExtensionEnable compile to BYTE-
+        // IDENTICAL bodies, so one signature matches (and flips) BOTH
+        // (expectedMatches = 2). MustRemainDisabled's bail-out is a NEAR jg
+        // (0F 8F rel32), flipped 0F 8F -> 90 E9. Six table entries -> seven
+        // physical flips. Reference 152.0.7977.30; derived in port152/.
+        // -------------------------------------------------------------------
+        { "152", {
+            { "manifest_v2_util::IsExtensionAffected (free predicate; covers install thunk)",
+              JG_SHORT, 0x082D26F5,
+              { 0x83,0xF9,0x02, 0x7F, 0x1F, 0x83,0xFA,0x08, 0x77,0x1A, 0xB9,0x0A,0x01,0x00,0x00,
+                0x0F,0xA3,0xD1, 0x73,0x10, 0x41,0x83,0xF8,0x05 }, 3, 1 },
+            // Shared body: ManifestV2Handler::IsExtensionAffected AND
+            // ShouldBlockExtensionEnable are the same 0x3e bytes; both must flip.
+            { "ShouldBlockExtensionEnable / IsExtensionAffected (shared body)",
+              JG_SHORT, 0x03348754,
+              { 0x83,0x7A,0x50,0x02, 0x7F, 0x34, 0x48,0x8B,0x8A,0x28,0x02,0x00,0x00,
+                0x8B,0x41,0x30, 0x80,0xBA,0x08,0x02,0x00,0x00,0x00, 0x75 }, 4, 2 },
+            { "OnExtensionSystemReady startup loop", JG_SHORT, 0x0124109C,
+              { 0x83,0x79,0x50,0x02, 0x7F, 0x2D, 0x48,0x8B,0x91,0x28,0x02,0x00,0x00,
+                0x8B,0x42,0x30, 0x80,0xB9,0x08,0x02,0x00,0x00,0x00, 0x75,0x0C }, 4, 1 },
+            { "MaybeReEnableExtension", JG_SHORT, 0x082D24D6,
+              { 0x83,0x7E,0x50,0x02, 0x7F, 0x2D, 0x48,0x8B,0x8E,0x28,0x02,0x00,0x00,
+                0x8B,0x41,0x30, 0x80,0xBE,0x08,0x02,0x00,0x00,0x00, 0x75,0x08 }, 4, 1 },
+            // UserMayInstall inlines its own copy (the Load-Unpacked gate).
+            { "UserMayInstall (inlined)", JG_SHORT, 0x08DDC241,
+              { 0x83,0x7F,0x50,0x02, 0x7F, 0x4E, 0x48,0x8B,0x8F,0x28,0x02,0x00,0x00,
+                0x8B,0x41,0x30, 0x80,0xBF,0x08,0x02,0x00,0x00,0x00, 0x75,0x0C }, 4, 1 },
+            // MustRemainDisabled: NEAR jg (0F 8F rel32). Flip 0F 8F -> 90 E9.
+            { "MustRemainDisabled (inlined, near jg)", JG_NEAR, 0x015A8D31,
+              { 0x83,0x7F,0x50,0x02, 0x0F,0x8F, 0x8B,0x00,0x00,0x00, 0x48,0x8B,0x8F,0x28,0x02,0x00,0x00,
+                0x8B,0x41,0x30, 0x80,0xBF,0x08,0x02,0x00,0x00,0x00, 0x75 }, 4, 1 },
+        } },
     };
 
-    // First pass: locate every site. If none is found, this layout is not
-    // recognized and we decline (the caller then reports candidates and refuses
-    // to write). If some but not all are found, we still apply the ones we
-    // located (and say which are missing) - a point-release that shifted only
-    // some sites is far better served by the flips we can place than by nothing.
-    struct Located { const AffectedSite* site; size_t jgRaw; bool relocated; };
-    std::vector<Located> located;
-    for (const auto& s : kSites) {
-        bool reloc = false;
-        size_t jgRaw = FindAffectedJg(fileBuffer, textRVA, textRaw, textSize, s, &reloc);
-        if (jgRaw != 0) located.push_back({ &s, jgRaw, reloc });
+    // Probe every milestone. For each, an entry is "satisfied" only when its
+    // signature matches EXACTLY the expected number of times (1 for a unique
+    // site, 2 for a shared body); a wrong count means the layout changed and the
+    // entry is declined, never guessed. The milestone with the most satisfied
+    // entries wins - on a genuine 151 build that is 151 (7 vs a couple of shared
+    // sites), on a 152 build that is 152 (6 vs the same couple).
+    struct Flip { const AffectedSite* site; size_t jgRaw; bool relocated; };
+    struct Candidate {
+        const Milestone* ms = nullptr;
+        std::vector<Flip> flips;
+        size_t satisfied = 0;
+    };
+
+    Candidate best;
+    for (const auto& ms : kMilestones) {
+        Candidate c;
+        c.ms = &ms;
+        for (const auto& s : ms.sites) {
+            bool reloc = false;
+            std::vector<size_t> hits =
+                FindAffectedJgSites(fileBuffer, textRVA, textRaw, textSize, s, &reloc);
+            if ((int)hits.size() == s.expectedMatches) {
+                c.satisfied++;
+                for (size_t jgRaw : hits) c.flips.push_back({ &s, jgRaw, reloc });
+            }
+        }
+        if (c.satisfied > best.satisfied) best = std::move(c);
     }
 
-    if (located.empty()) return 0;  // no sites found - caller reports & declines
+    PatchResult res;
+    if (best.satisfied == 0) return res;  // status 0 - no milestone matched
 
-    std::cout << TAG_INFO << " Stage 151: Chrome 151 MV2 layout detected (" << located.size()
-              << "/" << kSites.size() << " inlined IsExtensionAffected sites located)." << std::endl;
+    res.milestone = best.ms->name;
+    res.located = best.satisfied;
+    res.total = best.ms->sites.size();
+    res.full = (best.satisfied == best.ms->sites.size());
+
+    std::cout << TAG_INFO << " Chrome " << best.ms->name << " MV2 layout detected ("
+              << res.located << "/" << res.total << " inlined IsExtensionAffected sites, "
+              << best.flips.size() << " jg flip(s))." << std::endl;
 
     int applied = 0, already = 0;
-    for (const auto& L : located) {
-        uint8_t cur = fileBuffer[L.jgRaw];
-        DWORD jgRVA = textRVA + (DWORD)(L.jgRaw - textRaw);
-        if (cur == 0xEB) {
-            std::cout << "    [i] Stage 151: " << L.site->name << " jg->jmp at RVA 0x"
-                      << std::hex << jgRVA << std::dec << " already applied (no change)." << std::endl;
-            already++;
-            // Still record it so on-disk verification confirms the byte.
+    for (const auto& f : best.flips) {
+        DWORD jgRVA = textRVA + (DWORD)(f.jgRaw - textRaw);
+        const char* ms = best.ms->name;
+
+        if (f.site->kind == JG_SHORT) {
+            uint8_t cur = fileBuffer[f.jgRaw];
+            if (cur == 0xEB) {
+                std::cout << "    [i] " << ms << ": " << f.site->name << " jg->jmp at RVA 0x"
+                          << std::hex << jgRVA << std::dec << " already applied (no change)." << std::endl;
+                already++;
+                g_writtenPatches.push_back({ jgRVA, { 0xEB } });
+                continue;
+            }
+            if (cur != 0x7F) {
+                std::cout << "    " << TAG_WARN << " " << ms << ": " << f.site->name
+                          << " unexpected byte 0x" << std::hex << (int)cur << " at RVA 0x" << jgRVA
+                          << std::dec << " (expected 0x7F) - skipping this site." << std::endl;
+                continue;
+            }
+            fileBuffer[f.jgRaw] = 0xEB;   // jg -> jmp short
+            totalPatches++;
+            applied++;
+            res.flips++;
             g_writtenPatches.push_back({ jgRVA, { 0xEB } });
-            continue;
+        } else {  // JG_NEAR: 0F 8F disp32 -> 90 E9 disp32
+            uint8_t o0 = fileBuffer[f.jgRaw], o1 = fileBuffer[f.jgRaw + 1];
+            if (o0 == 0x90 && o1 == 0xE9) {
+                std::cout << "    [i] " << ms << ": " << f.site->name << " jg->jmp at RVA 0x"
+                          << std::hex << jgRVA << std::dec << " already applied (no change)." << std::endl;
+                already++;
+                g_writtenPatches.push_back({ jgRVA, { 0x90, 0xE9 } });
+                continue;
+            }
+            if (!(o0 == 0x0F && o1 == 0x8F)) {
+                std::cout << "    " << TAG_WARN << " " << ms << ": " << f.site->name
+                          << " unexpected bytes 0x" << std::hex << (int)o0 << " 0x" << (int)o1
+                          << " at RVA 0x" << jgRVA << std::dec
+                          << " (expected 0F 8F) - skipping this site." << std::endl;
+                continue;
+            }
+            fileBuffer[f.jgRaw] = 0x90;       // nop
+            fileBuffer[f.jgRaw + 1] = 0xE9;   // jmp near (keeps the disp32)
+            totalPatches++;
+            applied++;
+            res.flips++;
+            g_writtenPatches.push_back({ jgRVA, { 0x90, 0xE9 } });
+            // fall through to the shared OK print below (same as the short case)
         }
-        if (cur != 0x7F) {
-            std::cout << "    " << TAG_WARN << " Stage 151: " << L.site->name << " unexpected byte 0x"
-                      << std::hex << (int)cur << " at RVA 0x" << jgRVA << std::dec
-                      << " (expected 0x7F) - skipping this site." << std::endl;
-            continue;
-        }
-        fileBuffer[L.jgRaw] = 0xEB;   // jg -> jmp: force "not an affected MV2 extension"
-        totalPatches++;
-        applied++;
-        g_writtenPatches.push_back({ jgRVA, { 0xEB } });
-        std::cout << "    " << TAG_OK << " Stage 151: " << L.site->name << " jg->jmp at RVA 0x"
+
+        std::cout << "    " << TAG_OK << " " << ms << ": " << f.site->name << " jg->jmp at RVA 0x"
                   << std::hex << jgRVA << std::dec
-                  << (L.relocated ? "  (RELOCATED - point-release layout)" : "") << std::endl;
+                  << (f.relocated ? "  (RELOCATED - point-release layout)" : "") << std::endl;
+    }
+    res.flips += already;  // count already-applied sites toward the flip total
+
+    if (!res.full) {
+        std::cout << "    " << TAG_WARN << " Chrome " << best.ms->name << ": "
+                  << (res.total - res.located)
+                  << " site(s) not found - this Chrome build may have shifted them. "
+                     "MV2 re-enable is PARTIAL and may still be blocked; please report the version."
+                  << std::endl;
     }
 
-    if (located.size() < kSites.size()) {
-        std::cout << "    " << TAG_WARN << " Stage 151: " << (kSites.size() - located.size())
-                  << " site(s) not found - Chrome point release may have changed them. "
-                     "MV2 re-enable may be partial; please report the version." << std::endl;
-    }
-
-    // 1 = freshly applied at least one; 2 = everything was already applied.
-    return (applied > 0) ? 1 : 2;
+    res.status = (applied > 0) ? 1 : 2;
+    return res;
 }
 
 // ============================================================================
@@ -862,7 +976,7 @@ static void ReportLayoutCandidates(const std::vector<uint8_t>& buf,
               << std::endl;
 }
 
-static bool PatchChromeDllBuffer(std::vector<uint8_t>& fileBuffer) {
+static bool PatchChromeDllBuffer(std::vector<uint8_t>& fileBuffer, PatchResult* outResult) {
     PIMAGE_NT_HEADERS64 ntHeaders = ValidatePe64(fileBuffer.data(), fileBuffer.size());
     if (ntHeaders == nullptr) {
         std::cout << TAG_ERR << " Error: not a valid 64-bit PE image (bad DOS/NT headers or truncated file)." << std::endl;
@@ -896,35 +1010,36 @@ static bool PatchChromeDllBuffer(std::vector<uint8_t>& fileBuffer) {
     std::cout << TAG_INFO << " Starting MV2 Patching (ManifestV2Handler architecture)..." << std::endl;
 
     // ========================================================================
-    // Stage 151: Chrome 151 (branch-heads/7922) - flip the seven inlined
-    // IsExtensionAffected() manifest-version checks (jg -> jmp). This is the
-    // release-build equivalent of g_allow_mv2_for_testing == true.
-    // stage151: 0 = declined (layout not recognized; nothing is written),
-    //           1 = applied, 2 = already applied (idempotent re-run).
+    // Flip the inlined IsExtensionAffected() manifest-version checks (jg -> jmp)
+    // for whichever known Chrome milestone (151 / 152 / ...) this build matches.
+    // This is the release-build equivalent of g_allow_mv2_for_testing == true.
+    // status: 0 = declined (no milestone recognized; nothing is written),
+    //         1 = applied, 2 = already applied (idempotent re-run).
     // ========================================================================
-    std::cout << TAG_INFO << " Stage 151: probing for the Chrome 151 ManifestV2Handler layout..." << std::endl;
-    int stage151 = PatchStage151(fileBuffer, textSec.virtAddr, textSec.rawAddr, textSec.rawSize, totalPatches);
+    std::cout << TAG_INFO << " Probing for a known Chrome ManifestV2Handler layout (151 / 152)..." << std::endl;
+    PatchResult patch = PatchMilestones(fileBuffer, textSec.virtAddr, textSec.rawAddr, textSec.rawSize, totalPatches);
+    if (outResult) *outResult = patch;
 
-    if (stage151 == 0) {
-        // The seven known signatures matched nothing - this is a future Chrome
-        // layout, not a declined-but-known one. Report structural candidates
-        // and stop. NEVER guess at bytes: the first time this project did, it
-        // corrupted unrelated functions and crashed Chrome (mv2-reversing.md
-        // "Superseded approaches & lessons").
+    if (patch.status == 0) {
+        // No known milestone signature matched - this is a future Chrome layout,
+        // not a declined-but-known one. Report structural candidates and stop.
+        // NEVER guess at bytes: the first time this project did, it corrupted
+        // unrelated functions and crashed Chrome (mv2-reversing.md "Superseded
+        // approaches & lessons").
         ReportLayoutCandidates(fileBuffer, textSec.virtAddr, textSec.rawAddr, textSec.rawSize);
-        std::cout << TAG_WARN << " No known Stage 151 signature matched this chrome.dll." << std::endl;
+        std::cout << TAG_WARN << " No known MV2 layout (151 / 152) matched this chrome.dll." << std::endl;
         std::cout << "    Chrome likely changed its binary layout (new milestone, changed" << std::endl;
         std::cout << "    Extension struct layout, or different compiler output)." << std::endl;
         std::cout << "    Nothing was modified." << std::endl;
         std::cout << "    To port the patch to this version, follow 'Porting to a new Chrome" << std::endl;
-        std::cout << "    version' in mv2-reversing.md: resolve the seven gate symbols from this" << std::endl;
-        std::cout << "    version's PDB, re-capture their cmp/jg signatures, update the kSites" << std::endl;
-        std::cout << "    table in chrome-mv2-patch.cpp, and rebuild." << std::endl;
+        std::cout << "    version' in mv2-reversing.md: resolve the gate symbols from this" << std::endl;
+        std::cout << "    version's PDB, re-capture their cmp/jg signatures, add a milestone to" << std::endl;
+        std::cout << "    the kMilestones table in chrome-mv2-patch.cpp, and rebuild." << std::endl;
         return false;
     }
 
-    std::cout << TAG_INFO << " Stage 151 " << ((stage151 == 1) ? "applied."
-                                                      : "all sites already patched (no change needed).")
+    std::cout << TAG_INFO << " Chrome " << patch.milestone << " "
+              << ((patch.status == 1) ? "applied." : "all sites already patched (no change needed).")
               << std::endl;
 
     // ========================================================================
@@ -951,7 +1066,7 @@ static bool PatchChromeDllBuffer(std::vector<uint8_t>& fileBuffer) {
 
 // ============================================================================
 // Post-write verification: re-read the patched file from disk and confirm
-// every Stage 151 site contains the exact replacement bytes, plus that the
+// every patched site contains the exact replacement bytes, plus that the
 // Security Directory is cleared and the checksum field matches the file.
 // ============================================================================
 static bool VerifyPatchedFile(const std::wstring& path) {
@@ -1137,8 +1252,8 @@ static bool ConfirmForceClose(const ChromeInstall& inst) {
 static void PrintUsage() {
     std::cout << "Usage: chrome-mv2-patch.exe [path\\to\\chrome.dll] [options]\n"
                  "\n"
-                 "Re-enables Manifest V2 extension support in Google Chrome 151+\n"
-                 "(the current MV2-blocking layout; point releases relocate cleanly).\n"
+                 "Re-enables Manifest V2 extension support in Google Chrome 151 and 152\n"
+                 "(the current MV2-blocking layouts; point releases relocate cleanly).\n"
                  "With no path, every installed release channel (Stable/Beta/Dev/Canary)\n"
                  "is listed so you can pick the one to patch.\n"
                  "\n"
@@ -1187,14 +1302,16 @@ int wmain(int argc, wchar_t* argv[]) {
 
     std::cout << C_CYN << "==========================================================" << C_RESET << std::endl;
     std::cout << C_BOLD << "        Google Chrome chrome.dll Manifest V2 Patcher       " << C_RESET << std::endl;
-    std::cout << C_DIM  << "   (Chrome 151 ManifestV2Handler seven-flip edition)       " << C_RESET << std::endl;
     std::cout << C_DIM  << "                    v" APP_VERSION_STR "                       " << C_RESET << std::endl;
     std::cout << C_CYN << "==========================================================" << C_RESET << std::endl;
 
+#ifndef MV2_TEST_NO_ELEVATION
     if (!IsElevatedAdmin()) {
         return Fail(TAG_WARN + " Administrator privileges are REQUIRED to modify chrome.dll in Program Files!\n"
                     "    Please right-click chrome-mv2-patch.exe and select 'Run as administrator'.");
     }
+#endif  // MV2_TEST_NO_ELEVATION - set only for offline patch/verify tests on a
+        // local copy; build.bat never defines it, so releases always require admin.
 
     // Non-interactive runs must not sit on a prompt, so they need the channel
     // spelled out as a path.
@@ -1340,7 +1457,8 @@ int wmain(int argc, wchar_t* argv[]) {
     }
 
     // Apply Patches
-    if (!PatchChromeDllBuffer(buffer)) {
+    PatchResult patch;
+    if (!PatchChromeDllBuffer(buffer, &patch)) {
         return Fail(TAG_WARNING + " No patches were applied.", 0);
     }
 
@@ -1362,9 +1480,24 @@ int wmain(int argc, wchar_t* argv[]) {
         return Fail(TAG_ERR + "On-disk verification FAILED! Use 'chrome-mv2-patch.exe --restore' to revert.");
     }
 
+    // Honest reporting: the bytes on disk are verified either way, but only a
+    // full match of every gate in the chosen milestone actually re-enables MV2.
+    // A partial match writes the flips it found but must NOT claim success - that
+    // false "SUCCESS" on a half-patched newer Chrome is exactly what this fixes.
     std::cout << "==========================================================" << std::endl;
-    std::cout << TAG_SUCCESS << " chrome.dll successfully patched and verified on disk!" << std::endl;
-    std::cout << "          Manifest V2 extension support re-enabled." << std::endl;
+    if (patch.full) {
+        std::cout << TAG_SUCCESS << " chrome.dll successfully patched and verified on disk!" << std::endl;
+        std::cout << "          Manifest V2 extension support re-enabled (Chrome "
+                  << patch.milestone << " layout)." << std::endl;
+    } else {
+        std::cout << TAG_WARNING << " chrome.dll was PARTIALLY patched (Chrome " << patch.milestone
+                  << " layout, " << patch.located << "/" << patch.total << " gates)." << std::endl;
+        std::cout << "          The flips found were written and verified on disk, but " << std::endl;
+        std::cout << "          " << (patch.total - patch.located) << " gate(s) were not located, so MV2 may STILL be" << std::endl;
+        std::cout << "          blocked. This Chrome build likely shifted a signature -" << std::endl;
+        std::cout << "          please report the exact version so the patch can be updated." << std::endl;
+        std::cout << "          Revert any time with: chrome-mv2-patch.exe --restore" << std::endl;
+    }
     std::cout << "==========================================================" << std::endl;
 
     return Fail("", 0);  // success: pause (unless --quiet) + exit 0
