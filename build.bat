@@ -22,6 +22,18 @@ set "T_WARN=%C_YEL%[!]%C_RST%"
 set "T_FAIL=%C_BLD%%C_RED%[ERROR]%C_RST%"
 set "T_DONE=%C_BLD%%C_GRN%[SUCCESS]%C_RST%"
 
+REM Decide up front whether the console needs holding open at the end - see the
+REM :hold subroutine for why, and MV2_BUILD_NOPAUSE to suppress it. Done with
+REM plain string substitution rather than `echo %cmdcmdline% | find`: `find` on
+REM PATH may well be Git's Unix find, which takes neither /i nor that syntax.
+REM `call set` gives the second expansion pass %~nx0 needs inside the :pattern=.
+set "HOLD="
+set "CL=%cmdcmdline%"
+set "CL=%CL:"=%"
+call set "CL_CUT=%%CL:%~nx0=%%"
+if not "%CL_CUT%"=="%CL%" set "HOLD=1"
+if defined MV2_BUILD_NOPAUSE set "HOLD="
+
 echo %C_CYN%===================================================%C_RST%
 echo         %C_BLD%Building Chrome Manifest V2 Patcher (Go)%C_RST%
 echo %C_CYN%===================================================%C_RST%
@@ -30,6 +42,7 @@ REM 0. Require the Go toolchain.
 where go >nul 2>&1
 if errorlevel 1 (
     echo %T_FAIL% Could not find go.exe. Install Go from https://go.dev/dl and re-run.
+    call :hold
     exit /b 1
 )
 
@@ -72,17 +85,53 @@ REM    the loose binaries and the per-platform .zip in build\.
 rmdir /s /q "%OUTDIR%\stage" 2>nul
 del /q cmd\chrome-mv2\rsrc_windows_*.syso 2>nul
 
+REM 6. Every target must have produced its loose binary. :package reports its own
+REM    build/archive failures, but a `call` that never lands - an unfindable
+REM    label, say - reports nothing and would otherwise leave a silent SUCCESS on
+REM    a release that is missing a whole platform.
+call :require chrome-mv2.exe     windows-amd64
+call :require chrome-mv2-x86.exe windows-386
+call :require chrome-mv2         linux-amd64
+
 echo.
 if defined FAILED (
     echo %C_CYN%===================================================%C_RST%
     echo %T_WARN% Finished with errors: %FAILED%
     echo %C_CYN%===================================================%C_RST%
+    call :hold
     exit /b 1
 )
 echo %C_CYN%===================================================%C_RST%
 echo %T_DONE% Build complete. Artifacts in %C_BLD%%OUTDIR%\%C_RST%
 echo %C_CYN%===================================================%C_RST%
+call :hold
 endlocal
+exit /b 0
+
+REM ---------------------------------------------------------------------------
+REM :hold  - keep the window open when build.bat was double-clicked from
+REM Explorer, which spawns a dedicated console that closes the instant the
+REM script ends, taking the build output with it. Detected at the top: Explorer
+REM launches us as `cmd /c "<full path to build.bat>"`, so our own name appears
+REM in %cmdcmdline%, whereas from an existing shell that variable is just
+REM "cmd.exe" (or the pwsh/bash parent's command). So an interactive run - and
+REM any CI or scripted caller - is never blocked by a pause it can't answer.
+REM Set MV2_BUILD_NOPAUSE=1 to force it off regardless.
+REM ---------------------------------------------------------------------------
+:hold
+if not defined HOLD exit /b 0
+echo.
+pause
+exit /b 0
+
+REM ---------------------------------------------------------------------------
+REM :require <binary-name> <platform>  - assert a target actually produced its
+REM loose binary, so a call that silently never ran can't pass as a clean build.
+REM ---------------------------------------------------------------------------
+:require
+if exist "%OUTDIR%\%~1" exit /b 0
+echo %T_ERR% %~2 produced no %~1 - that target did not run.
+set "FAILED=%FAILED% %~2-missing"
 exit /b 0
 
 REM ---------------------------------------------------------------------------
@@ -126,6 +175,47 @@ copy /y signatures.json "%STAGE%\signatures.json" >nul
 copy /y LICENSE "%STAGE%\LICENSE" >nul 2>nul
 copy /y README.md "%STAGE%\README.md" >nul 2>nul
 
+REM Archive the staged tree: Linux ships a .tar.gz (platform convention), Windows
+REM a .zip. Both are :subroutine calls, not an inline `if ( ) else ( )`, because
+REM each sets a variable and then uses it - without delayed expansion that only
+REM works across a fresh parse, which a `call` gives (same reason as :manifest).
+if "%GOOS%"=="linux" (call :archive_tar) else (call :archive_zip)
+
+:package_reset
+set "GOOS="
+set "GOARCH="
+exit /b 0
+
+REM ---------------------------------------------------------------------------
+REM :archive_tar  - Linux release tarball, written by tools\mktargz.go rather
+REM than the host `tar`. There is no portable tar here: Windows 10+ ships bsdtar
+REM in System32 and Git for Windows ships GNU tar, and whichever wins the PATH
+REM race decides whether --mode is accepted at all (bsdtar rejects it). --mode is
+REM what restores the execute bit the Windows-staged binary has no way to carry,
+REM so the extracted chrome-mv2 runs without a manual chmod. The Go helper needs
+REM only the toolchain already required in step 0, and records the modes and the
+REM entry order itself. Members are named explicitly rather than globbed so a
+REM stray file in the stage dir can't slip into a release.
+REM ---------------------------------------------------------------------------
+:archive_tar
+set "TARBALL=%OUTDIR%\chrome-mv2-v%APP_VER%-%PLAT%.tar.gz"
+REM The helper has to build and run for the HOST, so drop the cross-build vars
+REM :package set (:package_reset clears them again right after this returns).
+set "GOOS="
+set "GOARCH="
+go run tools\mktargz.go -o "%TARBALL%" -C "%STAGE%" -exec "%BIN%" "%BIN%" signatures.json LICENSE README.md
+if errorlevel 1 (
+    echo %T_WARN% %PLAT% built, but tarring failed.
+    set "FAILED=%FAILED% %PLAT%-tar"
+) else (
+    echo %T_OK% %PLAT%: %C_BLD%%OUTDIR%\%BIN%%C_RST% + %C_BLD%%TARBALL%%C_RST%
+)
+exit /b 0
+
+REM ---------------------------------------------------------------------------
+REM :archive_zip  - Windows release zip.
+REM ---------------------------------------------------------------------------
+:archive_zip
 set "ZIP=%OUTDIR%\chrome-mv2-v%APP_VER%-%PLAT%.zip"
 powershell -NoProfile -ExecutionPolicy Bypass -Command "Compress-Archive -Path '%STAGE%\*' -DestinationPath '%ZIP%' -Force"
 if errorlevel 1 (
@@ -134,8 +224,4 @@ if errorlevel 1 (
 ) else (
     echo %T_OK% %PLAT%: %C_BLD%%OUTDIR%\%BIN%%C_RST% + %C_BLD%%ZIP%%C_RST%
 )
-
-:package_reset
-set "GOOS="
-set "GOARCH="
 exit /b 0

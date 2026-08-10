@@ -78,9 +78,15 @@ valid. See mv2-reversing.md §7 (CARDINAL RULE).
 
 ## Derivation toolkit (`scripts/`)
 
-Cross-platform, dependency-free. Replaces the old single-build `port152/`
-workspace. See `scripts/README.md`.
+Cross-platform, mostly stdlib-only (the installer unwrap in
+`fetch_chrome_binary.py` shells out to 7-Zip; the rest need nothing). Replaces
+the old single-build `port152/` workspace. See `scripts/README.md`.
 
+- `fetch_chrome_binary.py` — download the stock gate binary itself: a channel's
+  current `chrome.dll` (PE64/PE32) or Linux `chrome` (ELF), unwrapped out of the
+  offline installer and left in `_scratch/` arch-tagged (name + PE-magic/ELF-class
+  checked). `--platform win64|win|linux`, `--channel`, `--version` (Chrome for
+  Testing fallback — unbranded, re-verify), `--list`. stdlib + 7-Zip.
 - `fetch_symbols.py` — download the symbols matching a binary (PE→PDB from the
   Chromium symbol server, ELF→`chrome.debug` streamed from the per-version zip),
   saving to `_scratch/`. stdlib only. Dispatches on file magic. (Moved here from
@@ -92,7 +98,8 @@ workspace. See `scripts/README.md`.
 - `resolve_symbols.py` — Windows-only PDB symbol resolver (dbghelp via ctypes),
   emits the `--symbols` JSON. On Linux the equivalent is `nm -SC chrome.debug`.
 
-Porting checklist: `fetch_symbols.py` → name gates (`resolve_symbols.py` / `nm`) →
+Porting checklist: `fetch_chrome_binary.py` (get the stock binary) →
+`fetch_symbols.py` → name gates (`resolve_symbols.py` / `nm`) →
 `derive_milestone.py --symbols … --json` → add the entry to `signatures.json` →
 `derive_milestone.py --verify` must pass → patch a scratch copy and GUI-test.
 Full detail in mv2-reversing.md §5.
@@ -105,7 +112,7 @@ Full detail in mv2-reversing.md §5.
   per platform and a release zip each, all under `build/`:
   `build\chrome-mv2.exe` (windows/amd64) + `chrome-mv2-v<ver>-windows-amd64.zip`,
   `build\chrome-mv2-x86.exe` (windows/386) + `…-windows-386.zip`, and
-  `build\chrome-mv2` (linux/amd64) + `…-linux-amd64.zip` (each zip bundles the
+  `build\chrome-mv2` (linux/amd64) + `…-linux-amd64.tar.gz` (each archive bundles the
   binary + `signatures.json` + LICENSE + README, and `signatures.json` is also
   copied next to each loose binary in `build\`). Version is read from `appVersion`
   in `internal/app/app.go`. (ARM is intentionally not built: the engine flips
@@ -119,6 +126,27 @@ Full detail in mv2-reversing.md §5.
   are transient — build.bat deletes them in the tidy step, so a plain
   `go build ./cmd/chrome-mv2` stays manifest-free and runnable unelevated for
   offline `MV2_TEST_NO_ELEVATION` testing. Only the `.manifest` XML is tracked.
+- Linux tarball: written by `tools/mktargz.go` (`//go:build ignore`, run via
+  `go run`, so it stays out of `./...`), not by the host `tar`. There is no
+  portable tar on a Windows build host — Windows 10+ ships bsdtar in System32,
+  Git for Windows ships GNU tar, and only GNU tar accepts `--mode`, which is
+  what restores the execute bit a Windows-staged file cannot carry. The helper
+  records modes (0755 for the binary, 0644 for the rest) and entry order itself,
+  needing nothing beyond the Go toolchain build.bat already requires. Note it
+  must clear `GOOS`/`GOARCH` first — `build.bat`'s `:archive_tar` runs inside
+  the linux cross-build, and `go run` has to build for the host.
+- `build.bat` **must stay CRLF** (pinned by `.gitattributes`). cmd.exe seeks
+  batch files by byte offset instead of parsing them up front, so an LF-only
+  `.bat` can resume mid-line after a `CALL` and fail to find a label that is
+  plainly present ("The system cannot find the batch label specified"). It is
+  positional, so it stays hidden until an edit shifts the offsets — it surfaced
+  once as the third `call :package` (linux) failing while the first two ran.
+  Step 6's `:require` checks each target's loose binary exists, so a call that
+  never lands is reported instead of passing as a silent SUCCESS.
+- Double-clicking `build.bat` from Explorer pauses at the end so the output
+  stays readable; run from a terminal it does not. Detected via `%cmdcmdline%`
+  (see the `:hold` subroutine); `MV2_BUILD_NOPAUSE=1` forces it off for scripted
+  builds.
 - The patcher is idempotent, verifies every site on disk after writing, and on
   Windows clears the Security directory and recomputes the PE checksum (both moot
   on ELF). If all signatures miss, it reports structural candidates and **refuses

@@ -36,7 +36,7 @@ under `build/` — only the Go toolchain is required:
 | `chrome-mv2-x86.exe` | Windows x86 (`386`) | 32-bit `chrome.dll` |
 | `chrome-mv2` | Linux x64 (`amd64`) | the ELF `chrome` |
 
-(zips: `chrome-mv2-v<ver>-windows-amd64.zip`, `…-windows-386.zip`, `…-linux-amd64.zip`.)
+(archives: `chrome-mv2-v<ver>-windows-amd64.zip`, `…-windows-386.zip`, `…-linux-amd64.tar.gz`.)
 Or directly:
 
 ```

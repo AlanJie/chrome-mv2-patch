@@ -1,0 +1,20 @@
+# cmd.exe seeks batch files by byte offset rather than parsing them up front, so
+# an LF-only .bat can resume mid-line after a CALL and lose a label that is
+# plainly there ("The system cannot find the batch label specified"). The failure
+# is positional, so it hides until an edit shifts the offsets. Pin CRLF.
+*.bat text eol=crlf
+
+# Everything else is LF in the repo and converted on checkout per core.autocrlf.
+*.go     text eol=lf
+*.py     text eol=lf
+*.md     text eol=lf
+*.json   text eol=lf
+LICENSE  text eol=lf
+
+# Release archives and symbol/binary artifacts must never be line-ending mangled.
+*.zip    binary
+*.tar.gz binary
+*.exe    binary
+*.dll    binary
+*.syso   binary
+*.pdb    binary

@@ -19,7 +19,7 @@ Usage:
 
 Then feed the result to the rest of the pipeline:
     Windows: python scripts/resolve_symbols.py <chrome.dll> --symdir _scratch --json _scratch/syms.json
-    Linux:   nm -SC _scratch/chrome.debug > _scratch/syms.txt
+    Linux:   python scripts/dump_symtab.py _scratch/chrome.debug _scratch/syms.txt
     both  -> python scripts/derive_milestone.py <binary> --symbols … --name <ver> --json
 """
 
