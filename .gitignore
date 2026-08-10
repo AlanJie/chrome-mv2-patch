@@ -1,7 +1,5 @@
-*.exe
-*.zip
+/build/
+/_scratch/
+__pycache__/
 *.pdb
-*.dll
-*.bak
-*/__pycache__/*
-port152/symbols.json
+*.debug

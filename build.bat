@@ -1,12 +1,10 @@
 @echo off
 REM Delayed expansion is deliberately NOT enabled: it eats the "!" in the [!]
-REM tag, and every escape that survives a `set` was worse than the alternative.
-REM `if errorlevel 1` reads the code at run time, so nothing here needs it.
+REM tag. `if errorlevel 1` reads the code at run time, so nothing here needs it.
 setlocal
 
 REM Console colour. The ESC byte comes from `prompt $E`; if that fails or NO_COLOR
 REM is set, every code stays empty and the output is the plain text as before.
-REM Batch cannot detect a redirected stdout, so NO_COLOR is the way to silence it.
 set "ESC="
 if not defined NO_COLOR for /f %%E in ('echo prompt $E^| cmd') do set "ESC=%%E"
 
@@ -25,142 +23,119 @@ set "T_FAIL=%C_BLD%%C_RED%[ERROR]%C_RST%"
 set "T_DONE=%C_BLD%%C_GRN%[SUCCESS]%C_RST%"
 
 echo %C_CYN%===================================================%C_RST%
-echo         %C_BLD%Building Chrome Manifest V2 Patcher%C_RST%
+echo         %C_BLD%Building Chrome Manifest V2 Patcher (Go)%C_RST%
 echo %C_CYN%===================================================%C_RST%
 
-REM 0. Read the version from chrome-mv2-patch.cpp (single source of truth).
-set "VMAJ=0"
-set "VMIN=0"
-set "VPAT=0"
-set "VBLD=0"
-for /f "tokens=3" %%i in ('findstr /b /c:"#define APP_VER_MAJOR" chrome-mv2-patch.cpp') do set "VMAJ=%%i"
-for /f "tokens=3" %%i in ('findstr /b /c:"#define APP_VER_MINOR" chrome-mv2-patch.cpp') do set "VMIN=%%i"
-for /f "tokens=3" %%i in ('findstr /b /c:"#define APP_VER_PATCH" chrome-mv2-patch.cpp') do set "VPAT=%%i"
-for /f "tokens=3" %%i in ('findstr /b /c:"#define APP_VER_BUILD" chrome-mv2-patch.cpp') do set "VBLD=%%i"
-set "APP_VER=%VMAJ%.%VMIN%.%VPAT%"
+REM 0. Require the Go toolchain.
+where go >nul 2>&1
+if errorlevel 1 (
+    echo %T_FAIL% Could not find go.exe. Install Go from https://go.dev/dl and re-run.
+    exit /b 1
+)
+
+REM 1. Read the version from the Go source (single source of truth: appVersion
+REM    in internal\app\app.go, e.g. `const appVersion = "1.1.0"`).
+set "APP_VER=0.0.0"
+for /f tokens^=2^ delims^=^" %%i in ('findstr /c:"appVersion = " internal\app\app.go') do set "APP_VER=%%i"
 echo %T_INFO% Patcher version: %C_BLD%%APP_VER%%C_RST%
 
-REM 1. Locate Visual Studio vcvars64.bat (auto-detect any edition/version)
-set "VS_PATH="
+set "PKG=./cmd/chrome-mv2"
+set "OUTDIR=build"
 
-REM 1a. Preferred: ask vswhere for any install with the C++ toolset (covers all editions incl. Build Tools).
-for %%V in ("%ProgramFiles(x86)%" "%ProgramFiles%") do (
-    if not defined VS_PATH if exist "%%~V\Microsoft Visual Studio\Installer\vswhere.exe" (
-        for /f "usebackq tokens=*" %%i in (`"%%~V\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath`) do (
-            if exist "%%i\VC\Auxiliary\Build\vcvars64.bat" (
-                set "VS_PATH=%%i\VC\Auxiliary\Build\vcvars64.bat"
-            )
-        )
-    )
-)
+REM 2. Fresh build/ tree.
+if exist "%OUTDIR%" rmdir /s /q "%OUTDIR%"
+mkdir "%OUTDIR%"
 
-REM 1b. Fallback: scan both Program Files roots for ANY vcvars64.bat (any year/edition).
-if not defined VS_PATH (
-    for %%R in ("%ProgramFiles%\Microsoft Visual Studio" "%ProgramFiles(x86)%\Microsoft Visual Studio") do (
-        if not defined VS_PATH if exist "%%~R" (
-            for /f "delims=" %%i in ('dir /b /s "%%~R\vcvars64.bat" 2^>nul') do (
-                if not defined VS_PATH set "VS_PATH=%%i"
-            )
-        )
-    )
-)
+REM 3. Embed the Windows UAC manifest (requireAdministrator) for the release
+REM    build. The .syso is a transient artifact regenerated from the manifest
+REM    each run and removed in the tidy step (step 5), so a plain
+REM    `go build ./cmd/chrome-mv2` stays manifest-free - handy for unelevated
+REM    offline testing with MV2_TEST_NO_ELEVATION. `go build` auto-links the
+REM    rsrc_windows_<GOARCH>.syso matching each target, so one is generated per
+REM    Windows arch (amd64 + 386); the _windows_ suffix keeps them out of the
+REM    Linux cross-build. rsrc runs via `go run pkg@version` - fetched to the
+REM    module cache, never added to go.mod.
+set "MANIFEST=cmd\chrome-mv2\chrome-mv2.exe.manifest"
+call :manifest amd64
+call :manifest 386
 
-if defined VS_PATH (
-    echo %T_INFO% Found Visual Studio vcvars64 at: %C_DIM%"%VS_PATH%"%C_RST%
-    call "%VS_PATH%" >nul
-) else (
-    echo %T_WARN% vcvars64.bat not found automatically. Checking if cl.exe is in PATH...
-)
+REM 4. Build + package one binary per platform. Each :package call cross-builds
+REM    from this one toolchain (no CGO), stages the binary + LICENSE + README
+REM    into build\stage\<os>-<arch>\, and zips it to build\<os>-<arch>.zip.
+set "FAILED="
+call :package windows amd64 chrome-mv2.exe
+call :package windows 386   chrome-mv2-x86.exe
+call :package linux   amd64 chrome-mv2
 
-where cl.exe >nul 2>&1
-if errorlevel 1 (
-    echo %T_FAIL% Could not find cl.exe. Please run build.bat from Visual Studio Developer Command Prompt.
-    exit /b 1
-)
-
-REM 2. Generate + compile the Windows version resource (embeds FILEVERSION /
-REM    "Details" tab). The .rc is written here from the version parsed above, so
-REM    the .cpp stays the only source of truth and no .rc is checked in. rc.exe
-REM    ships with the Windows SDK and is on PATH after vcvars64. If it is missing,
-REM    build without the resource rather than failing the whole build.
-set "RES_FILE="
-set "RC_TMP=chrome-mv2-patch.rc"
-where rc.exe >nul 2>&1
-if errorlevel 1 (
-    echo %T_WARN% rc.exe not found; building without embedded version resource.
-) else (
-    echo %T_INFO% Generating and compiling version resource...
-    (
-        echo #include ^<winver.h^>
-        echo VS_VERSION_INFO VERSIONINFO
-        echo  FILEVERSION    %VMAJ%,%VMIN%,%VPAT%,%VBLD%
-        echo  PRODUCTVERSION %VMAJ%,%VMIN%,%VPAT%,%VBLD%
-        echo  FILEFLAGSMASK  0x3fL
-        echo  FILEFLAGS      0x0L
-        echo  FILEOS         0x40004L
-        echo  FILETYPE       0x1L
-        echo  FILESUBTYPE    0x0L
-        echo BEGIN
-        echo     BLOCK "StringFileInfo"
-        echo     BEGIN
-        echo         BLOCK "040904b0"
-        echo         BEGIN
-        echo             VALUE "CompanyName",      "chrome-patcher"
-        echo             VALUE "FileDescription",  "Google Chrome chrome.dll Manifest V2 Patcher"
-        echo             VALUE "FileVersion",      "%APP_VER%"
-        echo             VALUE "InternalName",     "chrome-mv2-patch"
-        echo             VALUE "OriginalFilename", "chrome-mv2-patch.exe"
-        echo             VALUE "ProductName",      "Chrome MV2 Patcher"
-        echo             VALUE "ProductVersion",   "%APP_VER%"
-        echo         END
-        echo     END
-        echo     BLOCK "VarFileInfo"
-        echo     BEGIN
-        echo         VALUE "Translation", 0x409, 1200
-        echo     END
-        echo END
-    ) > "%RC_TMP%"
-    rc.exe /nologo /fo chrome-mv2-patch.res "%RC_TMP%"
-    if errorlevel 1 (
-        echo %T_WARN% rc.exe failed; building without embedded version resource.
-    ) else (
-        set "RES_FILE=chrome-mv2-patch.res"
-    )
-    del /q "%RC_TMP%" 2>nul
-)
-
-REM 3. Compile chrome-mv2-patch.exe (Standalone chrome.dll Binary Patcher)
-echo %T_INFO% Compiling chrome-mv2-patch.exe (x64)...
-cl.exe /O2 /EHsc /std:c++17 /W3 /D_CRT_SECURE_NO_WARNINGS chrome-mv2-patch.cpp %RES_FILE% /link /OUT:chrome-mv2-patch.exe /MANIFEST /MANIFESTUAC:"level='requireAdministrator' uiAccess='false'" /MANIFEST:EMBED shell32.lib user32.lib advapi32.lib version.lib rstrtmgr.lib
-
-if errorlevel 1 (
-    echo %T_FAIL% chrome-mv2-patch.exe compilation failed.
-    del /q chrome-mv2-patch.obj 2>nul
-    del /q chrome-mv2-patch.res 2>nul
-    exit /b 1
-)
-
-echo %T_OK% Compilation succeeded: %C_BLD%chrome-mv2-patch.exe%C_RST%
-
-REM 4. Clean up intermediate build artifacts
-echo %T_INFO% Cleaning up intermediate build artifacts...
-del /q chrome-mv2-patch.obj 2>nul
-del /q chrome-mv2-patch.res 2>nul
-
-REM 5. Package the versioned release zip (exe only) for GitHub releases.
-set "ZIP_NAME=chrome-mv2-patch-v%APP_VER%.zip"
-echo %T_INFO% Packaging release archive %ZIP_NAME%...
-del /q "%ZIP_NAME%" 2>nul
-powershell -NoProfile -ExecutionPolicy Bypass -Command "Compress-Archive -Path 'chrome-mv2-patch.exe' -DestinationPath '%ZIP_NAME%' -Force"
-if errorlevel 1 (
-    echo %T_WARN% Failed to create %ZIP_NAME%. The exe built fine; is PowerShell available?
-) else (
-    echo %T_OK% Release archive ready: %C_BLD%%ZIP_NAME%%C_RST%
-)
+REM 5. Tidy: drop the staging tree and the transient manifest resources, leaving
+REM    the loose binaries and the per-platform .zip in build\.
+rmdir /s /q "%OUTDIR%\stage" 2>nul
+del /q cmd\chrome-mv2\rsrc_windows_*.syso 2>nul
 
 echo.
+if defined FAILED (
+    echo %C_CYN%===================================================%C_RST%
+    echo %T_WARN% Finished with errors: %FAILED%
+    echo %C_CYN%===================================================%C_RST%
+    exit /b 1
+)
 echo %C_CYN%===================================================%C_RST%
-echo %T_DONE% Build process completed successfully!
+echo %T_DONE% Build complete. Artifacts in %C_BLD%%OUTDIR%\%C_RST%
 echo %C_CYN%===================================================%C_RST%
-
 endlocal
+exit /b 0
+
+REM ---------------------------------------------------------------------------
+REM :manifest <goarch>  - regenerate the per-arch UAC manifest .syso. A
+REM subroutine (not an inline `for ( )` block) so the parens in
+REM "(requireAdministrator)" don't break the batch parser.
+REM ---------------------------------------------------------------------------
+:manifest
+echo %T_INFO% Embedding Windows manifest (requireAdministrator) for %~1...
+go run github.com/akavel/rsrc@v0.10.2 -manifest "%MANIFEST%" -arch %~1 -o "cmd\chrome-mv2\rsrc_windows_%~1.syso" 2>nul
+if errorlevel 1 (
+    echo %T_WARN% Could not generate the %~1 manifest resource - offline first run? That Windows exe will NOT request elevation.
+) else (
+    echo %T_OK% Manifest resource: %C_BLD%cmd\chrome-mv2\rsrc_windows_%~1.syso%C_RST%
+)
+exit /b 0
+
+REM ---------------------------------------------------------------------------
+REM :package <goos> <goarch> <binary-name>
+REM ---------------------------------------------------------------------------
+:package
+set "GOOS=%~1"
+set "GOARCH=%~2"
+set "BIN=%~3"
+set "PLAT=%~1-%~2"
+set "STAGE=%OUTDIR%\stage\%PLAT%"
+mkdir "%STAGE%" 2>nul
+
+echo %T_INFO% Building %C_BLD%%BIN%%C_RST% (%PLAT%)...
+go build -trimpath -ldflags "-s -w" -o "%STAGE%\%BIN%" %PKG%
+if errorlevel 1 (
+    echo %T_ERR% %PLAT% build failed.
+    set "FAILED=%FAILED% %PLAT%"
+    goto :package_reset
+)
+REM Loose binary + its runtime signature table at build\ for quick local use.
+copy /y "%STAGE%\%BIN%" "%OUTDIR%\%BIN%" >nul
+copy /y signatures.json "%OUTDIR%\signatures.json" >nul
+REM Bundle the runtime table (read from beside the binary) + docs in the zip.
+copy /y signatures.json "%STAGE%\signatures.json" >nul
+copy /y LICENSE "%STAGE%\LICENSE" >nul 2>nul
+copy /y README.md "%STAGE%\README.md" >nul 2>nul
+
+set "ZIP=%OUTDIR%\chrome-mv2-v%APP_VER%-%PLAT%.zip"
+powershell -NoProfile -ExecutionPolicy Bypass -Command "Compress-Archive -Path '%STAGE%\*' -DestinationPath '%ZIP%' -Force"
+if errorlevel 1 (
+    echo %T_WARN% %PLAT% built, but zipping failed - is PowerShell available?
+    set "FAILED=%FAILED% %PLAT%-zip"
+) else (
+    echo %T_OK% %PLAT%: %C_BLD%%OUTDIR%\%BIN%%C_RST% + %C_BLD%%ZIP%%C_RST%
+)
+
+:package_reset
+set "GOOS="
+set "GOARCH="
+exit /b 0

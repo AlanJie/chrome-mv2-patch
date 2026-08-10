@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<!--
+  Windows application manifest for chrome-mv2.exe.
+
+  Embedded into the Windows build as a resource: build.bat regenerates
+  rsrc_windows_amd64.syso from this file, and `go build` auto-links any .syso in
+  the main package directory (the _windows_amd64 suffix scopes it to that
+  GOOS/GOARCH, so the Linux cross-build ignores it).
+
+  requireAdministrator makes Windows show the UAC elevation prompt on launch and
+  marks the binary as needing admin - the equivalent of the old C++ build's
+  /MANIFESTUAC:"level='requireAdministrator' uiAccess='false'". The tool needs
+  admin to modify chrome.dll under Program Files.
+-->
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+  <trustInfo xmlns="urn:schemas-microsoft-com:asm.v3">
+    <security>
+      <requestedPrivileges>
+        <requestedExecutionLevel level="requireAdministrator" uiAccess="false"/>
+      </requestedPrivileges>
+    </security>
+  </trustInfo>
+</assembly>
