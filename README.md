@@ -1,59 +1,58 @@
-# Chrome Manifest V2 Extension Patcher
+# Chrome MV2 Extension Patcher
 
-A standalone patcher that re-enables Manifest V2 extension support in Chrome by changing a few bytes in the code to skip specific checks. The details in [`mv2-reversing.md`](mv2-reversing.md).
+Re-enables Manifest V2 extensions in Chrome by patching a few bytes. See [`mv2-reversing.md`](mv2-reversing.md) for details.
+
+## Supported Versions
+
+- ✅ Windows x64
+- ✅ Windows x86 (32-bit)
+- ✅ Linux x64
+- ❌ macOS (not yet supported)
+- ❌ ARM (not yet supported)
 
 ## Usage
 
-```
-chrome-mv2 patch          [path]   flip the MV2 gates (default command)
-chrome-mv2 restore        [path]   restore the target binary from its .bak
-```
+### Windows
 
-Run elevated (Administrator on Windows, `sudo` on Linux). With no path, installed channels are listed so you can pick one — or press `c` at the prompt to type any `chrome.dll` path yourself (handy for a copy kept outside the standard install folders). Options: `-y/--yes` (force-close a running Chrome), `-q/--quiet` (no exit pause, for scripting), `-v/--version`, `-h/--help`.
+Run [`chrome-mv2.ps1`](chrome-mv2.ps1):
 
-Both 32-bit (x86) and 64-bit (x64) Chrome for Windows are supported: the `-x86` build patches a 32-bit `chrome.dll`, the plain build a 64-bit one. Each parses its own format and only applies signatures for that architecture.
-
-Chrome-version signatures live in [`signatures.json`](signatures.json), read at runtime from next to the binary (not embedded), so the table can be updated without a rebuild — just ship a new `signatures.json` beside the exe. Derive a new version's entry with `python scripts/derive_milestone.py` (see [`scripts/README.md`](scripts/README.md)).
-
-## Layout
-
-```
-cmd/chrome-mv2/        thin main() entry point
-internal/app/          engine, PE/ELF image layer, platform glue
-signatures.json        the gate signature table (read at runtime, ships beside the binary)
-scripts/               cross-platform toolkit: fetch symbols, derive + verify signatures (see scripts/README.md)
-mv2-reversing.md       the reverse-engineering write-up (both platforms)
+```powershell
+powershell -ExecutionPolicy Bypass -File chrome-mv2.ps1
 ```
 
-## Building
+### Linux
 
-`build.bat` (Windows) builds one binary per platform and a release zip each,
-under `build/` — only the Go toolchain is required:
+Run [`chrome-mv2.sh`](chrome-mv2.sh):
 
-| Output | Target | Patches |
-| :--- | :--- | :--- |
-| `chrome-mv2.exe` | Windows x64 (`amd64`) | 64-bit `chrome.dll` |
-| `chrome-mv2-x86.exe` | Windows x86 (`386`) | 32-bit `chrome.dll` |
-| `chrome-mv2` | Linux x64 (`amd64`) | the ELF `chrome` |
-
-(archives: `chrome-mv2-v<ver>-windows-amd64.zip`, `…-windows-386.zip`, `…-linux-amd64.tar.gz`.)
-Or directly:
-
-```
-go build -o chrome-mv2      ./cmd/chrome-mv2               # host OS
-GOOS=linux   GOARCH=amd64 go build -o chrome-mv2-linux   ./cmd/chrome-mv2
-GOOS=windows GOARCH=amd64 go build -o chrome-mv2.exe     ./cmd/chrome-mv2
-GOOS=windows GOARCH=386   go build -o chrome-mv2-x86.exe ./cmd/chrome-mv2
+```bash
+chmod +x ./chrome-mv2.sh
+sudo ./chrome-mv2.sh
 ```
 
-`signatures.json` is read at runtime, so it must sit next to the binary (or in the current directory). `build.bat` places it beside each binary and inside each release zip; a plain `go build` does not, so copy `signatures.json` next to the exe before running it.
+## Adding New Chrome Versions
 
-The Windows release built by `build.bat` embeds a `requireAdministrator` manifest (`cmd/chrome-mv2/chrome-mv2.exe.manifest`), so it prompts for UAC elevation on launch — the tool needs admin to modify `chrome.dll`. A plain `go build` omits the manifest, which is convenient for unelevated offline testing (`MV2_TEST_NO_ELEVATION=1`).
+Update the signature tables when a new Chrome version comes out:
 
-## Verification
+- **Windows**: Edit the `$EmbeddedSignatures` block in `chrome-mv2.ps1`, or put a `signatures.json` next to it
+- **Linux**: Edit the `EMBEDDED_SIGNATURES` block in `chrome-mv2.sh`, or put a `signatures.json` next to it
 
-Install [uBlock Origin](https://chromewebstore.google.com/detail/ublock-origin/cjpalhdlnbpafiamejdnhcphjbkeiagm) available until the end of August 2026.
-Or load it unpacked: enable `Developer mode` on `chrome://extensions`, click `Load unpacked`, and select the `uBlock0.chromium` folder from a [uBlock Origin release](https://github.com/gorhill/uBlock/releases).
+Both scripts have signatures built in and will use an external `signatures.json` if present (it overrides the embedded ones).
+
+Use the Python tools in `scripts/` to derive new signatures (see [`scripts/README.md`](scripts/README.md)).
+
+## Files
+
+- `chrome-mv2.ps1` - PowerShell script for Windows
+- `chrome-mv2.sh` - Bash script for Linux  
+- `signatures.json` - signature database
+- `scripts/` - Python tools to derive new signatures
+- `mv2-reversing.md` - reverse engineering notes
+
+## Testing
+
+Install [uBlock Origin](https://chromewebstore.google.com/detail/ublock-origin/cjpalhdlnbpafiamejdnhcphjbkeiagm) from the Chrome Web Store (available until end of August 2026).
+
+Or load it unpacked: turn on Developer mode at `chrome://extensions`, click Load unpacked, and pick the `uBlock0.chromium` folder from a [uBlock Origin release](https://github.com/gorhill/uBlock/releases).
 
 ## Donate
 
