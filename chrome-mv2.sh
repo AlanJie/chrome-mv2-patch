@@ -38,7 +38,7 @@
 # Usage:
 #   sudo bash chrome-mv2.sh [patch|restore] [path] [--yes] [--quiet]
 #
-# Requirements: bash 4+, dd, od, grep, tail, head, mktemp, mv, chmod, sync
+# Requirements: bash 4+, dd, od, grep, head, mktemp, mv, chmod, sync
 #               (all coreutils/POSIX - no xxd/vim needed)
 # ============================================================================
 
@@ -146,8 +146,25 @@ get_signatures_path() {
     return 1
 }
 
-# Parse JSON and populate MILESTONE_* arrays
-# Requires: jq (but we'll use basic grep/sed parsing to avoid dependency)
+# Minimal JSON field readers for the fixed signatures schema.  These avoid jq
+# and GNU grep -P while still accepting normal pretty-printed JSON whitespace.
+json_string_field() {
+    local text="$1" key="$2"
+    local re="\"${key}\"[[:space:]]*:[[:space:]]*\"([^\"]*)\""
+    if [[ "$text" =~ $re ]]; then
+        printf '%s' "${BASH_REMATCH[1]}"
+    fi
+}
+
+json_number_field() {
+    local text="$1" key="$2"
+    local re="\"${key}\"[[:space:]]*:[[:space:]]*([0-9]+)"
+    if [[ "$text" =~ $re ]]; then
+        printf '%s' "${BASH_REMATCH[1]}"
+    fi
+}
+
+# Parse JSON and populate MILESTONE_* arrays without jq or another JSON tool.
 load_milestones() {
     local json_data=""
     local src_label=""
@@ -166,68 +183,81 @@ load_milestones() {
         json_data="$EMBEDDED_SIGNATURES"
         src_label="embedded tables"
     fi
+
+    # The external document is intentionally human-readable and therefore
+    # spans many lines, while the tiny embedded document uses one object per
+    # line.  The parser below is deliberately dependency-free and operates on
+    # one milestone object at a time, so normalize line endings/whitespace
+    # boundaries before extracting objects.
+    json_data="${json_data//$'\r'/}"
+    json_data="${json_data//$'\n'/}"
     
-    # Parse JSON manually (to avoid jq dependency)
-    # Extract milestones array and parse each milestone
-    
+    # Parse the constrained signatures schema manually (no jq dependency).
     MILESTONE_NAMES=()
     MILESTONE_CONTAINERS=()
     NUM_MILESTONES=0
-    
-    # Simple JSON parsing using grep and sed
-    # This is a minimal parser for our specific JSON structure
+
     local milestone_idx=0
-    
-    # Extract each milestone object
-    while IFS= read -r ms_line; do
+    local remaining="$json_data"
+    local milestone_re='(\{[[:space:]]*"name"[[:space:]]*:[[:space:]]*"[^"]+"[[:space:]]*,[[:space:]]*"container"[[:space:]]*:[[:space:]]*"[^"]+"[[:space:]]*,[[:space:]]*"sites"[[:space:]]*:[[:space:]]*\[[^]]*\][[:space:]]*\})'
+
+    while [[ "$remaining" =~ $milestone_re ]]; do
+        local ms_line="${BASH_REMATCH[1]}"
+        remaining="${remaining#*"${BASH_REMATCH[0]}"}"
+
         # Extract name
         local name
-        name=$(echo "$ms_line" | grep -oP '"name"\s*:\s*"\K[^"]+' | head -1)
-        
+        name=$(json_string_field "$ms_line" "name")
+
         # Extract container
         local container
-        container=$(echo "$ms_line" | grep -oP '"container"\s*:\s*"\K[^"]+' | head -1)
-        
+        container=$(json_string_field "$ms_line" "container")
+
         if [[ -z "$name" || -z "$container" ]]; then
             continue
         fi
-        
+
         MILESTONE_NAMES+=("$name")
         MILESTONE_CONTAINERS+=("$container")
-        
+
         # Parse sites array for this milestone
-        local sites_json
-        sites_json=$(echo "$ms_line" | grep -oP '"sites"\s*:\s*\[\K[^\]]+')
-        
+        local sites_json=""
+        local sites_re='"sites"[[:space:]]*:[[:space:]]*\[([^]]*)\]'
+        if [[ "$ms_line" =~ $sites_re ]]; then
+            sites_json="${BASH_REMATCH[1]}"
+        fi
+
         # Create a variable name for this milestone's sites
         local sites_var="MILESTONE_${milestone_idx}_SITES"
         declare -g -a "$sites_var"
-        
+
         # Parse each site
         local site_specs=()
-        while IFS= read -r site_obj; do
-            [[ -z "$site_obj" ]] && continue
-            
+        local site_re='(\{[^{}]*\})'
+        while [[ "$sites_json" =~ $site_re ]]; do
+            local site_obj="${BASH_REMATCH[1]}"
+            sites_json="${sites_json#*"${BASH_REMATCH[0]}"}"
+
             local s_name s_kind s_jgrva s_jgoff s_expected s_sig
-            s_name=$(echo "$site_obj" | grep -oP '"name"\s*:\s*"\K[^"]+')
-            s_kind=$(echo "$site_obj" | grep -oP '"kind"\s*:\s*"\K[^"]+')
-            s_jgrva=$(echo "$site_obj" | grep -oP '"jgRVA"\s*:\s*"\K[^"]+')
-            s_jgoff=$(echo "$site_obj" | grep -oP '"jgOff"\s*:\s*\K[0-9]+')
-            s_expected=$(echo "$site_obj" | grep -oP '"expectedMatches"\s*:\s*\K[0-9]+')
-            s_sig=$(echo "$site_obj" | grep -oP '"sig"\s*:\s*"\K[^"]+')
-            
+            s_name=$(json_string_field "$site_obj" "name")
+            s_kind=$(json_string_field "$site_obj" "kind")
+            s_jgrva=$(json_string_field "$site_obj" "jgRVA")
+            s_jgoff=$(json_number_field "$site_obj" "jgOff")
+            s_expected=$(json_number_field "$site_obj" "expectedMatches")
+            s_sig=$(json_string_field "$site_obj" "sig")
+
             if [[ -n "$s_name" && -n "$s_kind" && -n "$s_jgrva" ]]; then
                 local spec="${s_name}|${s_kind}|${s_jgrva}|${s_jgoff}|${s_expected}|${s_sig}"
                 site_specs+=("$spec")
             fi
-        done < <(echo "$sites_json" | grep -oP '\{[^}]+\}' || true)
-        
+        done
+
         # Assign sites to the milestone variable
         eval "${sites_var}=(\"\${site_specs[@]}\")"
-        
+
         ((milestone_idx++)) || true
-    done < <(echo "$json_data" | grep -oP '\{"name"[^}]+,"container"[^}]+,"sites":\[[^\]]+\]\}' || true)
-    
+    done
+
     NUM_MILESTONES=$milestone_idx
     
     if (( NUM_MILESTONES == 0 )); then
@@ -469,52 +499,66 @@ parse_elf() {
 # ============================================================================
 # Signature matching engine
 #
-# For each site, first try the fast path (probe the known RVA), then fall back
-# to a full .text scan using od+grep.  A site is accepted only when the match
-# count equals expectedMatches exactly.
+# For each site, first try the fast path (probe the known RVA), then use one
+# raw-byte fixed-anchor scan shared by every unresolved signature.  A site is
+# accepted only when the match count equals expectedMatches exactly.
 # ============================================================================
 
-# The hex dump of .text is cached here for the slow path.
-TEXT_HEX_FILE=""
-
-ensure_text_hex() {
-    if [[ -n "$TEXT_HEX_FILE" && -f "$TEXT_HEX_FILE" ]]; then return 0; fi
-    TEXT_HEX_FILE=$(mktemp /tmp/chrome-mv2-hex.XXXXXX)
-    infof "Dumping .text to hex for signature scanning (this may take a moment)..."
-    # head|tail slice out .text and od hex-encodes it: all coreutils, so no
-    # xxd (vim) dependency, and no dd bs=1 (which made one syscall per byte).
-    # head reads from the file FIRST so no pipe writer outlives its reader
-    # (a tail|head order would SIGPIPE tail under 'set -o pipefail').
-    # od -v is required: without it od collapses repeated lines to '*'.
-    head -c "$(( TEXT_RAW + TEXT_SIZE ))" -- "$TARGET_FILE" \
-        | tail -c "+$(( TEXT_RAW + 1 ))" \
-        | od -A n -v -t x1 | tr -d ' \n' > "$TEXT_HEX_FILE"
-    okf "Hex dump ready ($(( $(stat -c%s "$TEXT_HEX_FILE" 2>/dev/null || stat -f%z "$TEXT_HEX_FILE" 2>/dev/null) / 1024 / 1024 )) MiB hex)."
+# The raw backend is available on the grep implementations shipped by the
+# mainstream Linux distributions.  It is deliberately feature-tested instead
+# of assuming GNU grep or requiring another package.
+init_scan_backend() {
+    # -f with multiple binary patterns is the feature the fast path needs.
+    # A newline terminates a grep pattern, so an anchor itself must not contain
+    # newline (enforced by build_binary_anchor).
+    local probe_patterns
+    probe_patterns=$(mktemp /tmp/chrome-mv2-probe.XXXXXX)
+    printf 'x\ny\n' > "$probe_patterns"
+    local ok=false
+    if printf 'xy' | LC_ALL=C grep -a -o -b -F -f "$probe_patterns" >/dev/null 2>&1; then ok=true; fi
+    rm -f -- "$probe_patterns"
+    if ! $ok; then
+        errf "This grep does not support the required raw fixed-string options (-a -o -b -F -f)."
+        echo "    Installations from mainstream Linux distributions include a compatible grep."
+        return 1
+    fi
 }
 
-# Build a grep pattern from a signature, masking the jg opcode and displacement.
-# For short jg: mask bytes at jgOff (2 hex chars) and jgOff+1 (2 hex chars) → "...." (4 dots)
-# For near jg: mask bytes at jgOff..jgOff+5 (12 hex chars) → "............" BUT
-#   actually we mask: jgOff (opcode 0F, 2 chars) + jgOff+1 (opcode 8F, 2 chars) + jgOff+2..+5 (disp32, 8 chars)
-#   → 12 dots total
-build_grep_pattern() {
-    local sig="$1" kind="$2" jg_off="$3"
-    local sig_upper
-    sig_upper=$(echo "$sig" | tr 'a-f' 'A-F')
-    local sig_len=${#sig_upper}
+    # Build the longest exact anchor that can safely be passed as a shell/grep
+    # match. NUL cannot be stored in a Bash variable, while newline and colon
+    # terminate or split grep's byte-offset output record, so split exact runs
+    # around all three bytes.
+BINARY_ANCHOR_HEX=""
+BINARY_ANCHOR_OFF=0
+build_binary_anchor() {
+    local sig="${1,,}" kind="$2" jg_off="$3"
+    local sig_bytes=$(( ${#sig} / 2 )) mask_len=2
+    [[ "$kind" == "near" ]] && mask_len=6
+    local mask_end=$(( jg_off + mask_len ))
 
-    # jgOff is in bytes; in hex chars it's jgOff*2
-    local hex_off=$(( jg_off * 2 ))
+    BINARY_ANCHOR_HEX=""
+    BINARY_ANCHOR_OFF=0
+    local best_len=0 best_start=0 start end byte run_len
+    for (( start = 0; start < sig_bytes; start++ )); do
+        run_len=0
+        for (( end = start; end < sig_bytes; end++ )); do
+            if (( end >= jg_off && end < mask_end )); then break; fi
+            byte="${sig:$(( end * 2 )):2}"
+            if [[ "$byte" == "00" || "$byte" == "0a" || "$byte" == "3a" ]]; then break; fi
+            (( run_len += 1 )) || true
+        done
+        if (( run_len > best_len )); then
+            best_len=$run_len
+            best_start=$start
+        fi
+    done
 
-    local result=""
-    if [[ "$kind" == "short" ]]; then
-        # Mask 2 bytes (4 hex chars) at hex_off: jg opcode + disp8
-        result="${sig_upper:0:$hex_off}....${sig_upper:$((hex_off + 4))}"
-    else
-        # Near jg: mask 6 bytes (12 hex chars) at hex_off: 0F 8F + disp32
-        result="${sig_upper:0:$hex_off}............${sig_upper:$((hex_off + 12))}"
+    # A tiny anchor creates too many candidates and defeats the purpose of the
+    # raw backend. Signature tables must provide at least one safe 4-byte run.
+    if (( best_len >= 4 )); then
+        BINARY_ANCHOR_HEX="${sig:$(( best_start * 2 )):$(( best_len * 2 ))}"
+        BINARY_ANCHOR_OFF=$best_start
     fi
-    echo "$result"
 }
 
 # sig_matches_at <file> <file_offset> <sig_hex> <kind> <jg_off> → 0 if matches
@@ -524,8 +568,7 @@ sig_matches_at() {
     local actual
     actual=$(read_bytes_hex "$file" "$file_offset" "$sig_len")
 
-    local sig_upper
-    sig_upper=$(echo "$sig_hex" | tr 'a-f' 'A-F')
+    local sig_upper="${sig_hex^^}"
 
     # Compare byte by byte, masking the jg opcode and displacement
     local i byte_idx
@@ -545,12 +588,12 @@ sig_matches_at() {
             fi
         else  # near
             if (( byte_idx == jg_off )); then
-                # first opcode byte: accept 0F (stock) or 90 (flipped)
-                if [[ "$act_byte" != "0F" && "$act_byte" != "90" ]]; then return 1; fi
+                # The two opcode bytes are a pair: accept only stock 0F 8F or
+                # already-flipped 90 E9, never a mixed pair.
+                local act_pair="${actual:$i:4}"
+                if [[ "$act_pair" != "0F8F" && "$act_pair" != "90E9" ]]; then return 1; fi
                 continue
             elif (( byte_idx == jg_off + 1 )); then
-                # second opcode byte: accept 8F (stock) or E9 (flipped)
-                if [[ "$act_byte" != "8F" && "$act_byte" != "E9" ]]; then return 1; fi
                 continue
             elif (( byte_idx >= jg_off + 2 && byte_idx <= jg_off + 5 )); then
                 # disp32: wildcard
@@ -564,10 +607,123 @@ sig_matches_at() {
     return 0
 }
 
+# Results from the one-pass raw scan, keyed by kind|jgOff|signature.  The scan
+# is lazy: an exact recorded-RVA build never pays for it.
+declare -A GLOBAL_SCAN_DONE=()
+declare -A GLOBAL_SCAN_MATCHES=()
+GLOBAL_SCAN_SOURCE=""
+GLOBAL_SCAN_TEXT_RAW=-1
+GLOBAL_SCAN_TEXT_SIZE=-1
+SCAN_PATTERNS_FILE=""
+
+prepare_global_raw_scan() {
+    local file="$1"
+    if [[ "$GLOBAL_SCAN_SOURCE" == "$file" && $GLOBAL_SCAN_TEXT_RAW -eq $TEXT_RAW && $GLOBAL_SCAN_TEXT_SIZE -eq $TEXT_SIZE ]]; then
+        return 0
+    fi
+
+    GLOBAL_SCAN_DONE=()
+    GLOBAL_SCAN_MATCHES=()
+    GLOBAL_SCAN_SOURCE="$file"
+    GLOBAL_SCAN_TEXT_RAW=$TEXT_RAW
+    GLOBAL_SCAN_TEXT_SIZE=$TEXT_SIZE
+
+    # Bash read applies the current locale while decoding grep's raw-byte
+    # output.  Invalid UTF-8 bytes can otherwise make it stop after the first
+    # match.  Keep both grep and the reader in the byte-oriented C locale.
+    local LC_ALL=C
+
+    local patterns_file
+    patterns_file=$(mktemp /tmp/chrome-mv2-patterns.XXXXXX)
+    SCAN_PATTERNS_FILE="$patterns_file"
+
+    local -A anchor_seen=()
+    local -A anchor_to_keys=()
+    local -A key_anchor_off=()
+    local mi site_spec name kind jg_rva_hex jg_off expected_matches sig_hex
+    local key anchor_hex anchor_bin ai abyte
+
+    for (( mi = 0; mi < NUM_MILESTONES; mi++ )); do
+        [[ "${MILESTONE_CONTAINERS[$mi]}" == "elf" ]] || continue
+        local sites_var="MILESTONE_${mi}_SITES[@]"
+        local sites=("${!sites_var}")
+        for site_spec in "${sites[@]}"; do
+            IFS='|' read -r name kind jg_rva_hex jg_off expected_matches sig_hex <<< "$site_spec"
+            sig_hex="${sig_hex^^}"
+            key="${kind}|${jg_off}|${sig_hex}"
+            [[ -n "${GLOBAL_SCAN_DONE[$key]+x}" ]] && continue
+
+            build_binary_anchor "$sig_hex" "$kind" "$jg_off"
+            anchor_hex="$BINARY_ANCHOR_HEX"
+            if [[ -z "$anchor_hex" ]]; then
+                errf "Signature has no safe raw scan anchor: ${name}"
+                rm -f -- "$patterns_file"
+                SCAN_PATTERNS_FILE=""
+                return 1
+            fi
+
+            anchor_bin=""
+            for (( ai = 0; ai < ${#anchor_hex}; ai += 2 )); do
+                abyte="${anchor_hex:ai:2}"
+                printf -v abyte '%b' "\\x${abyte}"
+                anchor_bin+="$abyte"
+            done
+
+            GLOBAL_SCAN_DONE["$key"]=1
+            GLOBAL_SCAN_MATCHES["$key"]=""
+            key_anchor_off["$key"]=$BINARY_ANCHOR_OFF
+            if [[ -z "${anchor_seen[$anchor_bin]+x}" ]]; then
+                anchor_seen["$anchor_bin"]=1
+                printf '%s\n' "$anchor_bin" >> "$patterns_file"
+            fi
+            if [[ -n "${anchor_to_keys[$anchor_bin]-}" ]]; then
+                anchor_to_keys["$anchor_bin"]+=" $key"
+            else
+                anchor_to_keys["$anchor_bin"]="$key"
+            fi
+        done
+    done
+
+    if [[ ! -s "$patterns_file" ]]; then
+        rm -f -- "$patterns_file"
+        SCAN_PATTERNS_FILE=""
+        return 0
+    fi
+
+    infof "Scanning raw signature candidates in one fixed-string pass..."
+    local anchor_pos keys sig_start sig_end jg_file_offset existing
+    while IFS=: read -r anchor_pos anchor_bin; do
+        [[ "$anchor_pos" =~ ^[0-9]+$ ]] || continue
+        keys="${anchor_to_keys[$anchor_bin]-}"
+        [[ -n "$keys" ]] || continue
+        for key in $keys; do
+            IFS='|' read -r kind jg_off sig_hex <<< "$key"
+            sig_start=$(( anchor_pos - key_anchor_off[$key] ))
+            sig_end=$(( sig_start + ${#sig_hex} / 2 ))
+            if (( sig_start < TEXT_RAW || sig_end > TEXT_RAW + TEXT_SIZE )); then continue; fi
+            if sig_matches_at "$file" "$sig_start" "$sig_hex" "$kind" "$jg_off"; then
+                jg_file_offset=$(( sig_start + jg_off ))
+                existing=" ${GLOBAL_SCAN_MATCHES[$key]-} "
+                if [[ "$existing" != *" $jg_file_offset "* ]]; then
+                    if [[ -n "${GLOBAL_SCAN_MATCHES[$key]}" ]]; then
+                        GLOBAL_SCAN_MATCHES["$key"]+=" $jg_file_offset"
+                    else
+                        GLOBAL_SCAN_MATCHES["$key"]="$jg_file_offset"
+                    fi
+                fi
+            fi
+        done
+    done < <(LC_ALL=C grep -a -o -b -F -f "$patterns_file" -- "$file" 2>/dev/null || true)
+
+    rm -f -- "$patterns_file"
+    SCAN_PATTERNS_FILE=""
+}
+
 # find_site_matches <file> <site_spec> → sets FOUND_OFFSETS array and RELOCATED flag
 # site_spec is "name|kind|jgRVA|jgOff|expectedMatches|sig"
 FOUND_OFFSETS=()
 RELOCATED=false
+FAST_PROBE_ONLY=false
 
 find_site_matches() {
     local file="$1"
@@ -586,7 +742,7 @@ find_site_matches() {
         if (( rva_in_text < TEXT_SIZE )); then
             local jg_raw=$(( TEXT_RAW + rva_in_text ))
             local sig_start=$(( jg_raw - jg_off ))
-            if (( sig_start >= 0 )) && sig_matches_at "$file" "$sig_start" "$sig_hex" "$kind" "$jg_off"; then
+            if (( sig_start >= TEXT_RAW && sig_start + sig_len <= TEXT_RAW + TEXT_SIZE )) && sig_matches_at "$file" "$sig_start" "$sig_hex" "$kind" "$jg_off"; then
                 FOUND_OFFSETS=("$jg_raw")
                 RELOCATED=false
                 return 0
@@ -594,28 +750,21 @@ find_site_matches() {
         fi
     fi
 
-    # Slow path: scan .text using xxd hex dump + grep
-    ensure_text_hex
+    if $FAST_PROBE_ONLY; then
+        return 0
+    fi
 
-    local pattern
-    pattern=$(build_grep_pattern "$sig_hex" "$kind" "$jg_off")
-    # Convert pattern to lowercase for grep (od -t x1 outputs lowercase)
-    pattern=$(echo "$pattern" | tr 'A-F' 'a-f')
-
-    # Use grep -oP to find all occurrences with their byte offsets
-    # xxd -p produces 2 hex chars per byte, so hex_offset / 2 = byte offset within .text
-    # We use grep -b to get byte offsets in the hex stream
+    # Slow path: one global raw fixed-string pass is shared by every unresolved
+    # site and milestone.  The full masked verifier remains authoritative.
     local matches=()
-    while IFS=: read -r hex_pos match; do
-        # hex_pos is the byte offset within the hex file (each byte = 2 hex chars)
-        # so the actual byte offset in .text = hex_pos / 2
-        local byte_in_text=$(( hex_pos / 2 ))
-        local jg_file_offset=$(( TEXT_RAW + byte_in_text + jg_off ))
-        matches+=("$jg_file_offset")
-
-        # Cap scan: once we have one more than expected, stop
-        if (( ${#matches[@]} > expected_matches )); then break; fi  # shellcheck disable=SC2086
-    done < <(grep -obP "$pattern" "$TEXT_HEX_FILE" 2>/dev/null || true)
+    local scan_key="${kind}|${jg_off}|${sig_hex^^}"
+    prepare_global_raw_scan "$file" || return 1
+    if [[ -n "${GLOBAL_SCAN_MATCHES[$scan_key]-}" ]]; then
+        read -r -a matches <<< "${GLOBAL_SCAN_MATCHES[$scan_key]}"
+        if (( ${#matches[@]} > expected_matches + 1 )); then
+            matches=("${matches[@]:0:$(( expected_matches + 1 ))}")
+        fi
+    fi
 
     if (( ${#matches[@]} > 0 )); then
         FOUND_OFFSETS=("${matches[@]}")
@@ -640,11 +789,20 @@ FLIP_KINDS=()
 FLIP_OFFSETS=()
 FLIP_RELOCATED=()
 
-probe_milestones() {
-    local file="$1"
-
+reset_probe_results() {
     BEST_MS_INDEX=-1
+    BEST_MS_NAME=""
     BEST_SATISFIED=0
+    BEST_TOTAL=0
+    BEST_FULL=false
+    FLIP_NAMES=()
+    FLIP_KINDS=()
+    FLIP_OFFSETS=()
+    FLIP_RELOCATED=()
+}
+
+probe_milestones_pass() {
+    local file="$1"
 
     local mi
     for (( mi = 0; mi < NUM_MILESTONES; mi++ )); do
@@ -699,6 +857,26 @@ probe_milestones() {
     else
         BEST_FULL=false
     fi
+}
+
+probe_milestones() {
+    local file="$1"
+
+    # First probe every milestone only at its recorded RVAs.  This prevents an
+    # older table from triggering a full scan before a newer exact-build table
+    # has had a chance to win immediately.
+    reset_probe_results
+    FAST_PROBE_ONLY=true
+    probe_milestones_pass "$file"
+    FAST_PROBE_ONLY=false
+    if $BEST_FULL; then
+        return 0
+    fi
+
+    # At least one site moved (or has expectedMatches > 1).  Run the normal
+    # pass; its first miss lazily performs one shared raw scan for all tables.
+    reset_probe_results
+    probe_milestones_pass "$file"
 }
 
 # ============================================================================
@@ -810,65 +988,62 @@ report_layout_candidates() {
 
     infof "Scanning .text for the IsExtensionAffected skeleton (cmp r/m32,2 ; jg short ; ... ; type/location check)..."
 
-    ensure_text_hex
-
-    # Search for the 02 7F pattern (cmp ..., 2 ; jg short) in the hex stream
-    # 02 7F in hex = "027f"
     local total=0 shown=0
     local max_display=20
+    local marker
+    printf -v marker '%b' '\x02\x7f'
 
-    # Search for patterns: "83[f8-ff]027f" (reg form) and "83[78-7f]..027f" (disp8 form)
-    # Reg form: 83 F8..FF 02 7F → hex: "83f[89abcdef]027f" or "83f[8-f]027f"
-    # We just search for "027f" and then validate the preceding context
-    while IFS=: read -r hex_pos _match; do
-        local byte_in_text=$(( hex_pos / 2 ))
+    # Search raw bytes for the immediate/opcode pair 02 7F, then validate the
+    # cmp encoding before it and the type/location check after it.
+    local LC_ALL=C
+    while IFS=: read -r marker_pos _match; do
+        [[ "$marker_pos" =~ ^[0-9]+$ ]] || continue
+        if (( marker_pos < TEXT_RAW + 2 || marker_pos + 2 > TEXT_RAW + TEXT_SIZE )); then continue; fi
 
-        # Need at least 2 bytes before the "027f" for context
-        if (( byte_in_text < 2 )); then continue; fi
-
-        # Check preceding bytes for cmp encoding
-        local ctx_offset=$(( hex_pos - 4 ))
-        if (( ctx_offset < 0 )); then continue; fi
-        local ctx
-        ctx=$(dd if="$TEXT_HEX_FILE" bs=1 skip="$ctx_offset" count=4 2>/dev/null)
-
-        local valid=false
-        # reg form: 83 [F8-FF] → ctx = "83f?" where ? in [89abcdef]
-        if [[ "$ctx" =~ ^83f[89abcdef]$ ]]; then valid=true; fi
-        # disp8 form: need one more byte back: 83 [78-7F] disp8
-        if ! $valid && (( ctx_offset >= 2 )); then
-            local ctx6
-            ctx6=$(dd if="$TEXT_HEX_FILE" bs=1 skip=$(( ctx_offset - 2 )) count=6 2>/dev/null)
-            if [[ "$ctx6" =~ ^837[89abcdef]..$ ]]; then valid=true; fi
+        local valid=false cmp_back=0 ctx
+        ctx=$(read_bytes_hex "$file" $(( marker_pos - 2 )) 2)
+        # reg form: 83 F8..FF 02 7F
+        if [[ "$ctx" =~ ^83F[89A-F]$ ]]; then
+            valid=true
+            cmp_back=2
+        fi
+        # disp8 form: 83 78..7F disp8 02 7F
+        if ! $valid && (( marker_pos >= TEXT_RAW + 3 )); then
+            ctx=$(read_bytes_hex "$file" $(( marker_pos - 3 )) 3)
+            if [[ "$ctx" =~ ^837[89A-F][[:xdigit:]]{2}$ ]]; then
+                valid=true
+                cmp_back=3
+            fi
         fi
 
         if ! $valid; then continue; fi
 
         # Follow-up check within ~40 bytes after the jg
-        local follow_start=$(( hex_pos + 4 ))  # after "027f"
-        local follow_end=$(( follow_start + 80 ))  # 40 bytes = 80 hex chars
-        local hex_file_size
-        hex_file_size=$(stat -c%s "$TEXT_HEX_FILE" 2>/dev/null || stat -f%z "$TEXT_HEX_FILE" 2>/dev/null)
-        if (( follow_end > hex_file_size )); then follow_end=$hex_file_size; fi
-
-        local follow_region
-        follow_region=$(dd if="$TEXT_HEX_FILE" bs=1 skip="$follow_start" count=$(( follow_end - follow_start )) 2>/dev/null)
+        local follow_start=$(( marker_pos + 2 ))
+        local follow_count=40
+        if (( follow_start + follow_count > TEXT_RAW + TEXT_SIZE )); then
+            follow_count=$(( TEXT_RAW + TEXT_SIZE - follow_start ))
+        fi
+        local follow_region=""
+        if (( follow_count > 0 )); then
+            follow_region=$(read_bytes_hex "$file" "$follow_start" "$follow_count")
+        fi
 
         local has_follow=false
-        # cmp reg, 1 or cmp reg, 5: "83f?01" or "83f?05" where ? in [89abcdef]
-        if echo "$follow_region" | grep -qP "83f[89abcdef]0[15]"; then has_follow=true; fi
-        # cmp byte [reg+disp32], 0: "80b[89abcdef]........00"
-        if ! $has_follow && echo "$follow_region" | grep -qP "80b[89abcdef]........00"; then has_follow=true; fi
+        # cmp reg, 1 or cmp reg, 5
+        if [[ "$follow_region" =~ 83F[89A-F]0[15] ]]; then has_follow=true; fi
+        # cmp byte [reg+disp32], 0
+        if ! $has_follow && [[ "$follow_region" =~ 80B[89A-F][[:xdigit:]]{8}00 ]]; then has_follow=true; fi
 
         if ! $has_follow; then continue; fi
 
         (( total++ )) || true
         if (( shown < max_display )); then
-            local rva=$(( TEXT_VADDR + byte_in_text - 2 ))
+            local rva=$(( TEXT_VADDR + marker_pos - TEXT_RAW - cmp_back ))
             printf "    [candidate] RVA 0x%X\n" "$rva"
             (( shown++ )) || true
         fi
-    done < <(grep -obP "027f" "$TEXT_HEX_FILE" 2>/dev/null || true)
+    done < <(LC_ALL=C grep -a -o -b -F -- "$marker" "$file" 2>/dev/null || true)
 
     local extra=""
     if (( total > shown )); then extra=" ($((total - shown)) not shown)"; fi
@@ -887,7 +1062,7 @@ LINUX_DIRS=("/opt/google/chrome" "/opt/google/chrome-beta" "/opt/google/chrome-u
 chrome_version() {
     local bin="$1"
     local ver
-    ver=$("$bin" --version 2>/dev/null | grep -oP '\d+\.\d+\.\d+\.\d+' || true)
+    ver=$("$bin" --version 2>/dev/null | grep -o -E '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | head -1 || true)
     echo "$ver"
 }
 
@@ -921,7 +1096,8 @@ kill_chrome_processes() {
         target=$(readlink "$pid_dir" 2>/dev/null || true)
         if [[ -z "$target" ]]; then continue; fi
         if [[ "$target" == "$want" || "$target" == "$bin" || "$target" == "${want} (deleted)" || "$target" == "${bin} (deleted)" ]]; then
-            pid=$(echo "$pid_dir" | grep -oP '/proc/\K[0-9]+')
+            pid="${pid_dir#/proc/}"
+            pid="${pid%%/*}"
             kill -TERM "$pid" 2>/dev/null || true
         fi
     done
@@ -1234,7 +1410,10 @@ do_patch() {
     infof "Starting MV2 patching (ManifestV2Handler architecture, ELF target)..."
     infof "Probing for a known Chrome layout (${NUM_MILESTONES} milestone table(s))..."
 
-    probe_milestones "$work_file"
+    if ! probe_milestones "$work_file"; then
+        rm -f "$work_file"
+        return 1
+    fi
 
     if (( BEST_SATISFIED == 0 )); then
         report_layout_candidates "$work_file"
@@ -1350,8 +1529,8 @@ EOF
 # ============================================================================
 
 cleanup() {
-    if [[ -n "${TEXT_HEX_FILE:-}" && -f "${TEXT_HEX_FILE:-}" ]]; then
-        rm -f "$TEXT_HEX_FILE"
+    if [[ -n "${SCAN_PATTERNS_FILE:-}" && -f "${SCAN_PATTERNS_FILE:-}" ]]; then
+        rm -f "$SCAN_PATTERNS_FILE"
     fi
 }
 trap cleanup EXIT
@@ -1416,12 +1595,13 @@ main() {
 
     # Check for required tools (all coreutils/POSIX - present on any Linux)
     local tool
-    for tool in dd od grep tail head mktemp stat; do
+    for tool in dd od grep head mktemp stat; do
         if ! command -v "$tool" &>/dev/null; then
             errf "Required tool '${tool}' not found."
             exit 1
         fi
     done
+    init_scan_backend || exit 1
 
     # Root check
     if [[ "$(id -u)" -ne 0 && -z "${MV2_TEST_NO_ELEVATION:-}" ]]; then
