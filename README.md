@@ -4,8 +4,7 @@ Re-enables Manifest V2 extensions in Chrome by patching a few bytes. See [`mv2-r
 
 ## Supported Versions
 
-- ✅ Windows x64
-- ✅ Windows x86 (32-bit)
+- ✅ Windows x64, x86 (32-bit)
 - ✅ Linux x64
 - ❌ macOS (not yet supported)
 - ❌ ARM (not yet supported)
@@ -14,39 +13,17 @@ Re-enables Manifest V2 extensions in Chrome by patching a few bytes. See [`mv2-r
 
 ### Windows
 
-Run [`chrome-mv2.ps1`](chrome-mv2.ps1):
+Run in Terminal:
 
 ```powershell
-powershell -ExecutionPolicy Bypass -File chrome-mv2.ps1
+powershell -NoProfile -ExecutionPolicy Bypass -Command "irm https://raw.githubusercontent.com/Sketchystan1/chrome-mv2-patch/master/chrome-mv2.ps1 | iex"
 ```
 
 ### Linux
 
-Run [`chrome-mv2.sh`](chrome-mv2.sh):
-
 ```bash
-chmod +x ./chrome-mv2.sh
-sudo ./chrome-mv2.sh
+sudo bash -c "$(curl -fsSL https://github.com/Sketchystan1/chrome-mv2-patch/raw/master/chrome-mv2.sh)"
 ```
-
-## Adding New Chrome Versions
-
-Update the signature tables when a new Chrome version comes out:
-
-- **Windows**: Edit the `$EmbeddedSignatures` block in `chrome-mv2.ps1`, or put a `signatures.json` next to it
-- **Linux**: Edit the `EMBEDDED_SIGNATURES` block in `chrome-mv2.sh`, or put a `signatures.json` next to it
-
-Both scripts have signatures built in and will use an external `signatures.json` if present (it overrides the embedded ones).
-
-Use the Python tools in `scripts/` to derive new signatures (see [`scripts/README.md`](scripts/README.md)).
-
-## Files
-
-- `chrome-mv2.ps1` - PowerShell script for Windows
-- `chrome-mv2.sh` - Bash script for Linux  
-- `signatures.json` - signature database
-- `scripts/` - Python tools to derive new signatures
-- `mv2-reversing.md` - reverse engineering notes
 
 ## Testing
 
