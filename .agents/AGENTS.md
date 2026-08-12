@@ -1,158 +1,158 @@
-# Agent Workspace Guidelines & Manifest V2 Patcher References
+# Agent Workspace Guidelines and Manifest V2 Patcher References
 
-## Repository knowledge & research document
+## Repository overview
 
-This repository contains a binary patcher that re-enables Manifest V2 (MV2)
-extensions in Google Chrome by flipping the inlined `IsExtensionAffected` `jg`
-branches in the browser binary (`chrome.dll` on Windows, the ELF on Linux). It
-carries a per-milestone signature table and currently targets **Chrome 151 and
-152** (64-bit) plus **Chrome 151 x86** (32-bit `chrome.dll`) on Windows; it probes
-each milestone and applies only the best match. Both 32-bit (`GOARCH=386`,
-`chrome-mv2-x86.exe`) and 64-bit Windows binaries are built; the flip primitive is
-identical across x86/x64, only the byte signatures differ.
+This repository ships two self-contained patch scripts:
 
-The shipping tool is the Go program under `cmd/chrome-mv2` (logic in
-`internal/app`). The signature table is `signatures.json` at the repo root, read
-at runtime from next to the binary (NOT embedded — `os.ReadFile`, not `go:embed`),
-so it updates without a rebuild and must ship beside the exe. It is the forward
-source of truth for new milestones. Its original 151/152 entries were derived from
-a Windows-only C++ reference patcher (the historical parity oracle — the Go PE
-output was verified byte-identical to it), which is preserved in git history at
-commit `e12fe16` should re-derivation ever be needed.
+- `chrome-mv2.ps1` is the Windows implementation. It patches PE32+ (x64) and
+  PE32 (x86) `chrome.dll` files.
+- `chrome-mv2.sh` is the Linux implementation. It patches the x86-64 ELF
+  `chrome` executable.
 
-**Before modifying any patching logic, agents MUST read
-[mv2-reversing.md](../mv2-reversing.md)** — one document covering both platforms.
-It holds the full rationale, the verified addresses/encodings, and a table of
-superseded approaches with the exact symptom each produced. Do not re-derive a
-strategy it already records as failed.
+There is no compiled patcher or build step. Do not add instructions for the
+removed Go application, `cmd/chrome-mv2`, `internal/app`, `build.bat`, or
+platform executables. The PowerShell and Bash scripts own all runtime behavior:
+target discovery, signature loading, layout matching, patching, backup and
+restore safety, elevation, diagnostics, and user output.
 
-**Platform status:** Windows ships (151/152). Linux — the engine is wired up and
-the gate skeleton + flip are verified identical to Windows (mv2-reversing.md §4c),
-but **no Linux signature table is derived yet**, so the Linux patcher declines
-cleanly. Symbols for both platforms come from `python scripts/fetch_symbols.py`
-(PDB on Windows, `chrome.debug` on Linux — it dispatches on the target's file
-magic, saving into `_scratch/`).
+The patch re-enables Manifest V2 (MV2) extensions by flipping the existing
+`IsExtensionAffected` conditional branches in Chrome's browser binary. It uses
+per-milestone signature tables and applies only a complete, unambiguous match by
+default.
 
----
+Before modifying patching logic, read
+[`mv2-reversing.md`](../mv2-reversing.md). It records the rationale, verified
+gate layouts, container details, porting procedure, and failed approaches that
+must not be repeated.
 
-## The one rule that matters most
+## Cardinal rule
 
-**Only flip the direction of an existing branch. Never delete or blank a `call`,
-and never invent control flow.** A reverted approach blanked a side-effecting
-`call` to fake a return value and crashed Chrome on startup; byte-level
-verification did not catch it because the replacement bytes were structurally
-valid. See mv2-reversing.md §7 (CARDINAL RULE).
+Only flip the direction of an existing branch to its existing target:
 
----
+- short `jg`: `7F disp8` -> `EB disp8`
+- near `jg`: `0F 8F disp32` -> `90 E9 disp32`
 
-## Key references in `mv2-reversing.md`
+Never delete or blank a `call`, edit the compared manifest-version value, or
+invent control flow. Structurally valid but semantically wrong edits have
+previously crashed Chrome or hidden extensions. See `mv2-reversing.md` section
+7 before changing the byte strategy.
 
-- **Why MV2 is blocked (§1)**: `IsExtensionAffected` (`manifest_version < 3`
-  early-out) is the real gate. `g_allow_mv2_for_testing`'s only writer is
-  test-only and stripped, so LTO constant-folds the flag away — not even in the
-  PDB. Toggling it works only on Canary/debug.
-- **The flip (§2)**: each inlined site opens `cmp <mv>,2 ; jg not_affected`. Flip
-  the `jg` → unconditional jump, in either encoding: short `7F`→`EB`, or near
-  `0F 8F`→`90 E9` (both keep the displacement, pure direction change). The matcher
-  masks the `jg` opcode and displacement and requires an exact `expectedMatches`
-  count.
-- **Containers (§3)**: PE fixups (zero the Security directory, recompute the
-  checksum) vs ELF (none — no signature, no checksum; `.text` vaddr ≠ file offset,
-  delta computed from headers). PE parsing accepts both PE32+ (64-bit, container
-  `pe`) and PE32 (32-bit x86, container `pe32`); container tags keep 32- and
-  64-bit tables from cross-probing.
-- **Site tables (§4)**: Windows 151 = seven short-`jg` sites; Windows 152
-  rearchitected (shared free predicate + tail-call thunk, two byte-identical
-  bodies flipped by one `expectedMatches=2` signature, a near-`jg`
-  `MustRemainDisabled`); Windows 151 x86 = the same seven as 151, 32-bit codegen,
-  all short `jg` (§4b′). Linux 151 resembles Windows *152* (shared predicate +
-  thunks) — table not yet derived.
-- **Porting to a new version (§5)**: the cross-platform `scripts/` recipe (below).
-- **Superseded approaches (§7)**: unanchored wildcard searches (crash),
-  fixed-register patterns (miss), struct-operand edits (hide all extensions),
-  hand-rolled PDB parser (~0x1000 off), short-jg-only scan (missed the near-jg
-  site), third-party beta signatures (corrupt unrelated functions). Read before
-  proposing anything "new."
+## Runtime ownership
 
----
+Keep platform behavior in its owning script:
 
-## Derivation toolkit (`scripts/`)
+- Windows/PE logic: `chrome-mv2.ps1`
+- Linux/ELF logic: `chrome-mv2.sh`
+- Cross-platform signature derivation only: `scripts/*.py`
 
-Cross-platform, mostly stdlib-only (the installer unwrap in
-`fetch_chrome_binary.py` shells out to 7-Zip; the rest need nothing). Replaces
-the old single-build `port152/` workspace. See `scripts/README.md`.
+The two runtime scripts intentionally implement the same safety contract:
 
-- `fetch_chrome_binary.py` — download the stock gate binary itself: a channel's
-  current `chrome.dll` (PE64/PE32) or Linux `chrome` (ELF), unwrapped out of the
-  offline installer and left in `_scratch/` arch-tagged (name + PE-magic/ELF-class
-  checked). `--platform win64|win|linux`, `--channel`, `--version` (Chrome for
-  Testing fallback — unbranded, re-verify), `--list`. stdlib + 7-Zip.
-- `fetch_symbols.py` — download the symbols matching a binary (PE→PDB from the
-  Chromium symbol server, ELF→`chrome.debug` streamed from the per-version zip),
-  saving to `_scratch/`. stdlib only. Dispatches on file magic. (Moved here from
-  the patcher binary's old `fetch-symbols` subcommand.)
-- `derive_milestone.py` — parses PE **and** ELF, finds gate sites (`cmp <mv>,2 ;
-  jg`, short and near) with the engine's own masking, filters/names them via
-  `--symbols`, emits a `signatures.json` entry (`--json`), and `--verify`s an
-  existing table against a binary (`ALL SITES VERIFIED: True`). stdlib only.
-- `resolve_symbols.py` — Windows-only PDB symbol resolver (dbghelp via ctypes),
-  emits the `--symbols` JSON. On Linux the equivalent is `nm -SC chrome.debug`.
+- Strictly validate signature data and image bounds.
+- Probe the recorded RVA first, then relocate with a masked `.text` scan.
+- Mask only the jump opcode and displacement.
+- Require each site's exact `expectedMatches` count.
+- Choose the best milestone and decline ambiguous or incomplete layouts by
+  default.
+- Treat stock and already-patched opcodes as valid for idempotent reruns.
+- Verify prepared and written output.
+- Preserve a validated, build-specific stock backup.
+- Report structural candidates without modifying an unknown layout.
 
-Porting checklist: `fetch_chrome_binary.py` (get the stock binary) →
-`fetch_symbols.py` → name gates (`resolve_symbols.py` / `nm`) →
-`derive_milestone.py --symbols … --json` → add the entry to `signatures.json` →
-`derive_milestone.py --verify` must pass → patch a scratch copy and GUI-test.
-Full detail in mv2-reversing.md §5.
+Do not assume implementation details are interchangeable. PowerShell parses PE,
+strips the Authenticode Security directory, and recomputes the PE checksum.
+Bash parses ELF, preserves ownership/mode, and atomically replaces the executable.
 
----
+## Signature sources
 
-## Build & verify
+`signatures.json` is the canonical editable table used by the derivation tools
+and external override mode. The patch scripts are also self-contained and carry
+platform-specific embedded copies:
 
-- Build: `.\build.bat` (Go toolchain only, no Visual Studio) builds one binary
-  per platform and a release zip each, all under `build/`:
-  `build\chrome-mv2.exe` (windows/amd64) + `chrome-mv2-v<ver>-windows-amd64.zip`,
-  `build\chrome-mv2-x86.exe` (windows/386) + `…-windows-386.zip`, and
-  `build\chrome-mv2` (linux/amd64) + `…-linux-amd64.tar.gz` (each archive bundles the
-  binary + `signatures.json` + LICENSE + README, and `signatures.json` is also
-  copied next to each loose binary in `build\`). Version is read from `appVersion`
-  in `internal/app/app.go`. (ARM is intentionally not built: the engine flips
-  x86/x64 branches, so an ARM binary would have no native-ARM Chrome to patch.)
-- Windows UAC manifest: `build.bat`'s `:manifest` subroutine regenerates one
-  `cmd/chrome-mv2/rsrc_windows_<arch>.syso` per Windows arch (amd64 + 386) from
-  `cmd/chrome-mv2/chrome-mv2.exe.manifest` via
-  `go run github.com/akavel/rsrc@v0.10.2` (fetched to the module cache, never
-  added to `go.mod`), so each release exe embeds `requireAdministrator`. Go
-  auto-links the `rsrc_windows_<GOARCH>.syso` matching each target. The `.syso`s
-  are transient — build.bat deletes them in the tidy step, so a plain
-  `go build ./cmd/chrome-mv2` stays manifest-free and runnable unelevated for
-  offline `MV2_TEST_NO_ELEVATION` testing. Only the `.manifest` XML is tracked.
-- Linux tarball: written by `tools/mktargz.go` (`//go:build ignore`, run via
-  `go run`, so it stays out of `./...`), not by the host `tar`. There is no
-  portable tar on a Windows build host — Windows 10+ ships bsdtar in System32,
-  Git for Windows ships GNU tar, and only GNU tar accepts `--mode`, which is
-  what restores the execute bit a Windows-staged file cannot carry. The helper
-  records modes (0755 for the binary, 0644 for the rest) and entry order itself,
-  needing nothing beyond the Go toolchain build.bat already requires. Note it
-  must clear `GOOS`/`GOARCH` first — `build.bat`'s `:archive_tar` runs inside
-  the linux cross-build, and `go run` has to build for the host.
-- `build.bat` **must stay CRLF** (pinned by `.gitattributes`). cmd.exe seeks
-  batch files by byte offset instead of parsing them up front, so an LF-only
-  `.bat` can resume mid-line after a `CALL` and fail to find a label that is
-  plainly present ("The system cannot find the batch label specified"). It is
-  positional, so it stays hidden until an edit shifts the offsets — it surfaced
-  once as the third `call :package` (linux) failing while the first two ran.
-  Step 6's `:require` checks each target's loose binary exists, so a call that
-  never lands is reported instead of passing as a silent SUCCESS.
-- Double-clicking `build.bat` from Explorer pauses at the end so the output
-  stays readable; run from a terminal it does not. Detected via `%cmdcmdline%`
-  (see the `:hold` subroutine); `MV2_BUILD_NOPAUSE=1` forces it off for scripted
-  builds.
-- The patcher is idempotent, verifies every site on disk after writing, and on
-  Windows clears the Security directory and recomputes the PE checksum (both moot
-  on ELF). If all signatures miss, it reports structural candidates and **refuses
-  to write** — correct behaviour on an unrecognized milestone, not a bug to patch
-  around. A partial match reports `PARTIALLY patched`, never a false success.
-- Offline verify without elevation: run the tool with `MV2_TEST_NO_ELEVATION=1`
-  against a scratch stock-binary copy (never the live install).
-- Runtime note: the signature-stripped binary loads on a default install with no
-  registry/config change; the patcher never touches the registry.
+- `$EmbeddedSignatures` in `chrome-mv2.ps1` contains the Windows `pe` and `pe32`
+  milestones.
+- `EMBEDDED_SIGNATURES` in `chrome-mv2.sh` contains the Linux `elf` milestones.
+
+Runtime precedence is an explicitly supplied signature file, then a
+`signatures.json` beside the script, then the embedded table. A file in the
+caller's current directory must not be loaded implicitly.
+
+When adding or changing a milestone, update `signatures.json` and the matching
+embedded table in the same change. A release must not depend on an external JSON
+file merely because the embedded copy was forgotten. Keep older milestones so
+the scripts can continue probing supported Chrome versions.
+
+## Derivation toolkit
+
+The tools under `scripts/` fetch stock Chrome artifacts and symbols, derive new
+milestones, and verify signature tables. They do not patch installed Chrome.
+See [`scripts/README.md`](../scripts/README.md) for the complete workflow.
+
+- `fetch_chrome_binary.py`: fetch and unwrap a stock `chrome.dll` or Linux
+  `chrome` into `_scratch/`. Requires Python and 7-Zip.
+- `fetch_symbols.py`: fetch the matching PDB or `chrome.debug` into `_scratch/`.
+- `resolve_symbols.py`: resolve Windows PDB symbols through `dbghelp`.
+- `dump_symtab.py`: stream Linux `.symtab` data without the cost of `nm -SC`.
+- `derive_milestone.py`: find short and near gate sites, emit a milestone, and
+  verify a table against a stock binary.
+
+Porting checklist:
+
+1. Fetch a stock binary and its matching symbols.
+2. Resolve or dump symbols to name/filter candidate gates.
+3. Run `derive_milestone.py --symbols ... --name ... --json`.
+4. Add the entry to `signatures.json` and the correct embedded script table.
+5. Run `derive_milestone.py <binary> --verify signatures.json` and require
+   `ALL SITES VERIFIED: True`.
+6. Run the script regression suite.
+7. Patch only a scratch copy for byte inspection, then perform a platform GUI
+   or runtime test before declaring the milestone supported.
+
+Do not hand-patch a live install while deriving signatures. If the
+`cmp <mv>,2 ; jg` skeleton disappears, stop and re-analyze Chrome's gate logic
+from source before changing bytes.
+
+## Verification
+
+Run the full local suite from the repository root:
+
+```powershell
+pwsh -NoProfile -File scripts/tests/run-tests.ps1
+```
+
+The suite exercises synthetic PE and ELF fixtures, parses both runtime scripts,
+and covers patch, restore, check, malformed signatures, partial layouts,
+ambiguity, backup validation, and race protection. It requires PowerShell and a
+`bash` environment capable of running the Linux tests.
+
+For focused syntax checks:
+
+```powershell
+$tokens = $null; $errors = $null
+[Management.Automation.Language.Parser]::ParseFile(
+    (Resolve-Path .\chrome-mv2.ps1), [ref]$tokens, [ref]$errors) | Out-Null
+$errors
+```
+
+```bash
+bash -n chrome-mv2.sh
+```
+
+For a real stock artifact, also run:
+
+```text
+python scripts/derive_milestone.py <stock chrome.dll|chrome> --verify signatures.json
+```
+
+Use the read-only runtime diagnostics when appropriate:
+
+```powershell
+.\chrome-mv2.ps1 check "C:\path\to\chrome.dll" -Quiet
+```
+
+```bash
+./chrome-mv2.sh check /path/to/chrome --quiet
+```
+
+Never weaken a decline, backup, identity, bounds, or post-write check merely to
+make a new Chrome build pass. A declined unknown layout is the safe and expected
+result until its signatures are derived and verified.

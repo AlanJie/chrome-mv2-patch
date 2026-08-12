@@ -1,12 +1,12 @@
 # scripts — MV2 gate derivation toolkit
 
 Cross-platform, dependency-free tooling to fetch symbols for, derive, and verify
-the Chrome MV2 gate signatures the Go patcher reads at runtime
-(`../signatures.json`). Works for any future Chrome version on x86 or x86-64:
+the Chrome MV2 gate signatures used by `../chrome-mv2.ps1` and
+`../chrome-mv2.sh`. The canonical editable table is `../signatures.json`.
+Works for any future Chrome version on x86 or x86-64:
 64-bit PE `chrome.dll` (container `pe`), 32-bit PE `chrome.dll` (container
 `pe32`), and the ELF `chrome` on Linux (container `elf`). Replaces the old
-single-build `port152/` workspace, and the `fetch-symbols` subcommand that used
-to live in the patcher binary.
+single-build `port152/` workspace.
 
 Full rationale: [`../mv2-reversing.md`](../mv2-reversing.md) §"Porting to a new version".
 
@@ -57,11 +57,18 @@ python scripts/derive_milestone.py <stock chrome.dll|chrome>  --verify
    ```
    Each site should show `matches=1` (or `2` for a byte-identical shared body).
    A `matches>2` site needs a wider signature.
-4. **Add** the emitted entry to the `milestones` array in `../signatures.json`
-   (read at runtime from next to the binary — no rebuild needed; ship the updated
-   file alongside the exe).
+4. **Add** the emitted entry to the `milestones` array in
+   `../signatures.json`, then copy the platform entry into the matching embedded
+   table: `$EmbeddedSignatures` in `../chrome-mv2.ps1` for `pe`/`pe32`, or
+   `EMBEDDED_SIGNATURES` in `../chrome-mv2.sh` for `elf`. The scripts use an
+   explicit signature path first, then `signatures.json` beside the script, then
+   their embedded table. Keep the JSON and embedded copy synchronized.
 5. **Re-verify**: `python scripts/derive_milestone.py <binary> --verify` must
-   print `ALL SITES VERIFIED: True`, then patch a scratch copy and GUI-test.
+   print `ALL SITES VERIFIED: True`.
+6. **Run the script tests**:
+   `pwsh -NoProfile -File scripts/tests/run-tests.ps1` from the repository root.
+7. Patch a scratch copy, inspect the changed bytes, and GUI/runtime-test on the
+   target platform.
 
 The original 151/152 entries were derived from a Windows-only C++ reference
 patcher (preserved in git history at commit `e12fe16`); new versions are added to
@@ -75,6 +82,8 @@ for 64-bit), and `resolve_symbols.py` reads the PE32 `ImageBase`, so a 32-bit
 build only ever probes/verifies against `pe32` milestones. The shipped `151-x86`
 entry was derived this way from a 32-bit `chrome.dll` + its matching PDB.
 
-The masking and match-count rules mirror the patcher's engine
-(`../internal/app/engine.go`), so a table that verifies here is one the shipping
-binary will accept.
+The masking and match-count rules mirror both runtime scripts:
+`Find-AffectedJgSites` / `Invoke-PatchMilestones` in `chrome-mv2.ps1` and
+`find_site_matches` / `probe_milestones` in `chrome-mv2.sh`. A table that
+verifies here must still be synchronized into the appropriate embedded table
+and exercised through the script tests.

@@ -1,7 +1,6 @@
 """Fetch the debug symbols matching a Chrome binary, for MV2 gate derivation.
 
-Dispatches on the target's own file magic (moved out of the Go patcher, which now
-only patches — see internal/app/fetch.go in git history for the original):
+Dispatches on the target's own file magic:
 
   PE  (chrome.dll) -> derive the RSDS CodeView key and download the matching PDB
                       from the Chromium symbol server. Handles PE32 (x86) and
@@ -53,8 +52,7 @@ def _progress(n, total, label="  "):
 
 
 # ===========================================================================
-# PE -> PDB  (ported from internal/app/fetch.go codeViewFromDebugDir/parseRSDS,
-# and the pre-Go fetch-chrome-pdb.py)
+# PE -> PDB
 # ===========================================================================
 def codeview_info(data):
     """(pdb_name, guid+age key) from the PE debug directory's RSDS record,
@@ -181,7 +179,7 @@ def fetch_pdb(data, path, out_dir):
 
 
 # ===========================================================================
-# ELF -> chrome.debug  (ported from internal/app/fetch.go fetchDebug + helpers)
+# ELF -> chrome.debug
 # ===========================================================================
 def elf_section_data(data, name):
     """Named ELF64 section's file bytes, or None (absent / SHT_NOBITS)."""

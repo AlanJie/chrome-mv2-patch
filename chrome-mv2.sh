@@ -2,17 +2,16 @@
 # ============================================================================
 # Google Chrome Manifest V2 Patcher — standalone bash script for Linux
 #
-# Self-contained single-file port of the Go patcher (ELF path only).
+# Self-contained Linux implementation for ELF targets.
 # Re-enables Manifest V2 extension support in Google Chrome by flipping the
 # inlined IsExtensionAffected manifest-version checks.
 #
-# Same milestone engine, same match/decline semantics, same .bak handling.
+# Uses the shared milestone format and the repository's match/decline semantics.
 #
 # SELF-CONTAINED: the Linux signature tables are EMBEDDED in this file
 # ($EMBEDDED_SIGNATURES below), so the script needs no signatures.json and no
-# other file to run. If a signatures.json IS present next to the script (or in
-# the current directory) it takes precedence, so the tables can still be
-# updated without editing the script.
+# other file to run. A signatures.json installed next to the script takes
+# precedence; another file can be selected explicitly with --signatures.
 #
 # BACKUP SAFETY: uses pure-bash ELF build-id parser to detect Chrome updates.
 # Build-id survives patching, so the script can distinguish:
@@ -38,8 +37,8 @@
 # Usage:
 #   sudo bash chrome-mv2.sh [patch|restore] [path] [--yes] [--quiet]
 #
-# Requirements: bash 4+, dd, od, grep, head, mktemp, mv, chmod, sync
-#               (all coreutils/POSIX - no xxd/vim needed)
+# Requirements: bash 4.3+, python3, dd, od, grep, head, mktemp, mv, chmod,
+#               sha256sum, sync (no jq/xxd/vim needed)
 # ============================================================================
 
 set -euo pipefail
@@ -49,9 +48,8 @@ readonly APP_VERSION="1.2.0"
 # ============================================================================
 # Embedded ELF signature tables (151-linux & 152-linux).
 # Self-contained: the Linux signature tables are EMBEDDED in this file, so the
-# script needs no signatures.json to run. If a signatures.json IS present next
-# to the script (or in the current directory) it takes precedence, so the tables
-# can still be updated without editing the script.
+# script needs no signatures.json to run. A signatures.json installed next to
+# the script takes precedence; another file requires --signatures.
 #
 # Format: pipe-delimited fields per site, semicolon-delimited sites per
 # milestone.  Fields: name|kind|jgRVA|jgOff|expectedMatches|sig
@@ -124,9 +122,19 @@ banner() {
 # ============================================================================
 
 readonly SIGNATURES_FILE="signatures.json"
+SIGNATURES_OVERRIDE=""
 
-# Check for external signatures.json: script directory first, then cwd
+# An explicit --signatures path wins. Otherwise only a file installed beside
+# the script is trusted; never load an admin's current-directory file silently.
 get_signatures_path() {
+    if [[ -n "$SIGNATURES_OVERRIDE" ]]; then
+        if [[ ! -f "$SIGNATURES_OVERRIDE" ]]; then
+            return 2
+        fi
+        readlink -f "$SIGNATURES_OVERRIDE" 2>/dev/null || printf '%s\n' "$SIGNATURES_OVERRIDE"
+        return 0
+    fi
+
     local script_dir
     script_dir=$(dirname "$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "$0")")
     
@@ -136,32 +144,67 @@ get_signatures_path() {
         return 0
     fi
     
-    # Check in cwd
-    if [[ -f "${SIGNATURES_FILE}" ]]; then
-        echo "${SIGNATURES_FILE}"
-        return 0
-    fi
-    
     # Not found
     return 1
 }
 
-# Minimal JSON field readers for the fixed signatures schema.  These avoid jq
-# and GNU grep -P while still accepting normal pretty-printed JSON whitespace.
-json_string_field() {
-    local text="$1" key="$2"
-    local re="\"${key}\"[[:space:]]*:[[:space:]]*\"([^\"]*)\""
-    if [[ "$text" =~ $re ]]; then
-        printf '%s' "${BASH_REMATCH[1]}"
-    fi
-}
+parse_signature_json() {
+    python3 -c '
+import json, re, sys
 
-json_number_field() {
-    local text="$1" key="$2"
-    local re="\"${key}\"[[:space:]]*:[[:space:]]*([0-9]+)"
-    if [[ "$text" =~ $re ]]; then
-        printf '%s' "${BASH_REMATCH[1]}"
-    fi
+def clean_text(value, label):
+    if not isinstance(value, str) or not value.strip() or any(c in value for c in "\r\n\t|"):
+        raise ValueError(label + " is empty or contains a reserved character")
+    return value
+
+doc = json.load(sys.stdin)
+milestones = doc.get("milestones")
+if not isinstance(milestones, list) or not milestones:
+    raise ValueError("signature document contains no milestones")
+seen_ms = set()
+for ms in milestones:
+    name = clean_text(ms.get("name"), "milestone name")
+    if name in seen_ms:
+        raise ValueError("duplicate milestone " + name)
+    seen_ms.add(name)
+    container = ms.get("container")
+    if container not in ("elf", "pe", "pe32"):
+        raise ValueError("milestone %s has unsupported container %r" % (name, container))
+    sites = ms.get("sites")
+    if not isinstance(sites, list) or not sites:
+        raise ValueError("milestone %s contains no sites" % name)
+    print("M\t%s\t%s" % (name, container))
+    seen_sites = set()
+    for site in sites:
+        sname = clean_text(site.get("name"), "site name")
+        if sname in seen_sites:
+            raise ValueError("milestone %s has duplicate site %s" % (name, sname))
+        seen_sites.add(sname)
+        kind = site.get("kind")
+        if kind not in ("short", "near"):
+            raise ValueError("milestone %s site %s has invalid kind" % (name, sname))
+        rva = site.get("jgRVA")
+        if not isinstance(rva, str) or not re.fullmatch(r"0[xX][0-9A-Fa-f]+", rva):
+            raise ValueError("milestone %s site %s has invalid jgRVA" % (name, sname))
+        jgoff = site.get("jgOff")
+        expected = site.get("expectedMatches")
+        sig = site.get("sig")
+        if not isinstance(jgoff, int) or isinstance(jgoff, bool) or jgoff < 0:
+            raise ValueError("milestone %s site %s has invalid jgOff" % (name, sname))
+        if not isinstance(expected, int) or isinstance(expected, bool) or expected < 1:
+            raise ValueError("milestone %s site %s has invalid expectedMatches" % (name, sname))
+        if not isinstance(sig, str) or not sig or len(sig) % 2 or not re.fullmatch(r"[0-9A-Fa-f]+", sig):
+            raise ValueError("milestone %s site %s has invalid sig" % (name, sname))
+        raw = bytes.fromhex(sig)
+        need = 2 if kind == "short" else 6
+        if jgoff + need > len(raw):
+            raise ValueError("milestone %s site %s jump extends past sig" % (name, sname))
+        expected_op = b"\x7f" if kind == "short" else b"\x0f\x8f"
+        if raw[jgoff:jgoff + len(expected_op)] != expected_op:
+            raise ValueError("milestone %s site %s jgOff does not point at stock opcode" % (name, sname))
+        print("S\t%s\t%s\t%s\t%d\t%d\t%s" % (sname, kind, rva, jgoff, expected, sig.upper()))
+    print("E")
+' 2>&1
 }
 
 # Parse JSON and populate MILESTONE_* arrays without jq or another JSON tool.
@@ -171,10 +214,19 @@ load_milestones() {
     
     # Try external file first
     local sig_path
+    local sig_status=0
     if sig_path=$(get_signatures_path); then
-        if [[ -r "$sig_path" ]]; then
-            json_data=$(cat "$sig_path")
-            src_label="$sig_path"
+        if [[ ! -r "$sig_path" ]]; then
+            errf "Signature file is not readable: ${sig_path}"
+            return 1
+        fi
+        json_data=$(cat "$sig_path")
+        src_label="$sig_path"
+    else
+        sig_status=$?
+        if (( sig_status == 2 )); then
+            errf "Signature file does not exist: ${SIGNATURES_OVERRIDE}"
+            return 1
         fi
     fi
     
@@ -184,81 +236,46 @@ load_milestones() {
         src_label="embedded tables"
     fi
 
-    # The external document is intentionally human-readable and therefore
-    # spans many lines, while the tiny embedded document uses one object per
-    # line.  The parser below is deliberately dependency-free and operates on
-    # one milestone object at a time, so normalize line endings/whitespace
-    # boundaries before extracting objects.
-    json_data="${json_data//$'\r'/}"
-    json_data="${json_data//$'\n'/}"
-    
-    # Parse the constrained signatures schema manually (no jq dependency).
     MILESTONE_NAMES=()
     MILESTONE_CONTAINERS=()
     NUM_MILESTONES=0
 
-    local milestone_idx=0
-    local remaining="$json_data"
-    local milestone_re='(\{[[:space:]]*"name"[[:space:]]*:[[:space:]]*"[^"]+"[[:space:]]*,[[:space:]]*"container"[[:space:]]*:[[:space:]]*"[^"]+"[[:space:]]*,[[:space:]]*"sites"[[:space:]]*:[[:space:]]*\[[^]]*\][[:space:]]*\})'
+    local parsed_file
+    parsed_file=$(mktemp /tmp/chrome-mv2-signatures.XXXXXX)
+    SIGNATURE_PARSE_FILE="$parsed_file"
+    local parse_output
+    if ! parse_output=$(printf '%s' "$json_data" | parse_signature_json); then
+        errf "Failed to parse signature data from ${src_label}:"
+        printf '    %s\n' "$parse_output"
+        rm -f -- "$parsed_file"
+        return 1
+    fi
+    printf '%s\n' "$parse_output" > "$parsed_file"
 
-    while [[ "$remaining" =~ $milestone_re ]]; do
-        local ms_line="${BASH_REMATCH[1]}"
-        remaining="${remaining#*"${BASH_REMATCH[0]}"}"
+    local milestone_idx=-1 record f1 f2 f3 f4 f5 f6 site_specs=()
+    while IFS=$'\t' read -r record f1 f2 f3 f4 f5 f6; do
+        case "$record" in
+            M)
+                ((milestone_idx++)) || true
+                MILESTONE_NAMES+=("$f1")
+                MILESTONE_CONTAINERS+=("$f2")
+                site_specs=()
+                ;;
+            S)
+                site_specs+=("${f1}|${f2}|${f3}|${f4}|${f5}|${f6}")
+                ;;
+            E)
+                local sites_var="MILESTONE_${milestone_idx}_SITES"
+                declare -g -a "$sites_var"
+                local -n sites_ref="$sites_var"
+                sites_ref=("${site_specs[@]}")
+                ;;
+        esac
+    done < "$parsed_file"
+    rm -f -- "$parsed_file"
+    SIGNATURE_PARSE_FILE=""
 
-        # Extract name
-        local name
-        name=$(json_string_field "$ms_line" "name")
-
-        # Extract container
-        local container
-        container=$(json_string_field "$ms_line" "container")
-
-        if [[ -z "$name" || -z "$container" ]]; then
-            continue
-        fi
-
-        MILESTONE_NAMES+=("$name")
-        MILESTONE_CONTAINERS+=("$container")
-
-        # Parse sites array for this milestone
-        local sites_json=""
-        local sites_re='"sites"[[:space:]]*:[[:space:]]*\[([^]]*)\]'
-        if [[ "$ms_line" =~ $sites_re ]]; then
-            sites_json="${BASH_REMATCH[1]}"
-        fi
-
-        # Create a variable name for this milestone's sites
-        local sites_var="MILESTONE_${milestone_idx}_SITES"
-        declare -g -a "$sites_var"
-
-        # Parse each site
-        local site_specs=()
-        local site_re='(\{[^{}]*\})'
-        while [[ "$sites_json" =~ $site_re ]]; do
-            local site_obj="${BASH_REMATCH[1]}"
-            sites_json="${sites_json#*"${BASH_REMATCH[0]}"}"
-
-            local s_name s_kind s_jgrva s_jgoff s_expected s_sig
-            s_name=$(json_string_field "$site_obj" "name")
-            s_kind=$(json_string_field "$site_obj" "kind")
-            s_jgrva=$(json_string_field "$site_obj" "jgRVA")
-            s_jgoff=$(json_number_field "$site_obj" "jgOff")
-            s_expected=$(json_number_field "$site_obj" "expectedMatches")
-            s_sig=$(json_string_field "$site_obj" "sig")
-
-            if [[ -n "$s_name" && -n "$s_kind" && -n "$s_jgrva" ]]; then
-                local spec="${s_name}|${s_kind}|${s_jgrva}|${s_jgoff}|${s_expected}|${s_sig}"
-                site_specs+=("$spec")
-            fi
-        done
-
-        # Assign sites to the milestone variable
-        eval "${sites_var}=(\"\${site_specs[@]}\")"
-
-        ((milestone_idx++)) || true
-    done
-
-    NUM_MILESTONES=$milestone_idx
+    NUM_MILESTONES=$(( milestone_idx + 1 ))
     
     if (( NUM_MILESTONES == 0 )); then
         errf "Failed to parse signature data from ${src_label}"
@@ -314,6 +331,32 @@ read_byte() {
     echo $(( 16#$hex ))
 }
 
+range_within_file() {
+    local offset="$1" count="$2" size="$3"
+    (( offset >= 0 && count >= 0 && offset <= size && count <= size - offset ))
+}
+
+validate_elf_section_table() {
+    local file="$1" fsize="$2"
+    ELF_SHOFF=$(read_u64_le "$file" $((0x28)))
+    ELF_SHENTSIZE=$(read_u16_le "$file" $((0x3A)))
+    ELF_SHNUM=$(read_u16_le "$file" $((0x3C)))
+    ELF_SHSTRNDX=$(read_u16_le "$file" $((0x3E)))
+
+    # Chrome uses normal ELF64 section counts. Decline the extended-index forms
+    # instead of interpreting their extra indirection incorrectly.
+    if (( ELF_SHOFF < 64 || ELF_SHOFF > fsize || ELF_SHNUM == 0 || ELF_SHSTRNDX == 0xFFFF )); then return 1; fi
+    if (( ELF_SHENTSIZE < 64 || ELF_SHSTRNDX >= ELF_SHNUM )); then return 1; fi
+    if (( ELF_SHNUM > (fsize - ELF_SHOFF) / ELF_SHENTSIZE )); then return 1; fi
+
+    local strhdr_off=$(( ELF_SHOFF + ELF_SHSTRNDX * ELF_SHENTSIZE ))
+    ELF_STROFF=$(read_u64_le "$file" $(( strhdr_off + 0x18 )))
+    ELF_STRSIZE=$(read_u64_le "$file" $(( strhdr_off + 0x20 )))
+    range_within_file "$ELF_STROFF" "$ELF_STRSIZE" "$fsize"
+}
+
+ELF_SHOFF=0 ELF_SHENTSIZE=0 ELF_SHNUM=0 ELF_SHSTRNDX=0 ELF_STROFF=0 ELF_STRSIZE=0
+
 # ============================================================================
 # ELF64 parser — locate .text section (vaddr, file offset, size).
 # Returns via global variables: TEXT_VADDR, TEXT_RAW, TEXT_SIZE
@@ -354,38 +397,26 @@ get_elf_build_id() {
         return 1
     fi
 
-    # Read section header table info
-    local shoff shentsize shnum shstrndx
-    shoff=$(read_u64_le "$file" $((0x28)))
-    shentsize=$(read_u16_le "$file" $((0x3A)))
-    shnum=$(read_u16_le "$file" $((0x3C)))
-    shstrndx=$(read_u16_le "$file" $((0x3E)))
-
-    if (( shoff == 0 || shnum == 0 )); then
+    if ! validate_elf_section_table "$file" "$fsize"; then
         echo ""
         return 1
     fi
 
-    # Locate .shstrtab for section name resolution
-    local strhdr_off str_off str_size
-    strhdr_off=$(( shoff + shstrndx * shentsize ))
-    str_off=$(read_u64_le "$file" $(( strhdr_off + 0x18 )))
-    str_size=$(read_u64_le "$file" $(( strhdr_off + 0x20 )))
-
     # Find .note.gnu.build-id section
     local i sh_off name_off sec_name sec_off sec_size
-    for (( i = 0; i < shnum; i++ )); do
-        sh_off=$(( shoff + i * shentsize ))
+    for (( i = 0; i < ELF_SHNUM; i++ )); do
+        sh_off=$(( ELF_SHOFF + i * ELF_SHENTSIZE ))
         name_off=$(read_u32_le "$file" "$sh_off")
+        (( name_off < ELF_STRSIZE )) || continue
 
         # Read section name (NUL-terminated string)
-        sec_name=$(dd if="$file" bs=1 skip=$(( str_off + name_off )) count=32 2>/dev/null | tr '\0' '\n' | head -1)
+        sec_name=$(dd if="$file" bs=1 skip=$(( ELF_STROFF + name_off )) count=32 2>/dev/null | tr '\0' '\n' | head -1)
 
         if [[ "$sec_name" == ".note.gnu.build-id" ]]; then
             sec_off=$(read_u64_le "$file" $(( sh_off + 0x18 )))
             sec_size=$(read_u64_le "$file" $(( sh_off + 0x20 )))
 
-            if (( sec_size < 16 )); then
+            if (( sec_size < 16 )) || ! range_within_file "$sec_off" "$sec_size" "$fsize"; then
                 echo ""
                 return 1
             fi
@@ -398,13 +429,20 @@ get_elf_build_id() {
             descsz=$(read_u32_le "$file" $(( sec_off + 4 )))
             note_type=$(read_u32_le "$file" $(( sec_off + 8 )))
 
-            # NT_GNU_BUILD_ID = 3
-            if (( note_type == 3 && descsz > 0 && descsz <= 64 )); then
+            # NT_GNU_BUILD_ID = 3, with the canonical "GNU\0" owner name.
+            if (( note_type == 3 && namesz == 4 && descsz > 0 && descsz <= 64 )); then
+                local note_name
+                note_name=$(read_bytes_hex "$file" $(( sec_off + 12 )) 4)
+                [[ "$note_name" == "474E5500" ]] || break
                 # name starts at offset 12, desc starts after name (padded to 4-byte boundary)
                 local name_padded
                 name_padded=$(( (namesz + 3) / 4 * 4 ))
                 local desc_off
                 desc_off=$(( sec_off + 12 + name_padded ))
+                if ! range_within_file "$desc_off" "$descsz" "$fsize" || (( desc_off + descsz > sec_off + sec_size )); then
+                    echo ""
+                    return 1
+                fi
 
                 # Read build-id (desc field) as hex
                 local build_id
@@ -451,33 +489,21 @@ parse_elf() {
         return 1
     fi
 
-    # Section header table offset, entry size, count, and shstrtab index
-    local shoff shentsize shnum shstrndx
-    shoff=$(read_u64_le "$file" $((0x28)))
-    shentsize=$(read_u16_le "$file" $((0x3A)))
-    shnum=$(read_u16_le "$file" $((0x3C)))
-    shstrndx=$(read_u16_le "$file" $((0x3E)))
-
-    if (( shoff == 0 || shnum == 0 )); then
-        errf "ELF has no section table (fully stripped?)."
+    if ! validate_elf_section_table "$file" "$fsize"; then
+        errf "ELF section table or section-name table is out of bounds."
         return 1
     fi
-
-    # Locate .shstrtab to resolve section names
-    local strhdr_off str_off str_size
-    strhdr_off=$(( shoff + shstrndx * shentsize ))
-    str_off=$(read_u64_le "$file" $(( strhdr_off + 0x18 )))
-    str_size=$(read_u64_le "$file" $(( strhdr_off + 0x20 )))
 
     # Iterate sections to find .text
     local i sh_off name_off sec_name
     TEXT_VADDR=0; TEXT_RAW=0; TEXT_SIZE=0
-    for (( i = 0; i < shnum; i++ )); do
-        sh_off=$(( shoff + i * shentsize ))
+    for (( i = 0; i < ELF_SHNUM; i++ )); do
+        sh_off=$(( ELF_SHOFF + i * ELF_SHENTSIZE ))
         name_off=$(read_u32_le "$file" "$sh_off")
+        (( name_off < ELF_STRSIZE )) || continue
 
         # Read section name from .shstrtab (NUL-terminated)
-        sec_name=$(dd if="$file" bs=1 skip=$(( str_off + name_off )) count=16 2>/dev/null | tr '\0' '\n' | head -1)
+        sec_name=$(dd if="$file" bs=1 skip=$(( ELF_STROFF + name_off )) count=16 2>/dev/null | tr '\0' '\n' | head -1)
 
         if [[ "$sec_name" == ".text" ]]; then
             TEXT_VADDR=$(read_u64_le "$file" $(( sh_off + 0x10 )))
@@ -489,6 +515,10 @@ parse_elf() {
 
     if (( TEXT_SIZE == 0 )); then
         errf "Could not locate .text section."
+        return 1
+    fi
+    if ! range_within_file "$TEXT_RAW" "$TEXT_SIZE" "$fsize"; then
+        errf "ELF .text section is out of file bounds."
         return 1
     fi
 
@@ -615,6 +645,10 @@ GLOBAL_SCAN_SOURCE=""
 GLOBAL_SCAN_TEXT_RAW=-1
 GLOBAL_SCAN_TEXT_SIZE=-1
 SCAN_PATTERNS_FILE=""
+SIGNATURE_PARSE_FILE=""
+WORK_FILE=""
+WRITE_TMP=""
+META_TMP=""
 
 prepare_global_raw_scan() {
     local file="$1"
@@ -783,6 +817,7 @@ BEST_MS_NAME=""
 BEST_SATISFIED=0
 BEST_TOTAL=0
 BEST_FULL=false
+BEST_TIES=0
 # Arrays for the best milestone's flips:
 FLIP_NAMES=()
 FLIP_KINDS=()
@@ -795,6 +830,7 @@ reset_probe_results() {
     BEST_SATISFIED=0
     BEST_TOTAL=0
     BEST_FULL=false
+    BEST_TIES=0
     FLIP_NAMES=()
     FLIP_KINDS=()
     FLIP_OFFSETS=()
@@ -844,11 +880,14 @@ probe_milestones_pass() {
             FLIP_KINDS=("${flip_kinds_tmp[@]}")
             FLIP_OFFSETS=("${flip_offsets_tmp[@]}")
             FLIP_RELOCATED=("${flip_relocated_tmp[@]}")
+            BEST_TIES=1
 
             # Short-circuit: if this milestone satisfied every site, no other
             # milestone can beat it — skip the rest (avoids the expensive hex
             # dump for the remaining milestones).
             if (( satisfied == ${#sites[@]} )); then break; fi
+        elif (( satisfied == BEST_SATISFIED && satisfied > 0 )); then
+            (( BEST_TIES++ )) || true
         fi
     done
 
@@ -885,6 +924,8 @@ probe_milestones() {
 
 PATCH_STATUS=0   # 0=declined, 1=flips applied, 2=all already applied
 PATCH_FLIPS=0
+PATCH_STOCK=0
+PATCH_ALREADY=0
 WRITTEN_RVAS=()
 WRITTEN_BYTES=()
 
@@ -895,6 +936,8 @@ apply_flips() {
 
     PATCH_STATUS=0
     PATCH_FLIPS=0
+    PATCH_STOCK=0
+    PATCH_ALREADY=0
     WRITTEN_RVAS=()
     WRITTEN_BYTES=()
 
@@ -916,6 +959,7 @@ apply_flips() {
             if (( cur == 0xEB )); then
                 echo "    [i] ${BEST_MS_NAME}: ${name} jg->jmp at RVA ${rva_hex} already applied (no change)."
                 (( already++ )) || true
+                (( PATCH_ALREADY++ )) || true
                 WRITTEN_RVAS+=("$rva")
                 WRITTEN_BYTES+=("EB")
                 continue
@@ -928,6 +972,7 @@ apply_flips() {
             # Write the flip: 0x7F → 0xEB
             printf '\xEB' | dd of="$file" bs=1 seek="$offset" count=1 conv=notrunc 2>/dev/null
             (( applied++ )) || true
+            (( PATCH_STOCK++ )) || true
             (( PATCH_FLIPS++ )) || true
             WRITTEN_RVAS+=("$rva")
             WRITTEN_BYTES+=("EB")
@@ -940,6 +985,7 @@ apply_flips() {
             if (( o0 == 0x90 && o1 == 0xE9 )); then
                 echo "    [i] ${BEST_MS_NAME}: ${name} jg->jmp at RVA ${rva_hex} already applied (no change)."
                 (( already++ )) || true
+                (( PATCH_ALREADY++ )) || true
                 WRITTEN_RVAS+=("$rva")
                 WRITTEN_BYTES+=("90E9")
                 continue
@@ -952,6 +998,7 @@ apply_flips() {
             # Write the flip: 0F 8F → 90 E9
             printf '\x90\xE9' | dd of="$file" bs=1 seek="$offset" count=2 conv=notrunc 2>/dev/null
             (( applied++ )) || true
+            (( PATCH_STOCK++ )) || true
             (( PATCH_FLIPS++ )) || true
             WRITTEN_RVAS+=("$rva")
             WRITTEN_BYTES+=("90E9")
@@ -976,6 +1023,40 @@ apply_flips() {
     else
         PATCH_STATUS=2
     fi
+}
+
+STATE_STOCK=0
+STATE_PATCHED=0
+classify_flip_states() {
+    local file="$1"
+    STATE_STOCK=0
+    STATE_PATCHED=0
+    local i kind offset o0 o1
+    for (( i = 0; i < ${#FLIP_OFFSETS[@]}; i++ )); do
+        kind="${FLIP_KINDS[$i]}"
+        offset="${FLIP_OFFSETS[$i]}"
+        o0=$(read_byte "$file" "$offset")
+        if [[ "$kind" == "short" ]]; then
+            if (( o0 == 0x7F )); then (( STATE_STOCK++ )) || true
+            elif (( o0 == 0xEB )); then (( STATE_PATCHED++ )) || true
+            else return 1
+            fi
+        else
+            o1=$(read_byte "$file" $(( offset + 1 )))
+            if (( o0 == 0x0F && o1 == 0x8F )); then (( STATE_STOCK++ )) || true
+            elif (( o0 == 0x90 && o1 == 0xE9 )); then (( STATE_PATCHED++ )) || true
+            else return 1
+            fi
+        fi
+    done
+}
+
+verify_patched_output() {
+    local file="$1"
+    probe_milestones "$file" || return 1
+    (( BEST_SATISFIED > 0 && BEST_TIES == 1 )) || return 1
+    classify_flip_states "$file" || return 1
+    (( STATE_STOCK == 0 && STATE_PATCHED == ${#FLIP_OFFSETS[@]} ))
 }
 
 # ============================================================================
@@ -1058,12 +1139,20 @@ report_layout_candidates() {
 LINUX_CHANNELS=("Stable" "Beta" "Dev")
 LINUX_DIRS=("/opt/google/chrome" "/opt/google/chrome-beta" "/opt/google/chrome-unstable")
 
-# Get Chrome version from binary
+# Get Chrome version without executing a root-owned browser binary.
 chrome_version() {
     local bin="$1"
-    local ver
-    ver=$("$bin" --version 2>/dev/null | grep -o -E '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | head -1 || true)
-    echo "$ver"
+    local pkg=""
+    case "$bin" in
+        /opt/google/chrome/chrome) pkg="google-chrome-stable" ;;
+        /opt/google/chrome-beta/chrome) pkg="google-chrome-beta" ;;
+        /opt/google/chrome-unstable/chrome) pkg="google-chrome-unstable" ;;
+    esac
+    if [[ -n "$pkg" ]] && command -v dpkg-query >/dev/null 2>&1; then
+        dpkg-query -W -f='${Version}\n' "$pkg" 2>/dev/null | grep -o -E '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | head -1 || true
+    elif [[ -n "$pkg" ]] && command -v rpm >/dev/null 2>&1; then
+        rpm -q --qf '%{VERSION}\n' "$pkg" 2>/dev/null | grep -o -E '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | head -1 || true
+    fi
 }
 
 # Count processes holding the binary open
@@ -1108,24 +1197,96 @@ kill_chrome_processes() {
         if (( $(proc_holders "$bin") == 0 )); then return 0; fi
         sleep 0.25
     done
-    # Still running — the rename will still succeed (old inode stays mapped)
-    return 0
+    return 1
 }
 
-# Atomic write: temp file + sync + rename (sidesteps ETXTBSY)
+# Atomic write: preserve the target's metadata, verify bytes, re-check the target
+# hash to close the inspect/write race, then rename in the same directory.
 write_target() {
-    local target="$1" source="$2"
-    local dir mode
+    local target="$1" source="$2" expected_hash="${3:-}"
+    local dir
     dir=$(dirname "$target")
-    mode=$(stat -c%a "$target" 2>/dev/null || echo "755")
 
     local tmp
     tmp=$(mktemp "${dir}/.chrome-mv2-XXXXXX")
+    WRITE_TMP="$tmp"
+    if [[ -e "$target" ]]; then
+        cp -a -- "$target" "$tmp"
+    else
+        cp -a -- "$source" "$tmp"
+    fi
+    cp -- "$source" "$tmp"
 
-    cp "$source" "$tmp"
+    local source_hash tmp_hash current_hash
+    source_hash=$(sha256sum -- "$source" | awk '{print $1}')
+    tmp_hash=$(sha256sum -- "$tmp" | awk '{print $1}')
+    if [[ "$source_hash" != "$tmp_hash" ]]; then
+        rm -f -- "$tmp"
+        errf "Temporary-file verification failed for ${target}."
+        return 1
+    fi
+    if [[ -n "$expected_hash" ]]; then
+        current_hash=$(sha256sum -- "$target" | awk '{print $1}')
+        if [[ "$current_hash" != "$expected_hash" ]]; then
+            rm -f -- "$tmp"
+            errf "Target changed after inspection; refusing to overwrite it."
+            return 1
+        fi
+    fi
     sync "$tmp"
-    chmod "$mode" "$tmp"
-    mv -f "$tmp" "$target"
+    mv -f -- "$tmp" "$target"
+    WRITE_TMP=""
+    sync "$dir" 2>/dev/null || sync
+}
+
+backup_meta_path() { printf '%s.meta\n' "$1"; }
+
+save_backup_snapshot() {
+    local target="$1" backup="$2" source="$3" build_id="$4"
+    local target_hash=""
+    [[ -f "$backup" ]] && target_hash=$(sha256sum -- "$backup" | awk '{print $1}')
+    write_target "$backup" "$source" "$target_hash" || return 1
+
+    local meta meta_tmp size hash
+    meta=$(backup_meta_path "$backup")
+    meta_tmp=$(mktemp "$(dirname "$meta")/.chrome-mv2-meta-XXXXXX")
+    META_TMP="$meta_tmp"
+    size=$(stat -c%s "$backup")
+    hash=$(sha256sum -- "$backup" | awk '{print $1}')
+    printf 'schema=1\ncontainer=elf\nbuild_id=%s\nsize=%s\nsha256=%s\n' "$build_id" "$size" "$hash" > "$meta_tmp"
+    write_target "$meta" "$meta_tmp" "" || { rm -f -- "$meta_tmp"; return 1; }
+    rm -f -- "$meta_tmp"
+    META_TMP=""
+}
+
+BACKUP_BUILD_ID="" BACKUP_SIZE=0 BACKUP_HASH="" BACKUP_LEGACY=false
+validate_backup_snapshot() {
+    local backup="$1" meta
+    [[ -f "$backup" ]] || return 1
+    parse_elf "$backup" >/dev/null || return 1
+    BACKUP_BUILD_ID=$(get_elf_build_id "$backup")
+    BACKUP_SIZE=$(stat -c%s "$backup")
+    BACKUP_HASH=$(sha256sum -- "$backup" | awk '{print $1}')
+    [[ -n "$BACKUP_BUILD_ID" ]] || return 1
+
+    meta=$(backup_meta_path "$backup")
+    BACKUP_LEGACY=false
+    if [[ ! -f "$meta" ]]; then BACKUP_LEGACY=true; return 0; fi
+
+    local schema="" container="" build_id="" size="" sha256="" key value extra
+    while IFS='=' read -r key value extra; do
+        [[ -z "$extra" ]] || return 1
+        case "$key" in
+            schema) schema="$value" ;;
+            container) container="$value" ;;
+            build_id) build_id="$value" ;;
+            size) size="$value" ;;
+            sha256) sha256="$value" ;;
+            *) return 1 ;;
+        esac
+    done < "$meta"
+    [[ "$schema" == 1 && "$container" == elf && "$build_id" == "$BACKUP_BUILD_ID" &&
+       "$size" == "$BACKUP_SIZE" && "$sha256" == "$BACKUP_HASH" ]]
 }
 
 # ============================================================================
@@ -1194,7 +1355,14 @@ read_custom_path() {
         echo -n "${C_BOLD}Enter the full path to chrome binary, blank to cancel: ${C_RESET}"
         local line
         read -r line || return 1
-        line=$(echo "$line" | xargs)  # Trim whitespace and quotes
+        line="${line#"${line%%[![:space:]]*}"}"
+        line="${line%"${line##*[![:space:]]}"}"
+        if (( ${#line} >= 2 )); then
+            if [[ "${line:0:1}" == '"' && "${line: -1}" == '"' ]] ||
+               [[ "${line:0:1}" == "'" && "${line: -1}" == "'" ]]; then
+                line="${line:1:${#line}-2}"
+            fi
+        fi
         
         if [[ -z "$line" ]]; then
             return 1
@@ -1323,6 +1491,28 @@ confirm_force_close() {
     done
 }
 
+request_target_close() {
+    local target="$1" assume_yes="$2" holders
+    holders=$(proc_holders "$target")
+    (( holders == 0 )) && return 0
+
+    if $assume_yes; then
+        warnf "Chrome is running and will be force closed (--yes)."
+    elif $QUIET; then
+        errf "Chrome is running (${holders} process(es))."
+        echo "    Close it, or pass --yes to force close it."
+        return 1
+    else
+        confirm_force_close "$(basename "$(dirname "$target")")" "$holders" || return 1
+    fi
+
+    if ! kill_chrome_processes "$target"; then
+        errf "Chrome processes still hold this binary after 5 seconds."
+        echo "    Close this channel manually and re-run; nothing was written."
+        return 1
+    fi
+}
+
 # ============================================================================
 # Orchestration — patch / restore flows
 # ============================================================================
@@ -1332,25 +1522,7 @@ CHOSEN_INDEX=-1
 CHOSEN_CUSTOM_PATH=""
 
 do_patch() {
-    local target="$1" assume_yes="$2"
-    local holders
-    holders=$(proc_holders "$target")
-
-    if (( holders > 0 )); then
-        if $assume_yes; then
-            warnf "Chrome is running and will be force closed (--yes)."
-            kill_chrome_processes "$target"
-        elif $QUIET; then
-            errf "Chrome is running (${holders} process(es))."
-            echo "    Close it, or pass --yes to force close it."
-            return 1
-        else
-            confirm_force_close "$(basename "$(dirname "$target")")" "$holders" || return 1
-            kill_chrome_processes "$target"
-        fi
-    fi
-
-    # Read the target
+    local target="$1" assume_yes="$2" allow_partial="$3"
     local fsize
     fsize=$(stat -c%s "$target" 2>/dev/null || stat -f%z "$target" 2>/dev/null)
     if (( fsize == 0 )); then
@@ -1359,55 +1531,89 @@ do_patch() {
     fi
     okf "Target: ${target} (${fsize} bytes)."
 
-    # Parse ELF
     parse_elf "$target" || return 1
+    local target_id target_hash
+    target_id=$(get_elf_build_id "$target")
+    target_hash=$(sha256sum -- "$target" | awk '{print $1}')
+    if [[ -z "$target_id" ]]; then
+        errf "Could not extract a valid GNU build-id from ${target}."
+        return 1
+    fi
 
-    # Backup management
+    infof "Starting MV2 patching (ManifestV2Handler architecture, ELF target)..."
+    infof "Probing target for a known Chrome layout (${NUM_MILESTONES} milestone table(s))..."
+    probe_milestones "$target" || return 1
+    if (( BEST_SATISFIED == 0 )); then
+        report_layout_candidates "$target"
+        warnf "No known MV2 layout matched this binary; nothing was modified."
+        return 1
+    fi
+    if ! $BEST_FULL && (( BEST_TIES > 1 )); then
+        warnf "${BEST_TIES} milestones tied at ${BEST_SATISFIED} sites; the layout is ambiguous."
+        return 1
+    fi
+    classify_flip_states "$target" || { errf "Located jump bytes are in an invalid mixed/corrupt state."; return 1; }
+
     local backup="${target}.bak"
     local work_file
     work_file=$(mktemp /tmp/chrome-mv2-work.XXXXXX)
+    WORK_FILE="$work_file"
 
     if [[ ! -f "$backup" ]]; then
-        infof "Creating initial backup copy: ${backup} ..."
-        cp "$target" "$backup"
-        cp "$target" "$work_file"
-        okf "Initial backup created successfully."
-    else
-        # Use ELF build-id to detect Chrome updates. Build-id is in the
-        # .note.gnu.build-id section and survives patching, so we can distinguish:
-        #   - Same build-id = same Chrome version → work from backup (safe)
-        #   - Different build-id = Chrome updated → refresh backup
-        local target_id backup_id
-        target_id=$(get_elf_build_id "$target")
-        backup_id=$(get_elf_build_id "$backup")
-        
-        if [[ -z "$target_id" ]]; then
-            errf "Error: could not extract build-id from ${target}."
-            echo "    The file may be corrupted or not a valid ELF binary."
-            rm -f "$work_file"
+        if { ! $BEST_FULL && ! $allow_partial; } || (( STATE_PATCHED != 0 )); then
+            errf "No clean backup exists and the target is not a complete stock layout."
+            echo "    Restore/reinstall Chrome first; refusing to save modified bytes as the baseline."
+            rm -f -- "$work_file"
             return 1
         fi
-        if [[ -z "$backup_id" ]]; then
-            warnf "Warning: could not extract build-id from backup - recreating it."
-            cp "$target" "$backup"
-            backup_id="$target_id"
+        infof "Creating initial backup copy: ${backup} ..."
+        save_backup_snapshot "$target" "$backup" "$target" "$target_id" || { rm -f -- "$work_file"; return 1; }
+        validate_backup_snapshot "$backup" || { errf "Initial backup verification failed."; rm -f -- "$work_file"; return 1; }
+        okf "Initial backup created and verified."
+    else
+        if ! validate_backup_snapshot "$backup"; then
+            errf "Backup or its metadata failed validation; refusing to overwrite it."
+            rm -f -- "$work_file"
+            return 1
         fi
-        
-        if [[ "$target_id" != "$backup_id" ]]; then
+
+        # A usable baseline must itself be a complete stock layout.
+        parse_elf "$backup" || { rm -f -- "$work_file"; return 1; }
+        probe_milestones "$backup" || { rm -f -- "$work_file"; return 1; }
+        classify_flip_states "$backup" || { errf "Backup jump state is invalid."; rm -f -- "$work_file"; return 1; }
+        if { ! $BEST_FULL && ! $allow_partial; } || (( BEST_TIES != 1 || STATE_PATCHED != 0 )); then
+            errf "Backup is not a complete clean stock layout."
+            rm -f -- "$work_file"
+            return 1
+        fi
+
+        if [[ "$target_id" != "$BACKUP_BUILD_ID" ]]; then
+            # Refresh only from a fully recognized stock target. Otherwise keep
+            # the old known-good backup untouched and decline the new build.
+            parse_elf "$target" || { rm -f -- "$work_file"; return 1; }
+            probe_milestones "$target" || { rm -f -- "$work_file"; return 1; }
+            classify_flip_states "$target" || { rm -f -- "$work_file"; return 1; }
+            if ! $BEST_FULL || (( BEST_TIES != 1 || STATE_PATCHED != 0 )); then
+                errf "Chrome changed builds, but the new target is not a complete recognized stock layout."
+                echo "    The existing backup was preserved. Add signatures for this build first."
+                rm -f -- "$work_file"
+                return 1
+            fi
             infof "Chrome update detected (build-id changed) - refreshing backup ${backup} ..."
-            okf "  Old build-id: ${backup_id:0:16}..."
+            okf "  Old build-id: ${BACKUP_BUILD_ID:0:16}..."
             okf "  New build-id: ${target_id:0:16}..."
-            cp "$target" "$backup"
-            cp "$target" "$work_file"
-            okf "Backup updated to new version."
-        else
-            infof "Same Chrome build detected - working from existing backup to preserve clean stock..."
-            cp "$backup" "$work_file"
+            save_backup_snapshot "$target" "$backup" "$target" "$target_id" || { rm -f -- "$work_file"; return 1; }
+            validate_backup_snapshot "$backup" || { errf "Updated backup verification failed."; rm -f -- "$work_file"; return 1; }
+            okf "Backup updated and verified."
+        elif $BACKUP_LEGACY; then
+            save_backup_snapshot "$target" "$backup" "$backup" "$BACKUP_BUILD_ID" || { rm -f -- "$work_file"; return 1; }
+            okf "Legacy backup validated and metadata added."
         fi
     fi
 
-    # Probe milestones
-    infof "Starting MV2 patching (ManifestV2Handler architecture, ELF target)..."
+    cp -- "$backup" "$work_file"
+    parse_elf "$work_file" || { rm -f -- "$work_file"; return 1; }
+
     infof "Probing for a known Chrome layout (${NUM_MILESTONES} milestone table(s))..."
 
     if ! probe_milestones "$work_file"; then
@@ -1424,8 +1630,17 @@ do_patch() {
         rm -f "$work_file"
         return 1
     fi
+    if ! $BEST_FULL && (( BEST_TIES > 1 )); then
+        warnf "${BEST_TIES} milestones tied at ${BEST_SATISFIED} sites; declining ambiguous layout."
+        rm -f -- "$work_file"
+        return 1
+    fi
+    if ! $BEST_FULL && ! $allow_partial; then
+        warnf "Only ${BEST_SATISFIED}/${BEST_TOTAL} sites matched; partial writes require --allow-partial."
+        rm -f -- "$work_file"
+        return 1
+    fi
 
-    # Apply flips to the work file
     apply_flips "$work_file"
 
     local msg
@@ -1436,12 +1651,42 @@ do_patch() {
     fi
     infof "Chrome ${BEST_MS_NAME} ${msg}"
 
-    # ELF finalize is a no-op (no security directory, no checksum)
     okf "ELF: no post-flip fixups needed."
+    if ! verify_patched_output "$work_file"; then
+        errf "Prepared output failed post-patch verification."
+        rm -f -- "$work_file"
+        return 1
+    fi
 
-    # Write the patched file atomically
-    write_target "$target" "$work_file"
-    rm -f "$work_file"
+    local prepared_hash
+    prepared_hash=$(sha256sum -- "$work_file" | awk '{print $1}')
+    if [[ "$prepared_hash" == "$target_hash" ]]; then
+        rm -f -- "$work_file"
+        successf "Target is already fully patched; no write was needed."
+        return 0
+    fi
+    if [[ "$target_hash" != "$BACKUP_HASH" ]]; then
+        errf "Target contains changes unrelated to this patch; refusing to overwrite them."
+        echo "    Restore/reinstall Chrome or inspect the binary manually before retrying."
+        rm -f -- "$work_file"
+        WORK_FILE=""
+        return 1
+    fi
+
+    request_target_close "$target" "$assume_yes" || { rm -f -- "$work_file"; return 1; }
+    if (( $(proc_holders "$target") > 0 )); then
+        errf "Chrome restarted after it was closed; nothing was written."
+        rm -f -- "$work_file"
+        WORK_FILE=""
+        return 1
+    fi
+    write_target "$target" "$work_file" "$target_hash" || { rm -f -- "$work_file"; return 1; }
+    rm -f -- "$work_file"
+    WORK_FILE=""
+    if [[ "$(sha256sum -- "$target" | awk '{print $1}')" != "$prepared_hash" ]]; then
+        errf "Post-write SHA-256 verification failed."
+        return 1
+    fi
 
     # Report outcome
     rule
@@ -1459,7 +1704,7 @@ do_patch() {
 }
 
 do_restore() {
-    local target="$1" assume_yes="$2"
+    local target="$1" assume_yes="$2" force_restore="$3"
     local backup="${target}.bak"
 
     infof "Restore mode requested..."
@@ -1468,37 +1713,97 @@ do_restore() {
         return 1
     fi
 
-    local holders
-    holders=$(proc_holders "$target")
-    if (( holders > 0 )); then
-        if $assume_yes; then
-            warnf "Chrome is running and will be force closed (--yes)."
-            kill_chrome_processes "$target"
-        elif $QUIET; then
-            errf "Chrome is running (${holders} process(es))."
-            echo "    Close it, or pass --yes to force close it."
-            return 1
-        else
-            confirm_force_close "$(basename "$(dirname "$target")")" "$holders" || return 1
-            kill_chrome_processes "$target"
-        fi
+    if ! validate_backup_snapshot "$backup"; then
+        errf "Backup or its metadata failed validation."
+        return 1
+    fi
+    parse_elf "$backup" || return 1
+    probe_milestones "$backup" || return 1
+    classify_flip_states "$backup" || return 1
+    if (( BEST_SATISFIED == 0 || BEST_TIES != 1 || STATE_PATCHED != 0 )); then
+        errf "Backup is not a complete clean stock layout."
+        return 1
     fi
 
-    write_target "$target" "$backup"
+    parse_elf "$target" || return 1
+    local target_id target_hash
+    target_id=$(get_elf_build_id "$target")
+    target_hash=$(sha256sum -- "$target" | awk '{print $1}')
+    if [[ "$target_id" != "$BACKUP_BUILD_ID" ]] && ! $force_restore; then
+        errf "Backup belongs to a different Chrome build; refusing to downgrade the installed binary."
+        echo "    Use --force-restore only when restoring that older build is intentional."
+        return 1
+    fi
+    if [[ "$target_id" != "$BACKUP_BUILD_ID" ]]; then
+        warnf "Forcing restore from a different Chrome build (--force-restore)."
+    fi
+    if [[ "$target_hash" == "$BACKUP_HASH" ]]; then
+        successf "Target already matches the verified backup; no write was needed."
+        return 0
+    fi
+    request_target_close "$target" "$assume_yes" || return 1
+    if (( $(proc_holders "$target") > 0 )); then
+        errf "Chrome restarted after it was closed; nothing was written."
+        return 1
+    fi
+    write_target "$target" "$backup" "$target_hash" || return 1
+    if [[ "$(sha256sum -- "$target" | awk '{print $1}')" != "$BACKUP_HASH" ]]; then
+        errf "Post-restore SHA-256 verification failed."
+        return 1
+    fi
     successf "Original binary successfully restored from backup!"
     return 0
 }
 
+do_check() {
+    local target="$1"
+    parse_elf "$target" || return 1
+    local build_id size hash
+    build_id=$(get_elf_build_id "$target")
+    size=$(stat -c%s "$target")
+    hash=$(sha256sum -- "$target" | awk '{print $1}')
+    okf "ELF identity: build-id=${build_id}, size=${size}, SHA-256=${hash}"
+
+    probe_milestones "$target" || return 1
+    if (( BEST_SATISFIED == 0 )); then
+        warnf "No known MV2 layout matched."
+    elif ! $BEST_FULL && (( BEST_TIES > 1 )); then
+        warnf "${BEST_TIES} milestones tied at ${BEST_SATISFIED} sites; layout is ambiguous."
+    else
+        classify_flip_states "$target" || { warnf "Located gates contain invalid bytes."; return 1; }
+        local state="patched"
+        (( STATE_STOCK > 0 && STATE_PATCHED == 0 )) && state="stock"
+        (( STATE_STOCK > 0 && STATE_PATCHED > 0 )) && state="mixed"
+        okf "Layout: Chrome ${BEST_MS_NAME}, ${BEST_SATISFIED}/${BEST_TOTAL} sites, state=${state}."
+    fi
+
+    local backup="${target}.bak"
+    if [[ -f "$backup" ]]; then
+        if validate_backup_snapshot "$backup"; then
+            local same=false
+            [[ "$build_id" == "$BACKUP_BUILD_ID" ]] && same=true
+            okf "Backup: verified, same build=${same}, metadata=$(! $BACKUP_LEGACY && echo true || echo false)."
+        else
+            warnf "Backup: invalid."
+        fi
+    else
+        infof "Backup: absent."
+    fi
+
+    $BEST_FULL && (( BEST_TIES == 1 ))
+}
+
 print_usage() {
     cat <<'EOF'
-Usage: sudo bash chrome-mv2.sh [command] [path] [options]
+Usage: bash chrome-mv2.sh [command] [path] [options]
 
 Re-enables Manifest V2 extension support in Google Chrome by flipping the
 inlined IsExtensionAffected manifest-version checks (Linux ELF only).
 
 Commands:
   patch                  Flip the MV2 gates (default if omitted).
-  restore                Restore the target binary from its .bak.
+  restore                Restore the target binary from its verified .bak.
+  check                  Read-only layout/patch/backup diagnostics.
 
 Arguments:
   path                   Full path to target chrome binary. If omitted, installed
@@ -1508,6 +1813,9 @@ Arguments:
 Options:
   -y, --yes              Force close a running Chrome without asking.
   -q, --quiet            Do not pause for interactive prompts (for scripting).
+      --allow-partial    Developer override: write an incomplete milestone.
+      --force-restore    Restore a backup from a different Chrome build.
+      --signatures PATH  Use this external signature document explicitly.
   -v, --version          Print the tool version and exit.
   -h, --help             Show this help and exit.
 
@@ -1515,10 +1823,11 @@ Examples:
   sudo bash chrome-mv2.sh
   sudo bash chrome-mv2.sh patch /opt/google/chrome/chrome --yes
   sudo bash chrome-mv2.sh restore
+  bash chrome-mv2.sh check /custom/path/to/chrome
   sudo bash chrome-mv2.sh patch /custom/path/to/chrome
 
 Environment:
-  MV2_TEST_NO_ELEVATION  If set, skip the root check (for testing on copies).
+  MV2_TEST_NO_ELEVATION  If set, skip the write-permission check (tests only).
   NO_COLOR               Disable ANSI colour output.
   FORCE_COLOR            Force ANSI colour output.
 EOF
@@ -1529,9 +1838,10 @@ EOF
 # ============================================================================
 
 cleanup() {
-    if [[ -n "${SCAN_PATTERNS_FILE:-}" && -f "${SCAN_PATTERNS_FILE:-}" ]]; then
-        rm -f "$SCAN_PATTERNS_FILE"
-    fi
+    local tmp
+    for tmp in "${SCAN_PATTERNS_FILE:-}" "${SIGNATURE_PARSE_FILE:-}" "${WORK_FILE:-}" "${WRITE_TMP:-}" "${META_TMP:-}"; do
+        if [[ -n "$tmp" && -f "$tmp" ]]; then rm -f -- "$tmp"; fi
+    done
 }
 trap cleanup EXIT
 
@@ -1542,13 +1852,12 @@ trap cleanup EXIT
 main() {
     init_colors
 
-    # Load signature tables (external or embedded)
-    load_milestones || exit 1
-
     # Parse arguments - match PS1 parameter order: [command] [path] [options]
     local cmd="patch"
     local target_path=""
     local assume_yes=false
+    local allow_partial=false
+    local force_restore=false
     QUIET=false
     
     local positional_args=()
@@ -1559,6 +1868,18 @@ main() {
                 assume_yes=true ;;
             --quiet|-q)
                 QUIET=true ;;
+            --allow-partial)
+                allow_partial=true ;;
+            --force-restore)
+                force_restore=true ;;
+            --signatures)
+                if (( $# < 2 )); then errf "--signatures requires a path."; exit 2; fi
+                SIGNATURES_OVERRIDE="$2"
+                shift ;;
+            --)
+                shift
+                while (( $# > 0 )); do positional_args+=("$1"); shift; done
+                break ;;
             --version|-v)
                 echo "chrome-mv2-patch ${APP_VERSION}"
                 exit 0 ;;
@@ -1578,7 +1899,7 @@ main() {
     # Process positional arguments (match PS1: Position 0 = command, Position 1 = path)
     if (( ${#positional_args[@]} >= 1 )); then
         case "${positional_args[0]}" in
-            patch|restore)
+            patch|restore|check)
                 cmd="${positional_args[0]}"
                 if (( ${#positional_args[@]} >= 2 )); then
                     target_path="${positional_args[1]}"
@@ -1587,28 +1908,36 @@ main() {
             *)
                 # Not a command, treat as path (for backward compat: "script.sh /path/to/chrome")
                 target_path="${positional_args[0]}"
+                if (( ${#positional_args[@]} > 1 )); then
+                    errf "Too many positional arguments."
+                    print_usage
+                    exit 2
+                fi
                 ;;
         esac
     fi
+
+    if (( ${#positional_args[@]} > 2 )); then
+        errf "Too many positional arguments."
+        print_usage
+        exit 2
+    fi
+
+    # Help/version exited above. Operational commands now load and validate
+    # signatures; malformed data can no longer break the informational flags.
+    load_milestones || exit 1
 
     banner
 
     # Check for required tools (all coreutils/POSIX - present on any Linux)
     local tool
-    for tool in dd od grep head mktemp stat; do
+    for tool in python3 dd od grep head mktemp stat sha256sum awk cp mv sync readlink id; do
         if ! command -v "$tool" &>/dev/null; then
             errf "Required tool '${tool}' not found."
             exit 1
         fi
     done
     init_scan_backend || exit 1
-
-    # Root check
-    if [[ "$(id -u)" -ne 0 && -z "${MV2_TEST_NO_ELEVATION:-}" ]]; then
-        errf "root privileges are REQUIRED to modify /opt/google/chrome/chrome."
-        echo "    Re-run with sudo."
-        exit 1
-    fi
 
     # Resolve target
     if [[ -n "$target_path" ]]; then
@@ -1641,21 +1970,41 @@ main() {
             choose_install || exit 0
         fi
 
-        TARGET_FILE="${INSTALLS_PATHS[$CHOSEN_INDEX]}"
+        if [[ -z "$TARGET_FILE" ]]; then
+            TARGET_FILE="${INSTALLS_PATHS[$CHOSEN_INDEX]}"
+        fi
     fi
 
     okf "Target channel: ${C_CYN}$(basename "$(dirname "$TARGET_FILE")")${C_RESET}"
     okf "Target file: ${TARGET_FILE}"
 
+    # Check is always read-only. Patch/restore require write access to the
+    # containing directory for atomic replacement and backup creation, but a
+    # user-owned offline copy should not require root.
+    if [[ "$cmd" != "check" && -z "${MV2_TEST_NO_ELEVATION:-}" ]]; then
+        local target_dir
+        target_dir=$(dirname "$TARGET_FILE")
+        if [[ ! -w "$TARGET_FILE" || ! -w "$target_dir" ]]; then
+            errf "Write access is required for ${TARGET_FILE} and ${target_dir}."
+            echo "    Re-run with sudo for a system installation, or use a writable offline copy."
+            exit 1
+        fi
+    fi
+
     # Dispatch
     case "$cmd" in
         restore)
-            do_restore "$TARGET_FILE" "$assume_yes"
+            do_restore "$TARGET_FILE" "$assume_yes" "$force_restore"
             ;;
         patch)
-            do_patch "$TARGET_FILE" "$assume_yes"
+            do_patch "$TARGET_FILE" "$assume_yes" "$allow_partial"
+            ;;
+        check)
+            do_check "$TARGET_FILE"
             ;;
     esac
 }
 
-main "$@"
+if [[ -z "${MV2_TEST_LIBRARY_ONLY:-}" ]]; then
+    main "$@"
+fi

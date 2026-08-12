@@ -1,4 +1,4 @@
-"""Cross-platform MV2 gate derivation + verification for the Go patcher.
+"""Cross-platform MV2 gate derivation and verification for the patch scripts.
 
 One tool, both containers (PE `chrome.dll` on Windows — 64-bit PE32+ tagged
 `pe` and 32-bit PE32 tagged `pe32` — and ELF `chrome` on Linux) and both `jg`
@@ -17,10 +17,9 @@ No third-party dependencies (capstone/pyelftools/pefile not required), so it run
 on the bare reference boxes. Symbols are optional and only used for *naming*
 candidates — see resolve_symbols.py (Windows PDB) or `nm chrome.debug` (Linux).
 
-The finder mirrors the patcher's own report-only scanner (internal/app/engine.go
-reportLayoutCandidates) so what it surfaces is exactly what the engine would look
-for, extended to the near-jg encoding. The masking rules mirror the engine's
-matcher (findAffectedJgSites): only the jg opcode and its displacement are wild.
+The finder mirrors the report-only scanners and masked matchers in
+chrome-mv2.ps1 and chrome-mv2.sh, extended to the near-jg encoding. Only the jg
+opcode and its displacement are wild.
 
 Usage:
     python scripts/derive_milestone.py <stock-binary> [--name NAME] [--json]
@@ -43,7 +42,7 @@ DEFAULT_JSON = REPO / "signatures.json"
 # "virtual start" is the PE section VirtualAddress (an RVA) or the ELF section
 # sh_addr. The finder works on the .text slice, so positions are relative to
 # .text's start; rva() maps such a slice-relative index to jgRVA = pos +
-# text_virt (the address a disassembler shows and the value the Go engine stores).
+# text_virt (the address a disassembler shows and the patch scripts store).
 # ---------------------------------------------------------------------------
 class Image:
     def __init__(self, container, text_virt, text_raw, text_size, data):
@@ -61,7 +60,7 @@ class Image:
         return self._text
 
     def rva(self, textpos):
-        """Index within the .text slice -> the address the engine stores (jgRVA)."""
+        """Index within the .text slice -> the address the scripts store (jgRVA)."""
         return textpos + self.text_virt
 
     def off(self, rva):
@@ -126,7 +125,7 @@ def open_image(path):
 
 
 # ---------------------------------------------------------------------------
-# Masked matcher — mirrors findAffectedJgSites in internal/app/engine.go.
+# Masked matcher - mirrors the matchers in both runtime patch scripts.
 # Exact on every signature byte except the jg opcode and its displacement.
 #
 # A naive per-offset scan of the ~250 MB .text is far too slow in pure Python,
@@ -201,12 +200,12 @@ def masked_match_count(text, sig, jg_off, kind, cap=None):
 
 # ---------------------------------------------------------------------------
 # The finder: cmp <mv>,2 ; jg (short|near) ; ... type/location follow-up.
-# Byte skeleton (both cmp encodings, matching the engine's scanner):
+# Byte skeleton (both cmp encodings, matching the runtime scripts' scanners):
 #   reg   : 83 F8..FF 02              cmp <reg32>, 2         (mod=11, reg=/7)
 #   disp8 : 83 78..7F <disp8> 02      cmp [reg+disp8], 2     (mod=01, reg=/7)
 # then the jg: short 7F | near 0F 8F. A real gate also carries, within ~40
 # bytes, a Manifest::Type compare (83 F8..FF {01|05}) or the location byte test
-# (80 B8..BF <disp32> 00) - the same follow-up the engine requires.
+# (80 B8..BF <disp32> 00) - the same follow-up the runtime scripts require.
 # ---------------------------------------------------------------------------
 def find_gates(img):
     text = img.text
@@ -228,7 +227,7 @@ def find_gates(img):
     def cmp_start(imm_pos):
         """If imm_pos is the imm8 `02` of a `cmp r/m32,2` (opcode 83 /7), return
         the cmp start, else None. Handles the reg (mod=11) and disp8 (mod=01)
-        encodings, matching the engine's scanner."""
+        encodings, matching the runtime scripts' scanners."""
         if imm_pos >= 2 and text[imm_pos - 2] == 0x83 and (text[imm_pos - 1] & 0xF8) == 0xF8:
             return imm_pos - 2
         if imm_pos >= 3 and text[imm_pos - 3] == 0x83 and (text[imm_pos - 2] & 0xF8) == 0x78:
@@ -277,7 +276,7 @@ SIGLEN = {"short": 25, "near": 28}
 
 def build_site(img, cmp_pos, jg_pos, kind, name):
     """Package one candidate as a signatures.json site dict, measuring how many
-    times its fixed-window signature matches .text under the engine's masking."""
+    times its fixed-window signature matches .text under the scripts' masking."""
     text = img.text
     jg_off = jg_pos - cmp_pos
     siglen = min(max(SIGLEN[kind], jg_off + (2 if kind == "short" else 6) + 4),
@@ -413,7 +412,7 @@ def cmd_verify(img, json_path):
     """Report each milestone's fit against this one binary. A binary is a single
     Chrome version, so only its matching milestone verifies fully - success is
     "at least one milestone of this container fully covers the build", which is
-    how the engine picks the best-matching milestone to apply."""
+    how the runtime scripts pick the best-matching milestone to apply."""
     doc = json.loads(Path(json_path).read_text(encoding="utf-8"))
     text = img.text
     candidates = [ms for ms in doc.get("milestones", []) if ms.get("container") == img.container]

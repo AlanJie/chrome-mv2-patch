@@ -10,9 +10,9 @@
 
     Self-contained: the Windows signature tables are EMBEDDED in this file
     ($EmbeddedSignatures below), so the script needs no signatures.json and no
-    other file to run. If a signatures.json IS present next to the script (or in
-    the current directory) it takes precedence, so the tables can still be
-    updated without editing the script. Being self-contained is also what lets
+    other file to run. A signatures.json installed next to the script takes
+    precedence; another file must be selected explicitly with -Signatures.
+    Being self-contained is also what lets
     it run straight from a URL (see the irm|iex example).
 
     HOW IT PATCHES: for each gate, first probe the RVA recorded in the table -
@@ -48,8 +48,8 @@
     layer -> patching engine -> Windows host glue (file locks, elevation) ->
     install discovery -> interactive prompts -> orchestration -> entry point.
 
-.PARAMETER Command
-    patch (default) or restore.
+    .PARAMETER Command
+    patch (default), restore, or check. Check is read-only and never elevates.
 
 .PARAMETER Path
     Target chrome.dll. Omitted: installed channels are listed to pick from.
@@ -57,8 +57,19 @@
 .PARAMETER Yes
     Force close a running Chrome without asking.
 
-.PARAMETER Quiet
+    .PARAMETER Quiet
     Do not pause for 'Press Enter' on exit (for scripting).
+
+    .PARAMETER AllowPartial
+    Developer-only override which permits writing a milestone when only some of
+    its sites were located. The safe default is to decline partial layouts.
+
+    .PARAMETER ForceRestore
+    Restore even when the backup identity does not match the installed binary.
+
+    .PARAMETER Signatures
+    Explicit external signatures.json path. External data is never loaded from
+    the current directory implicitly.
 
 .EXAMPLE
     .\chrome-mv2.ps1
@@ -74,7 +85,7 @@
 [CmdletBinding()]
 param(
     [Parameter(Position = 0)]
-    [ValidateSet('patch', 'restore')]
+    [ValidateSet('patch', 'restore', 'check')]
     [string]$Command = 'patch',
 
     [Parameter(Position = 1)]
@@ -85,6 +96,12 @@ param(
 
     [Alias('q')]
     [switch]$Quiet,
+
+    [switch]$AllowPartial,
+
+    [switch]$ForceRestore,
+
+    [string]$Signatures,
 
     [Alias('v')]
     [switch]$Version,
@@ -101,7 +118,7 @@ $SignaturesFile  = 'signatures.json'
 $script:CsLoaded = $false
 
 # Embedded Windows signature tables - see the .DESCRIPTION note. An external
-# signatures.json next to the script (or in the cwd) overrides this if present.
+# signatures.json next to the script overrides this if present.
 #
 # Schema. Per milestone: name (label used in output), container ("pe" = PE32+/x64,
 # "pe32" = PE32/x86 - milestones whose container does not match the target are
@@ -206,7 +223,7 @@ public static class Mv2Native
     // Signature match at one position. Exact match on every byte
     // except the jg opcode and its displacement, which are masked per encoding:
     //   short: [jgOff] in {7F,EB}; [jgOff+1] disp8 wild
-    //   near : [jgOff] in {0F,90}; [jgOff+1] in {8F,E9}; [jgOff+2..+5] wild
+    //   near : opcode pair is exactly {0F 8F,90 E9}; [jgOff+2..+5] wild
     public static bool SigMatchesAt(byte[] buf, long start, byte[] sig, int jgOff, int kind)
     {
         if (start < 0 || start + sig.Length > buf.LongLength) return false;
@@ -221,8 +238,12 @@ public static class Mv2Native
             }
             else
             {
-                if (k == jgOff)                            { if (p != 0x0F && p != 0x90) return false; }
-                else if (k == jgOff + 1)                   { if (p != 0x8F && p != 0xE9) return false; }
+                if (k == jgOff)
+                {
+                    byte p1 = buf[start + jgOff + 1];
+                    if (!((p == 0x0F && p1 == 0x8F) || (p == 0x90 && p1 == 0xE9))) return false;
+                }
+                else if (k == jgOff + 1)                   { /* pair checked above */ }
                 else if (k >= jgOff + 2 && k <= jgOff + 5) { /* disp32 wildcard */ }
                 else if (p != sig[k])                      { return false; }
             }
@@ -313,16 +334,27 @@ public static class Mv2Native
 # ============================================================================
 # Signature loading. The milestone tables are embedded in this
 # file ($EmbeddedSignatures); an external signatures.json overrides them if
-# present, so new data can be shipped without editing the script.
+# present, so new data can be shipped without editing the script. Another path
+# must be supplied explicitly with -Signatures.
 # ============================================================================
 
-# An external signatures.json beside the script wins over one in the cwd; $null
-# means neither exists, so the embedded tables are used.
+# An explicit -Signatures path wins, followed by signatures.json beside the
+# script. $null means neither exists, so the embedded tables are used.
 function Get-SignaturesPath {
-    $candidates = @()
-    if ($PSScriptRoot) { $candidates += (Join-Path $PSScriptRoot $SignaturesFile) }
-    $candidates += $SignaturesFile   # cwd fallback
-    foreach ($p in $candidates) { if (Test-Path -LiteralPath $p -PathType Leaf) { return $p } }
+    if ($Signatures) {
+        if (-not (Test-Path -LiteralPath $Signatures -PathType Leaf)) {
+            throw "signature file does not exist: $Signatures"
+        }
+        return (Resolve-Path -LiteralPath $Signatures).Path
+    }
+
+    # A file installed beside the script is part of the tool distribution and
+    # may override the embedded tables. Never trust an admin's current directory
+    # implicitly: an unrelated signatures.json there must have no effect.
+    if ($PSScriptRoot) {
+        $besideScript = Join-Path $PSScriptRoot $SignaturesFile
+        if (Test-Path -LiteralPath $besideScript -PathType Leaf) { return $besideScript }
+    }
     return $null
 }
 
@@ -361,17 +393,47 @@ function ConvertFrom-HexString {
 function Import-Milestones {
     $doc = Read-SignatureJson
 
+    if ($null -eq $doc.milestones -or @($doc.milestones).Count -eq 0) {
+        throw 'signature document contains no milestones'
+    }
+
     $out = @()
+    $milestoneNames = @{}
     foreach ($rm in $doc.milestones) {
+        $msName = [string]$rm.name
+        $container = [string]$rm.container
+        if ([string]::IsNullOrWhiteSpace($msName) -or $msName -match '[\r\n|]') {
+            throw 'milestone name is empty or contains a reserved character'
+        }
+        if ($milestoneNames.ContainsKey($msName)) { throw "duplicate milestone name '$msName'" }
+        $milestoneNames[$msName] = $true
+        if ($container -notin 'pe', 'pe32', 'elf') {
+            throw "milestone $msName has unsupported container '$container'"
+        }
+        if ($null -eq $rm.sites -or @($rm.sites).Count -eq 0) {
+            throw "milestone $msName contains no sites"
+        }
+
         $sites = @()
+        $siteNames = @{}
         foreach ($rs in $rm.sites) {
+            $siteName = [string]$rs.name
+            if ([string]::IsNullOrWhiteSpace($siteName) -or $siteName -match '[\r\n|]') {
+                throw "milestone $msName has an invalid site name"
+            }
+            if ($siteNames.ContainsKey($siteName)) { throw "milestone $msName has duplicate site '$siteName'" }
+            $siteNames[$siteName] = $true
             switch ($rs.kind) {
                 'short' { $kind = 0 }      # Mv2Native.KindShort
                 'near'  { $kind = 1 }      # Mv2Native.KindNear
                 default { throw "milestone $($rm.name) site '$($rs.name)': unknown kind '$($rs.kind)'" }
             }
 
-            $sig = ConvertFrom-HexString $rs.sig
+            $sigText = [string]$rs.sig
+            if ([string]::IsNullOrWhiteSpace($sigText) -or $sigText -notmatch '^[0-9A-Fa-f]+$') {
+                throw "milestone $msName site '$siteName': sig must be non-empty hexadecimal bytes"
+            }
+            $sig = ConvertFrom-HexString $sigText
             $jgOff = [int]$rs.jgOff
             if ($jgOff -lt 0 -or $jgOff -ge $sig.Length) {
                 throw "milestone $($rm.name) site '$($rs.name)': jgOff $jgOff out of range (sig len $($sig.Length))"
@@ -383,13 +445,19 @@ function Import-Milestones {
             if ($kind -eq 1 -and ($jgOff + 5) -ge $sig.Length) {
                 throw "milestone $($rm.name) site '$($rs.name)': near jg needs 6 bytes but sig ends early"
             }
+            if ($kind -eq 0 -and ($jgOff + 1) -ge $sig.Length) {
+                throw "milestone $msName site '$siteName': short jg needs 2 bytes but sig ends early"
+            }
+            if ($kind -eq 1 -and $sig[$jgOff + 1] -ne 0x8F) {
+                throw ("milestone $msName site '$siteName': near jg second opcode is 0x{0:X2}, expected 0x8F" -f $sig[$jgOff + 1])
+            }
             $expected = [int]$rs.expectedMatches
             if ($expected -lt 1) {
                 throw "milestone $($rm.name) site '$($rs.name)': expectedMatches must be >= 1"
             }
 
             $sites += [pscustomobject]@{
-                Name            = $rs.name
+                Name            = $siteName
                 Kind            = $kind
                 JgRVA           = [uint32]([Convert]::ToUInt32($rs.jgRVA, 16))
                 Sig             = $sig
@@ -397,7 +465,7 @@ function Import-Milestones {
                 ExpectedMatches = $expected
             }
         }
-        $out += [pscustomobject]@{ Name = $rm.name; Container = $rm.container; Sites = $sites }
+        $out += [pscustomobject]@{ Name = $msName; Container = $container; Sites = $sites }
     }
     return $out
 }
@@ -458,6 +526,9 @@ function Open-PeImage {
         }
     }
     if ($textSize -eq 0) { throw "could not locate .text section" }
+    if ([int64]$textRaw -lt 0 -or [int64]$textRaw + [int64]$textSize -gt $Buf.LongLength) {
+        throw "not a valid PE: .text raw data is out of bounds"
+    }
 
     return [pscustomobject]@{
         Format     = if ($is32) { 'pe32' } else { 'pe' }   # matches a milestone's "container"
@@ -466,6 +537,9 @@ function Open-PeImage {
         TextSize   = $textSize
         ChecksumAt = $optOff + 64                          # same offset in PE32 and PE32+
         SecDirAt   = $optOff + $fixedLen + 4 * 8           # data directory [4] = Security
+        NtHeaderAt = [int64]$eLfanew
+        Machine    = [BitConverter]::ToUInt16($Buf, $eLfanew + 4)
+        TimeStamp  = [BitConverter]::ToUInt32($Buf, $eLfanew + 8)
         Is32       = $is32
     }
 }
@@ -497,6 +571,121 @@ function Complete-Image {
     Write-Ok ('Recalculated PE CheckSum: 0x{0:X}' -f $sum)
 }
 
+function Get-ByteHash {
+    param([byte[]]$Buf)
+    $sha = [Security.Cryptography.SHA256]::Create()
+    try { return ([BitConverter]::ToString($sha.ComputeHash($Buf))).Replace('-', '').ToLowerInvariant() }
+    finally { $sha.Dispose() }
+}
+
+function Get-PeIdentity {
+    param([byte[]]$Buf, $Img)
+    return [pscustomobject]@{
+        Format    = [string]$Img.Format
+        Machine   = [uint16]$Img.Machine
+        TimeStamp = [uint32]$Img.TimeStamp
+        Length    = [int64]$Buf.LongLength
+        SHA256    = Get-ByteHash $Buf
+    }
+}
+
+function Test-SameBuildIdentity {
+    param($A, $B)
+    return ($A.Format -eq $B.Format -and [uint16]$A.Machine -eq [uint16]$B.Machine -and
+        [uint32]$A.TimeStamp -eq [uint32]$B.TimeStamp -and [int64]$A.Length -eq [int64]$B.Length)
+}
+
+function Write-AtomicFile {
+    param(
+        [string]$TargetPath,
+        [byte[]]$Buf,
+        [string]$ExpectedCurrentHash = '',
+        [string]$PreserveMetadataFrom = ''
+    )
+
+    $full = [IO.Path]::GetFullPath($TargetPath)
+    $dir = [IO.Path]::GetDirectoryName($full)
+    if (-not $dir) { $dir = (Get-Location).Path }
+    $tmp = Join-Path $dir ('.chrome-mv2-' + [Guid]::NewGuid().ToString('N') + '.tmp')
+    $old = Join-Path $dir ('.chrome-mv2-' + [Guid]::NewGuid().ToString('N') + '.old')
+
+    try {
+        $fs = New-Object IO.FileStream($tmp, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write,
+            [IO.FileShare]::None, 1048576, [IO.FileOptions]::WriteThrough)
+        try {
+            $fs.Write($Buf, 0, $Buf.Length)
+            $fs.Flush($true)
+        } finally { $fs.Dispose() }
+
+        $written = [IO.File]::ReadAllBytes($tmp)
+        if ($written.LongLength -ne $Buf.LongLength -or (Get-ByteHash $written) -ne (Get-ByteHash $Buf)) {
+            throw "temporary-file verification failed for $TargetPath"
+        }
+
+        if ($PreserveMetadataFrom -and (Test-Path -LiteralPath $PreserveMetadataFrom -PathType Leaf)) {
+            try { [IO.File]::SetAttributes($tmp, [IO.File]::GetAttributes($PreserveMetadataFrom)) } catch { }
+            try { Set-Acl -LiteralPath $tmp -AclObject (Get-Acl -LiteralPath $PreserveMetadataFrom) } catch { }
+        }
+
+        if ($ExpectedCurrentHash) {
+            if (-not (Test-Path -LiteralPath $full -PathType Leaf)) { throw 'target disappeared before replacement' }
+            $now = (Get-FileHash -LiteralPath $full -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($now -ne $ExpectedCurrentHash.ToLowerInvariant()) {
+                throw 'target changed after it was inspected; refusing to overwrite it'
+            }
+        }
+
+        if (Test-Path -LiteralPath $full -PathType Leaf) {
+            [IO.File]::Replace($tmp, $full, $old, $true)
+            Remove-Item -LiteralPath $old -Force -ErrorAction SilentlyContinue
+        } else {
+            [IO.File]::Move($tmp, $full)
+        }
+    } finally {
+        if (Test-Path -LiteralPath $tmp -PathType Leaf) { Remove-Item -LiteralPath $tmp -Force -ErrorAction SilentlyContinue }
+        # If replacement succeeded but cleanup was interrupted, the .old file is
+        # a recoverable copy of the previous target; remove it on normal unwind.
+        if (Test-Path -LiteralPath $old -PathType Leaf) { Remove-Item -LiteralPath $old -Force -ErrorAction SilentlyContinue }
+    }
+}
+
+function Get-BackupMetadataPath { param([string]$BackupPath) return "$BackupPath.json" }
+
+function Save-BackupSnapshot {
+    param([string]$TargetPath, [string]$BackupPath, [byte[]]$Buf, $Identity)
+
+    Write-AtomicFile -TargetPath $BackupPath -Buf $Buf -PreserveMetadataFrom $TargetPath
+    $meta = [ordered]@{
+        Schema = 1; Format = $Identity.Format; Machine = $Identity.Machine
+        TimeStamp = $Identity.TimeStamp; Length = $Identity.Length; SHA256 = $Identity.SHA256
+    }
+    $json = ($meta | ConvertTo-Json -Compress) + "`n"
+    $bytes = [Text.UTF8Encoding]::new($false).GetBytes($json)
+    Write-AtomicFile -TargetPath (Get-BackupMetadataPath $BackupPath) -Buf $bytes
+}
+
+function Read-ValidatedBackup {
+    param([string]$BackupPath)
+
+    if (-not (Test-Path -LiteralPath $BackupPath -PathType Leaf)) { throw "backup does not exist: $BackupPath" }
+    $buf = [IO.File]::ReadAllBytes($BackupPath)
+    if ($buf.Length -eq 0) { throw 'backup is empty' }
+    $img = Open-Image $buf
+    $identity = Get-PeIdentity -Buf $buf -Img $img
+    $metaPath = Get-BackupMetadataPath $BackupPath
+    $legacy = -not (Test-Path -LiteralPath $metaPath -PathType Leaf)
+    if (-not $legacy) {
+        try { $meta = Get-Content -LiteralPath $metaPath -Raw | ConvertFrom-Json }
+        catch { throw "invalid backup metadata ${metaPath}: $_" }
+        if ([int]$meta.Schema -ne 1 -or $meta.Format -ne $identity.Format -or
+            [uint16]$meta.Machine -ne $identity.Machine -or [uint32]$meta.TimeStamp -ne $identity.TimeStamp -or
+            [int64]$meta.Length -ne $identity.Length -or ([string]$meta.SHA256).ToLowerInvariant() -ne $identity.SHA256) {
+            throw 'backup metadata/hash does not match the backup file'
+        }
+    }
+    return [pscustomobject]@{ Buf = $buf; Img = $img; Identity = $identity; Legacy = $legacy }
+}
+
 # ============================================================================
 # Patching engine
 # ============================================================================
@@ -520,8 +709,11 @@ function Test-SigAt {
             elseif ($k -eq $JgOff + 1) { }                       # disp8 wildcard
             elseif ($p -ne $Sig[$k])   { return $false }
         } else {
-            if     ($k -eq $JgOff)     { if ($p -ne 0x0F -and $p -ne 0x90) { return $false } }
-            elseif ($k -eq $JgOff + 1) { if ($p -ne 0x8F -and $p -ne 0xE9) { return $false } }
+            if ($k -eq $JgOff) {
+                $p1 = $Buf[$Start + $JgOff + 1]
+                if (-not (($p -eq 0x0F -and $p1 -eq 0x8F) -or ($p -eq 0x90 -and $p1 -eq 0xE9))) { return $false }
+            }
+            elseif ($k -eq $JgOff + 1) { }                         # pair checked above
             elseif ($k -ge $JgOff + 2 -and $k -le $JgOff + 5) { } # disp32 wildcard
             elseif ($p -ne $Sig[$k])   { return $false }
         }
@@ -577,9 +769,16 @@ function Find-AffectedJgSites {
 #   Written    @{ RVA; Bytes } per patched site for record-keeping
 #   Relocated  at least one gate was found by scan, not at its recorded RVA
 function Invoke-PatchMilestones {
-    param([byte[]]$Buf, $Img, [array]$Milestones)
+    param(
+        [byte[]]$Buf,
+        $Img,
+        [array]$Milestones,
+        [bool]$AllowPartial = $false,
+        [bool]$Apply = $true
+    )
 
     $best = $null
+    $bestCount = 0
     foreach ($ms in $Milestones) {
         $flips = @(); $satisfied = 0
         foreach ($s in $ms.Sites) {
@@ -593,6 +792,9 @@ function Invoke-PatchMilestones {
         }
         if ($null -eq $best -or $satisfied -gt $best.Satisfied) {
             $best = [pscustomobject]@{ Ms = $ms; Flips = $flips; Satisfied = $satisfied }
+            $bestCount = 1
+        } elseif ($satisfied -eq $best.Satisfied -and $satisfied -gt 0) {
+            $bestCount++
         }
         # Early exit: a milestone that satisfies EVERY site is the definitive
         # match - no other milestone can beat 100%. Stop here so we do not scan
@@ -604,7 +806,8 @@ function Invoke-PatchMilestones {
 
     $res = [pscustomobject]@{
         Status = 0; Milestone = ''; Located = 0; Total = 0; Flips = 0
-        Full = $false; Written = @(); Relocated = $false
+        Full = $false; Written = @(); Relocated = $false; Reason = ''
+        Stock = 0; Already = 0
     }
     if ($null -eq $best -or $best.Satisfied -eq 0) { return $res }
 
@@ -612,6 +815,17 @@ function Invoke-PatchMilestones {
     $res.Located   = $best.Satisfied
     $res.Total     = $best.Ms.Sites.Count
     $res.Full      = ($best.Satisfied -eq $best.Ms.Sites.Count)
+
+    if (-not $res.Full -and $bestCount -gt 1) {
+        $res.Reason = "$bestCount milestones tied at $($best.Satisfied) located site(s); layout is ambiguous"
+        Write-Warn $res.Reason
+        return $res
+    }
+    if (-not $res.Full -and -not $AllowPartial) {
+        $res.Reason = "only $($res.Located)/$($res.Total) sites matched; partial writes require -AllowPartial"
+        Write-Warn $res.Reason
+        return $res
+    }
 
     Write-Info ("Chrome {0} MV2 layout detected ({1}/{2} inlined IsExtensionAffected sites, {3} jg flip(s))." -f `
         $best.Ms.Name, $res.Located, $res.Total, $best.Flips.Count)
@@ -628,7 +842,7 @@ function Invoke-PatchMilestones {
             $cur = $Buf[$f.JgRaw]
             if ($cur -eq 0xEB) {
                 Write-Host ("    [i] {0}: {1} jg->jmp at RVA 0x{2:X} already applied (no change)." -f $ms, $f.Site.Name, $jgRVA)
-                $already++
+                $already++; $res.Already++
                 $res.Written += [pscustomobject]@{ RVA = $jgRVA; Bytes = [byte[]]@(0xEB) }
                 continue
             }
@@ -637,14 +851,15 @@ function Invoke-PatchMilestones {
                     $script:TagWarn, $ms, $f.Site.Name, $cur, $jgRVA)
                 continue
             }
-            $Buf[$f.JgRaw] = 0xEB          # jg -> jmp short
+            $res.Stock++
+            if ($Apply) { $Buf[$f.JgRaw] = 0xEB }          # jg -> jmp short
             $applied++; $res.Flips++
             $res.Written += [pscustomobject]@{ RVA = $jgRVA; Bytes = [byte[]]@(0xEB) }
         } else {
             $o0 = $Buf[$f.JgRaw]; $o1 = $Buf[$f.JgRaw + 1]
             if ($o0 -eq 0x90 -and $o1 -eq 0xE9) {
                 Write-Host ("    [i] {0}: {1} jg->jmp at RVA 0x{2:X} already applied (no change)." -f $ms, $f.Site.Name, $jgRVA)
-                $already++
+                $already++; $res.Already++
                 $res.Written += [pscustomobject]@{ RVA = $jgRVA; Bytes = [byte[]]@(0x90, 0xE9) }
                 continue
             }
@@ -653,14 +868,21 @@ function Invoke-PatchMilestones {
                     $script:TagWarn, $ms, $f.Site.Name, $o0, $o1, $jgRVA)
                 continue
             }
-            $Buf[$f.JgRaw]     = 0x90      # nop
-            $Buf[$f.JgRaw + 1] = 0xE9      # jmp near (keeps the disp32)
+            $res.Stock++
+            if ($Apply) {
+                $Buf[$f.JgRaw]     = 0x90      # nop
+                $Buf[$f.JgRaw + 1] = 0xE9      # jmp near (keeps the disp32)
+            }
             $applied++; $res.Flips++
             $res.Written += [pscustomobject]@{ RVA = $jgRVA; Bytes = [byte[]]@(0x90, 0xE9) }
         }
 
         $suffix = if ($f.Relocated) { '  (RELOCATED - point-release layout)' } else { '' }
-        Write-Host ("    {0} {1}: {2} jg->jmp at RVA 0x{3:X}{4}" -f $script:TagOK, $ms, $f.Site.Name, $jgRVA, $suffix)
+        if ($Apply) {
+            Write-Host ("    {0} {1}: {2} jg->jmp at RVA 0x{3:X}{4}" -f $script:TagOK, $ms, $f.Site.Name, $jgRVA, $suffix)
+        } else {
+            Write-Host ("    {0} {1}: {2} stock jg at RVA 0x{3:X}{4}" -f $script:TagOK, $ms, $f.Site.Name, $jgRVA, $suffix)
+        }
     }
     $res.Flips += $already   # count already-applied sites toward the flip total
 
@@ -671,6 +893,28 @@ function Invoke-PatchMilestones {
 
     $res.Status = if ($applied -gt 0) { 1 } else { 2 }
     return $res
+}
+
+function Test-PatchOutput {
+    param([byte[]]$Buf, $Img, $Patch)
+    foreach ($w in $Patch.Written) {
+        $off = [int64]$Img.TextRaw + ([int64]$w.RVA - [int64]$Img.TextRVA)
+        if ($off -lt 0 -or $off + $w.Bytes.Length -gt $Buf.LongLength) { return $false }
+        for ($i = 0; $i -lt $w.Bytes.Length; $i++) {
+            if ($Buf[$off + $i] -ne $w.Bytes[$i]) { return $false }
+        }
+    }
+    return ($Patch.Written.Count -gt 0)
+}
+
+function Get-CleanStockLayout {
+    param([byte[]]$Buf, $Img, [array]$Milestones, [bool]$AllowPartialLayout = $false)
+    $copy = [byte[]]$Buf.Clone()
+    $probe = Invoke-PatchMilestones -Buf $copy -Img $Img -Milestones $Milestones `
+        -AllowPartial $AllowPartialLayout -Apply $false
+    $clean = ($probe.Status -ne 0 -and $probe.Stock -gt 0 -and $probe.Already -eq 0 -and
+        ($probe.Full -or $AllowPartialLayout) -and -not $probe.Reason)
+    return [pscustomobject]@{ Clean = $clean; Probe = $probe }
 }
 
 # Report-only structural scan for the decline path. Never writes anything: it
@@ -852,6 +1096,7 @@ NOTE: file mode forwards parameters explicitly - a new user-facing switch has to
 be added to the $argv list below or it is silently dropped on the elevated run.
 #>
 function Invoke-SelfElevate {
+    param([string]$ResolvedTargetPath)
     # Prefer the current host (pwsh vs powershell.exe) so PS7 stays on PS7.
     $exe = (Get-Process -Id $PID).Path
     if (-not $exe) { $exe = if ($PSVersionTable.PSVersion.Major -ge 6) { 'pwsh.exe' } else { 'powershell.exe' } }
@@ -860,16 +1105,20 @@ function Invoke-SelfElevate {
 
     if ($fileMode) {
         $argv = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', (Get-QuotedArg $PSCommandPath), $Command)
-        if ($Path)  { $argv += (Get-QuotedArg $Path) }
+        if ($ResolvedTargetPath)  { $argv += (Get-QuotedArg $ResolvedTargetPath) }
         if ($Yes)   { $argv += '-Yes' }
         if ($Quiet) { $argv += '-Quiet' }
+        if ($AllowPartial) { $argv += '-AllowPartial' }
+        if ($ForceRestore) { $argv += '-ForceRestore' }
+        if ($Signatures) { $argv += '-Signatures'; $argv += (Get-QuotedArg ([IO.Path]::GetFullPath($Signatures))) }
         $argv += '-Relaunched'
         $argString = $argv -join ' '
     } else {
         # REPLAY mode: rebuild from this process's own argv, injecting the guard
         # into the -Command / -EncodedCommand payload.
         $raw = [Environment]::GetCommandLineArgs()
-        $marker = "`$env:MV2_RELAUNCHED='1'; "
+        $targetB64 = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($ResolvedTargetPath))
+        $marker = "`$env:MV2_RELAUNCHED='1'; `$env:MV2_TARGET_B64='$targetB64'; "
         $rebuilt = New-Object System.Collections.Generic.List[string]
         $injected = $false
         for ($i = 1; $i -lt $raw.Count; $i++) {
@@ -959,26 +1208,57 @@ function Close-FileHolders {
     return $false
 }
 
-# Closes the target if something has it open. Returns $false when it is still
-# locked afterwards - the caller must not write in that case.
-function Unlock-Target {
-    param([string]$TargetPath, [bool]$ForceClose)
+# Performs a fresh lock/holder check and obtains consent in the same operation.
+# A process which starts after this returns is handled by the atomic replace
+# failing; it is never killed without going through this consent gate.
+function Request-TargetUnlock {
+    param($Target, [bool]$AssumeYes)
 
-    if (-not (Test-TargetLocked -TargetPath $TargetPath)) { return $true }
-    Write-Info 'The target is in use - this Chrome channel is running.'
-    if (-not $ForceClose) { return $false }
-    if (Close-FileHolders -TargetPath $TargetPath) {
+    $holders = @(Get-FileHolders -TargetPath $Target.Path)
+    $locked = Test-TargetLocked -TargetPath $Target.Path
+    if ($holders.Count -eq 0 -and -not $locked) { return $true }
+
+    $current = [pscustomobject]@{
+        Channel = $Target.Channel; Path = $Target.Path; Running = $true
+        Holders = $holders.Count
+    }
+    if ($AssumeYes) {
+        Write-Warn "Chrome $($Target.Channel) is running and will be force closed (-Yes)."
+    } elseif ($Quiet) {
+        Write-Err "Chrome $($Target.Channel) is running ($($holders.Count) detected holder(s))."
+        Write-Host '    Close it, or pass -Yes to force close it.'
+        return $false
+    } elseif (-not (Confirm-ForceClose $current)) {
+        return $false
+    }
+
+    if (Close-FileHolders -TargetPath $Target.Path) {
         Write-Ok 'This channel is closed; other Chrome channels were left running.'
         return $true
     }
     return $false
 }
 
+function Test-TargetDirectoryWritable {
+    param([string]$TargetPath)
+    $dir = Split-Path -Parent ([IO.Path]::GetFullPath($TargetPath))
+    $probe = Join-Path $dir ('.chrome-mv2-write-probe-' + [Guid]::NewGuid().ToString('N'))
+    try {
+        $fs = [IO.File]::Open($probe, [IO.FileMode]::CreateNew, [IO.FileAccess]::Write, [IO.FileShare]::None)
+        $fs.Dispose()
+        return $true
+    } catch {
+        return $false
+    } finally {
+        if (Test-Path -LiteralPath $probe -PathType Leaf) { Remove-Item -LiteralPath $probe -Force -ErrorAction SilentlyContinue }
+    }
+}
+
 # Writes the patched image in place. The file was unlocked first, so a straight
 # overwrite is safe (Chrome reopens chrome.dll on next launch).
 function Write-Target {
-    param([string]$TargetPath, [byte[]]$Buf)
-    [IO.File]::WriteAllBytes($TargetPath, $Buf)
+    param([string]$TargetPath, [byte[]]$Buf, [string]$ExpectedCurrentHash = '')
+    Write-AtomicFile -TargetPath $TargetPath -Buf $Buf -ExpectedCurrentHash $ExpectedCurrentHash -PreserveMetadataFrom $TargetPath
 }
 
 # ============================================================================
@@ -1207,21 +1487,6 @@ function Confirm-ForceClose {
     }
 }
 
-# Consent gate for killing a running channel, in the one place all three answers
-# meet: not running = go, -Yes = go with a warning, -Quiet = refuse (cannot ask),
-# otherwise prompt. $false means the caller must abort without touching anything.
-function Confirm-CloseConsent {
-    param($Target, [bool]$AssumeYes)
-    if (-not $Target.Running) { return $true }
-    if ($AssumeYes) { Write-Warn "Chrome $($Target.Channel) is running and will be force closed (--yes)."; return $true }
-    if ($Quiet) {
-        Write-Err "Chrome $($Target.Channel) is running ($($Target.Holders) process(es))."
-        Write-Host '    Close it, or pass -Yes to force close it.'
-        return $false
-    }
-    return (Confirm-ForceClose $Target)
-}
-
 # ============================================================================
 # Orchestration
 # ============================================================================
@@ -1273,59 +1538,87 @@ function Resolve-Target {
 function Invoke-Patch {
     param($Target, [bool]$AssumeYes)
 
-    if (-not (Confirm-CloseConsent -Target $Target -AssumeYes $AssumeYes)) { return 1 }
-    if (-not (Unlock-Target -TargetPath $Target.Path -ForceClose $true)) {
-        Write-Err 'Target is still locked and no owning process could be closed.'
-        Write-Host '    Close this Chrome channel manually and re-run. Other channels can stay open.'
-        return 1
-    }
-
     $buf = [IO.File]::ReadAllBytes($Target.Path)
     if ($buf.Length -eq 0) { Write-Err 'Error: the target file is empty.'; return 1 }
     Write-Ok "Loaded $($buf.Length) bytes from $($Target.Path)."
 
     $img = Open-Image $buf
+    $targetIdentity = Get-PeIdentity -Buf $buf -Img $img
+    $targetHash = $targetIdentity.SHA256
 
-    # Backup policy, three cases:
-    #   no .bak yet           -> copy the current file as the baseline
-    #   .bak + stock target   -> Chrome updated, so refresh .bak to the new stock
-    #   .bak + patched target -> patch the STOCK bytes out of .bak rather than the
-    #                            patched file, so re-runs cannot stack edits
-    # Test-LikelyStock is the discriminator: this tool always zeroes the
-    # Authenticode directory, so a non-zero one means Chrome wrote the file last.
-    $backupPath = Get-BackupPath $Target.Path
-    if (-not (Test-Path -LiteralPath $backupPath -PathType Leaf)) {
-        Write-Info "Creating initial backup copy: $backupPath ..."
-        Copy-Item -LiteralPath $Target.Path -Destination $backupPath -Force
-        Write-Ok 'Initial backup created successfully.'
-    } elseif (Test-LikelyStock -Img $img -Buf $buf) {
-        Write-Info "Unpatched stock detected - refreshing $backupPath ..."
-        Copy-Item -LiteralPath $Target.Path -Destination $backupPath -Force
-        Write-Ok 'Backup updated to latest stock version.'
-    } else {
-        Write-Info 'Previously patched binary detected. Restoring clean stock from backup before re-patching...'
-        try {
-            $buf = [IO.File]::ReadAllBytes($backupPath)
-            $img = Open-Image $buf
-            Write-Ok 'Restored clean stock into memory buffer.'
-        } catch {
-            Write-Warn "Backup restore failed ($_). Attempting idempotent re-patch of the existing file..."
-        }
-    }
-
-    # Only milestones for this container are considered - a PE32+ table can never
-    # match a PE32 target, and probing it would just waste a full .text scan.
     $milestones = @(Import-Milestones | Where-Object { $_.Container -eq $img.Format })
     Write-Info "Starting MV2 patching (ManifestV2Handler architecture, $($img.Format.ToUpper()) target)..."
     if ($milestones.Count -eq 0) {
         Write-Warn "No $($img.Format.ToUpper()) milestone signatures are known yet - declining (nothing modified)."
         Show-LayoutCandidates -Buf $buf -Img $img
-        Write-Warn 'No patches were applied.'
         return 1
     }
 
+    # Backups are accepted only when they parse as clean stock and describe the
+    # same PE build. A patched/unsigned target can never become a new baseline.
+    $backupPath = Get-BackupPath $Target.Path
+    if (-not (Test-Path -LiteralPath $backupPath -PathType Leaf)) {
+        if (-not (Test-LikelyStock -Img $img -Buf $buf)) {
+            Write-Err 'No clean backup exists and the target is not a signed stock Chrome DLL.'
+            Write-Host '    Restore/reinstall Chrome first; refusing to save patched bytes as the baseline.'
+            return 1
+        }
+        $stockLayout = Get-CleanStockLayout -Buf $buf -Img $img -Milestones $milestones `
+            -AllowPartialLayout $AllowPartial.IsPresent
+        if (-not $stockLayout.Clean) {
+            Write-Err 'No clean backup exists and the target is not a recognized stock layout.'
+            return 1
+        }
+        Write-Info "Creating initial backup copy: $backupPath ..."
+        Save-BackupSnapshot -TargetPath $Target.Path -BackupPath $backupPath -Buf $buf -Identity $targetIdentity
+        $backup = Read-ValidatedBackup $backupPath
+        Write-Ok 'Initial backup created and verified.'
+    } else {
+        try {
+            $backup = Read-ValidatedBackup $backupPath
+        } catch {
+            Write-Err "Backup validation failed: $_"
+            return 1
+        }
+        if (-not (Test-LikelyStock -Img $backup.Img -Buf $backup.Buf)) {
+            Write-Err 'The backup does not look like signed stock Chrome; refusing to use it.'
+            return 1
+        }
+        $backupLayout = Get-CleanStockLayout -Buf $backup.Buf -Img $backup.Img -Milestones $milestones `
+            -AllowPartialLayout $AllowPartial.IsPresent
+        if (-not $backupLayout.Clean) {
+            Write-Err 'The backup is not a recognized clean stock layout.'
+            return 1
+        }
+
+        if (-not (Test-SameBuildIdentity -A $targetIdentity -B $backup.Identity)) {
+            if (-not (Test-LikelyStock -Img $img -Buf $buf)) {
+                Write-Err 'Chrome changed builds, but the current target is not verifiable stock.'
+                Write-Host '    Reinstall/update Chrome to recreate a clean target before patching.'
+                return 1
+            }
+            $newStockLayout = Get-CleanStockLayout -Buf $buf -Img $img -Milestones $milestones `
+                -AllowPartialLayout $AllowPartial.IsPresent
+            if (-not $newStockLayout.Clean) {
+                Write-Err 'The updated target is signed but does not match a complete known stock layout.'
+                return 1
+            }
+            Write-Info 'Chrome update detected - replacing the backup with the new signed stock build...'
+            Save-BackupSnapshot -TargetPath $Target.Path -BackupPath $backupPath -Buf $buf -Identity $targetIdentity
+            $backup = Read-ValidatedBackup $backupPath
+            Write-Ok 'Backup updated and verified.'
+        } elseif ($backup.Legacy) {
+            Save-BackupSnapshot -TargetPath $Target.Path -BackupPath $backupPath -Buf $backup.Buf -Identity $backup.Identity
+            Write-Ok 'Legacy backup validated and metadata added.'
+        }
+    }
+
+    $buf = [byte[]]$backup.Buf.Clone()
+    $img = Open-Image $buf
+
     Write-Info "Probing for a known Chrome layout ($($milestones.Count) milestone table(s))..."
-    $patch = Invoke-PatchMilestones -Buf $buf -Img $img -Milestones $milestones
+    $patch = Invoke-PatchMilestones -Buf $buf -Img $img -Milestones $milestones `
+        -AllowPartial $AllowPartial.IsPresent -Apply $true
     if ($patch.Status -eq 0) {
         Show-LayoutCandidates -Buf $buf -Img $img
         Write-Warn 'No known MV2 layout matched this binary.'
@@ -1339,8 +1632,29 @@ function Invoke-Patch {
     Write-Info "Chrome $($patch.Milestone) $msg"
 
     Complete-Image -Img $img -Buf $buf
+    if (-not (Test-PatchOutput -Buf $buf -Img $img -Patch $patch)) {
+        Write-Err 'Internal verification failed: prepared output does not contain every selected patch.'
+        return 1
+    }
 
-    Write-Target -TargetPath $Target.Path -Buf $buf
+    $preparedHash = Get-ByteHash $buf
+    if ($preparedHash -eq $targetHash) {
+        Write-Success 'Target is already fully patched; no write was needed.'
+        return 0
+    }
+    if ($targetHash -ne $backup.Identity.SHA256) {
+        Write-Err 'Target contains changes unrelated to this patch; refusing to overwrite them.'
+        Write-Host '    Restore/reinstall Chrome or inspect the binary manually before retrying.'
+        return 1
+    }
+
+    if (-not (Request-TargetUnlock -Target $Target -AssumeYes $AssumeYes)) {
+        Write-Err 'Target is still locked; nothing was written.'
+        return 1
+    }
+    Write-Target -TargetPath $Target.Path -Buf $buf -ExpectedCurrentHash $targetHash
+    $afterHash = (Get-FileHash -LiteralPath $Target.Path -Algorithm SHA256).Hash.ToLowerInvariant()
+    if ($afterHash -ne $preparedHash) { throw 'post-write SHA-256 verification failed' }
 
     Write-Rule
     if ($patch.Full) {
@@ -1356,8 +1670,8 @@ function Invoke-Patch {
     return 0
 }
 
-# restore: copies .bak back over the target verbatim. No parsing and no
-# verification needed - the backup is a byte-for-byte copy of what Chrome shipped.
+# restore: validates backup metadata, stock layout, and build identity before an
+# atomic replacement. A cross-build restore requires the explicit force switch.
 function Invoke-Restore {
     param($Target, [bool]$AssumeYes)
 
@@ -1367,16 +1681,73 @@ function Invoke-Restore {
         Write-Err "Error: backup file $backupPath does not exist."
         return 1
     }
-    if (-not (Confirm-CloseConsent -Target $Target -AssumeYes $AssumeYes)) { return 1 }
-    if (-not (Unlock-Target -TargetPath $Target.Path -ForceClose $true)) {
-        Write-Err 'Target is still locked and no owning process could be closed.'
-        Write-Host '    Close this Chrome channel manually and re-run.'
+    try { $backup = Read-ValidatedBackup $backupPath }
+    catch { Write-Err "Backup validation failed: $_"; return 1 }
+    if (-not (Test-LikelyStock -Img $backup.Img -Buf $backup.Buf)) {
+        Write-Err 'Backup is not verifiable signed stock Chrome; refusing to restore it.'
         return 1
     }
-    $data = [IO.File]::ReadAllBytes($backupPath)
-    Write-Target -TargetPath $Target.Path -Buf $data
+    $milestones = @(Import-Milestones | Where-Object { $_.Container -eq $backup.Img.Format })
+    $backupLayout = Get-CleanStockLayout -Buf $backup.Buf -Img $backup.Img -Milestones $milestones -AllowPartialLayout $true
+    if (-not $backupLayout.Clean) {
+        Write-Err 'Backup is not a recognized clean stock layout.'
+        return 1
+    }
+
+    $current = [IO.File]::ReadAllBytes($Target.Path)
+    $currentImg = Open-Image $current
+    $currentIdentity = Get-PeIdentity -Buf $current -Img $currentImg
+    if (-not (Test-SameBuildIdentity -A $currentIdentity -B $backup.Identity) -and -not $ForceRestore) {
+        Write-Err 'Backup belongs to a different Chrome build; refusing to downgrade the installed DLL.'
+        Write-Host '    Use -ForceRestore only if restoring that older build is intentional.'
+        return 1
+    }
+    if (-not (Test-SameBuildIdentity -A $currentIdentity -B $backup.Identity)) {
+        Write-Warn 'Forcing restore from a different Chrome build (-ForceRestore).'
+    }
+    if ($currentIdentity.SHA256 -eq $backup.Identity.SHA256) {
+        Write-Success 'Target already matches the verified backup; no write was needed.'
+        return 0
+    }
+    if (-not (Request-TargetUnlock -Target $Target -AssumeYes $AssumeYes)) {
+        Write-Err 'Target is still locked; nothing was written.'
+        return 1
+    }
+    Write-Target -TargetPath $Target.Path -Buf $backup.Buf -ExpectedCurrentHash $currentIdentity.SHA256
+    $afterHash = (Get-FileHash -LiteralPath $Target.Path -Algorithm SHA256).Hash.ToLowerInvariant()
+    if ($afterHash -ne $backup.Identity.SHA256) { throw 'post-restore SHA-256 verification failed' }
     Write-Success 'Original binary successfully restored from backup!'
     return 0
+}
+
+function Invoke-Check {
+    param($Target)
+    $buf = [IO.File]::ReadAllBytes($Target.Path)
+    if ($buf.Length -eq 0) { Write-Err 'Error: the target file is empty.'; return 1 }
+    $img = Open-Image $buf
+    $identity = Get-PeIdentity -Buf $buf -Img $img
+    Write-Ok ("PE identity: {0}, machine=0x{1:X4}, timestamp=0x{2:X8}, size={3}, SHA-256={4}" -f `
+        $identity.Format, $identity.Machine, $identity.TimeStamp, $identity.Length, $identity.SHA256)
+
+    $milestones = @(Import-Milestones | Where-Object { $_.Container -eq $img.Format })
+    $probe = Invoke-PatchMilestones -Buf $buf -Img $img -Milestones $milestones -AllowPartial $true -Apply $false
+    if ($probe.Status -eq 0) {
+        Write-Warn $(if ($probe.Reason) { $probe.Reason } else { 'No known complete MV2 layout matched.' })
+    } else {
+        $state = if ($probe.Stock -gt 0 -and $probe.Already -gt 0) { 'mixed' } elseif ($probe.Stock -gt 0) { 'stock' } else { 'patched' }
+        Write-Ok "Layout: Chrome $($probe.Milestone), $($probe.Located)/$($probe.Total) sites, state=$state."
+    }
+
+    $backupPath = Get-BackupPath $Target.Path
+    if (Test-Path -LiteralPath $backupPath -PathType Leaf) {
+        try {
+            $backup = Read-ValidatedBackup $backupPath
+            $same = Test-SameBuildIdentity -A $identity -B $backup.Identity
+            Write-Ok "Backup: verified, same build=$same, metadata=$(-not $backup.Legacy)."
+        } catch { Write-Warn "Backup: invalid ($_)." }
+    } else { Write-Info 'Backup: absent.' }
+
+    return $(if ($probe.Full) { 0 } else { 1 })
 }
 
 # ============================================================================
@@ -1393,13 +1764,32 @@ function Invoke-Main {
 
     Write-Banner
 
-    if (-not (Test-Elevated) -and -not $env:MV2_TEST_NO_ELEVATION) {
+    $effectivePath = $Path
+    if (-not $effectivePath -and $env:MV2_TARGET_B64) {
+        try { $effectivePath = [Text.Encoding]::Unicode.GetString([Convert]::FromBase64String($env:MV2_TARGET_B64)) }
+        catch { Write-Err 'Invalid elevated target marker.'; return 1 }
+    }
+
+    # Resolve before elevation. Read-only checks never need admin, and an
+    # offline/user-owned copy should not cause a UAC prompt merely because the
+    # normal Program Files installation does.
+    $target = Resolve-Target -TargetPath $effectivePath -Interactive (-not $Quiet)
+    if (-not $target) { return 1 }
+
+    Write-Host "$script:TagOK Target channel: $($C.Cyn)$($target.Channel)$($C.Reset)"
+    Write-Host "$script:TagOK Target file: $($target.Path)"
+    if ($target.Version) { Write-Host "$script:TagOK Chrome version detected: $($target.Version)" }
+
+    if ($Command -eq 'check') { return (Invoke-Check -Target $target) }
+
+    $needsElevation = -not (Test-TargetDirectoryWritable -TargetPath $target.Path)
+    if ($needsElevation -and -not (Test-Elevated) -and -not $env:MV2_TEST_NO_ELEVATION) {
         # Loop guard: -Relaunched (file mode) or the MV2_RELAUNCHED env marker
         # (replay/irm|iex mode) means we ALREADY tried to elevate. If we are
         # still not admin, report and stop instead of spawning again.
         $alreadyTried = $Relaunched -or $env:MV2_RELAUNCHED
         if (-not $alreadyTried) {
-            $childCode = Invoke-SelfElevate
+            $childCode = Invoke-SelfElevate -ResolvedTargetPath ([IO.Path]::GetFullPath($target.Path))
             if ($null -ne $childCode) {
                 # The elevated child owns the console output and its own exit
                 # pause; pausing again here would ask twice.
@@ -1412,13 +1802,6 @@ function Invoke-Main {
         return 1
     }
 
-    $target = Resolve-Target -TargetPath $Path -Interactive (-not $Quiet)
-    if (-not $target) { return 1 }
-
-    Write-Host "$script:TagOK Target channel: $($C.Cyn)$($target.Channel)$($C.Reset)"
-    Write-Host "$script:TagOK Target file: $($target.Path)"
-    if ($target.Version) { Write-Host "$script:TagOK Chrome version detected: $($target.Version)" }
-
     if ($Command -eq 'restore') { return (Invoke-Restore -Target $target -AssumeYes $Yes.IsPresent) }
     return (Invoke-Patch -Target $target -AssumeYes $Yes.IsPresent)
 }
@@ -1426,6 +1809,8 @@ function Invoke-Main {
 # Set when an elevated child ran: it printed its own output and did its own exit
 # pause, so pausing here as well would ask twice.
 $script:SuppressPause = $false
+
+if ($env:MV2_TEST_LIBRARY_ONLY) { return }
 
 # Double-clicking a .ps1 or running it from a shortcut closes the window on exit,
 # so hold it open unless -Quiet asked for a scripting-friendly run.
