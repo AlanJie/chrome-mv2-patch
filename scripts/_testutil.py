@@ -1,0 +1,160 @@
+"""Shared helpers for the flat Python test suite (scripts/test_*.py).
+
+The runtime patchers are shell/PowerShell; these tests drive them as black boxes
+(subprocess) after building synthetic PE/ELF/Mach-O fixtures in pure Python.
+"""
+import hashlib
+import os
+import re
+import shutil
+import struct
+import subprocess
+import sys
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parent.parent
+
+# Resolve bash explicitly: on Windows a bare "bash" in subprocess often hits the
+# System32 WSL launcher (which needs /mnt/c paths), while shutil.which finds
+# git-bash (which uses /c). Using the resolved path keeps posix() correct.
+BASH = shutil.which("bash") or "bash"
+
+_DRIVE = re.compile(r"^([A-Za-z]):[\\/](.*)$")
+
+
+def posix(p):
+    """A path string the local bash accepts. Converts a Windows drive path
+    (C:\\x\\y) to the MSYS/git-bash form (/c/x/y); native POSIX paths (Linux/
+    macOS CI) have no drive prefix and pass through unchanged."""
+    p = str(p)
+    m = _DRIVE.match(p)
+    if m:
+        return "/" + m.group(1).lower() + "/" + m.group(2).replace("\\", "/")
+    return p.replace("\\", "/")
+
+
+class Asserter:
+    def __init__(self):
+        self.passed = 0
+
+    def ok(self):
+        self.passed += 1
+
+    def fail(self, msg):
+        print(f"ASSERTION FAILED: {msg}", file=sys.stderr)
+        sys.exit(1)
+
+    def eq(self, got, want, msg):
+        if got != want:
+            self.fail(f"{msg} (got {got!r}, expected {want!r})")
+        self.ok()
+
+    def true(self, cond, msg):
+        if not cond:
+            self.fail(msg)
+        self.ok()
+
+    def is_file(self, path, msg):
+        self.true(Path(path).is_file(), msg)
+
+
+def run(cmd, env=None, cwd=None):
+    """Run a command; return CompletedProcess with captured text output."""
+    e = dict(os.environ)
+    if env:
+        e.update(env)
+    return subprocess.run(cmd, env=e, cwd=cwd, capture_output=True, text=True)
+
+
+def run_ok(cmd, env=None, cwd=None):
+    return run(cmd, env, cwd).returncode == 0
+
+
+def bash(script, sub, target, sigs, *extra, env=None):
+    """Invoke a shell patcher: bash <script> <sub> <target> --signatures <sigs>
+    --quiet [extra...]. Paths are converted for the local bash."""
+    cmd = [BASH, posix(script), sub, posix(target), "--signatures", posix(sigs), "--quiet", *extra]
+    return run(cmd, env)
+
+
+def copy(src, dst):
+    """Portable file copy (avoids depending on a `cp` on PATH)."""
+    shutil.copyfile(src, dst)
+
+
+def byte_at(path, off):
+    with open(path, "rb") as f:
+        f.seek(off)
+        return f.read(1)[0]
+
+
+def poke(path, off, value):
+    with open(path, "r+b") as f:
+        f.seek(off)
+        f.write(bytes([value]))
+
+
+def sha256(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+# ---------------------------------------------------------------------------
+# Synthetic fixtures (byte-identical to the old shell harnesses' builders).
+# ---------------------------------------------------------------------------
+def make_elf(path, sig_hex, build_byte=0x11):
+    """Minimal ELF64 with a .text carrying `sig_hex` at file offset 0x140 and a
+    GNU build-id note. Mirrors the former test-bash.sh make_elf."""
+    buf = bytearray(0x700)
+    ident = bytes(b"\x7fELF" + bytes([2, 1, 1, 0]) + bytes(8))
+    buf[:64] = struct.pack("<16sHHIQQQIHHHHHH", ident, 2, 62, 1, 0, 0, 0x500, 0, 64, 0, 0, 64, 4, 3)
+    sig = bytes.fromhex(sig_hex)
+    buf[0x140:0x140 + len(sig)] = sig
+    note = struct.pack("<III", 4, 20, 3) + b"GNU\0" + bytes([build_byte]) * 20
+    buf[0x300:0x300 + len(note)] = note
+    names = b"\0.text\0.note.gnu.build-id\0.shstrtab\0"
+    buf[0x400:0x400 + len(names)] = names
+    sections = [
+        (0, 0, 0, 0, 0, 0, 0, 0, 0, 0),
+        (1, 1, 6, 0x400000, 0x100, 0x100, 0, 0, 16, 0),
+        (7, 7, 2, 0, 0x300, len(note), 0, 0, 4, 0),
+        (26, 3, 0, 0, 0x400, len(names), 0, 0, 1, 0),
+    ]
+    for i, sh in enumerate(sections):
+        buf[0x500 + i * 64:0x500 + (i + 1) * 64] = struct.pack("<IIQQQQIIQQ", *sh)
+    Path(path).write_bytes(buf)
+
+
+def _macho_thin(cpu, text, uuid_byte):
+    MH64, SEG, UUID, TEXT_OFF, VM = 0xFEEDFACF, 0x19, 0x1B, 0x200, 0x100000000
+    seg_sz = 72 + 80
+    hdr = struct.pack("<IiiIIIII", MH64, cpu, 0, 6, 2, seg_sz + 24, 0, 0)
+    sect = struct.pack("<16s16sQQIIIIIII4x", b"__text", b"__TEXT", VM, len(text), TEXT_OFF, 4, 0, 0, 0, 0, 0)
+    seg = struct.pack("<II16sQQQQiiII", SEG, seg_sz, b"__TEXT", VM, 0x1000, 0, TEXT_OFF + len(text), 7, 5, 1, 0)
+    uuid = struct.pack("<II", UUID, 24) + bytes([uuid_byte]) * 16
+    body = hdr + seg + sect + uuid
+    body += b"\x00" * (TEXT_OFF - len(body)) + text
+    return body
+
+
+def make_fat_macho(path):
+    """Universal fixture: x86_64 short-jg gate + arm64 b.cond gate, each at
+    __text offset 0x40. Returns (x64_jg_offset, arm64_jg_offset) file offsets."""
+    X64, ARM = 0x01000007, 0x0100000C
+    x64_text = b"\x00" * 0x40 + bytes.fromhex("837E50027F2F554889E5488B8E280200008B413080BE080200") + b"\x00" * 0x40
+    arm_text = b"\x00" * 0x40 + struct.pack("<IIII", 0x7100091F, 0x5400008C, 0xD503201F, 0x7100051F) + b"\x00" * 0x40
+    sx, sa = _macho_thin(X64, x64_text, 0xA1), _macho_thin(ARM, arm_text, 0xB2)
+    hdr = struct.pack(">II", 0xCAFEBABE, 2)
+    off = len(hdr) + 40
+    aligned = (off + 0xFFF) & ~0xFFF
+    entries, blobs, cur, offs = b"", b"", aligned, []
+    for cpu, d in ((X64, sx), (ARM, sa)):
+        entries += struct.pack(">IIIII", cpu, 0, cur, len(d), 12)
+        blobs += b"\x00" * (cur - (aligned + len(blobs))) + d
+        offs.append(cur)
+        cur = (cur + len(d) + 0xFFF) & ~0xFFF
+    Path(path).write_bytes(hdr + entries + b"\x00" * (aligned - off) + blobs)
+    return offs[0] + 0x200 + 0x40 + 4, offs[1] + 0x200 + 0x40 + 4
+

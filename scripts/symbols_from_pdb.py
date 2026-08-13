@@ -10,7 +10,7 @@ so it works for any Chrome version. On Linux the equivalent is `nm chrome.debug 
 grep -Ei 'IsExtensionAffected|ShouldBlockExtension|MaybeReEnable|UserMayInstall|MustRemainDisabled'`.
 
 Usage (Windows, with chrome.dll.pdb next to the DLL or in --symdir):
-    python scripts/resolve_symbols.py path\\to\\chrome.dll [--symdir DIR] [--json out.json]
+    python scripts/symbols_from_pdb.py path\\to\\chrome.dll [--symdir DIR] [--json out.json]
 
 The 5+ GB PDB parses once (~2 min on first SymLoadModuleExW). Requires dbghelp
 (ships with Windows). Fetch the matching PDB with `chrome-mv2 fetch-symbols`.
@@ -82,7 +82,7 @@ class SYMBOL_INFOW(C.Structure):
 
 def resolve(dll, symdir):
     if sys.platform != "win32":
-        raise SystemExit("resolve_symbols.py is Windows-only (dbghelp). "
+        raise SystemExit("symbols_from_pdb.py is Windows-only (dbghelp). "
                          "On Linux use `nm chrome.debug` — see the script header.")
 
     image_base, text_rva, text_size = pe_text_and_base(dll)

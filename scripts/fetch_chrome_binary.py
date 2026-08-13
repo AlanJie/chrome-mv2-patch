@@ -1,14 +1,19 @@
 """Fetch the stock, gate-bearing Chrome binary for MV2 signature derivation.
 
-The rest of the toolkit (`fetch_symbols.py` -> `resolve_symbols.py` / `nm` ->
+The rest of the toolkit (`fetch_symbols.py` -> `symbols_from_pdb.py` / `nm` ->
 `derive_milestone.py`) all start from ONE artifact: the browser binary that
 carries the inlined `IsExtensionAffected` gates --
 
     Windows x64    chrome.dll   (PE32+, container "pe")
     Windows x86    chrome.dll   (PE32,  container "pe32")
     Linux  x86-64  chrome       (ELF,   container "elf")
+    macOS  x86-64  Google Chrome Framework  (Mach-O, container "macho-x64")
+    macOS  arm64   Google Chrome Framework  (Mach-O, container "macho-arm64")
 
-macOS is not a patcher target, so it is intentionally absent.
+macOS has no consumer offline installer we can unwrap off-Mac (it ships a `.dmg`),
+so the mac platforms always fetch the per-arch Chrome for Testing zip -- a plain
+zip 7-Zip opens trivially. CfT is UNBRANDED, so a mac table derived from it must
+be re-verified against a real `Google Chrome.app` install (the macOS CI does this).
 
 Google publishes offline installers only for each channel's CURRENT build, so
 that is what this fetches by default -- the same consumer binary the patcher
@@ -23,6 +28,8 @@ The binary is unwrapped out of the installer and dropped in `_scratch/`
     python scripts/fetch_chrome_binary.py                      # current stable, host arch
     python scripts/fetch_chrome_binary.py --platform linux
     python scripts/fetch_chrome_binary.py --platform win       # 32-bit chrome.dll
+    python scripts/fetch_chrome_binary.py --platform mac-arm64 # Apple Silicon framework
+    python scripts/fetch_chrome_binary.py --platform mac-x64   # Intel framework
     python scripts/fetch_chrome_binary.py --channel beta
     python scripts/fetch_chrome_binary.py --version 152.0.7977.30
     python scripts/fetch_chrome_binary.py --list               # just print current versions
@@ -57,9 +64,13 @@ CHANNELS = ("stable", "beta")
 #   so a 32-bit fetch never grabs a stray 64-bit dll and vice-versa. The Linux
 #   ELF is matched by class byte (2 == 64-bit) instead.
 PLATFORMS = {
-    "win64": {"api": "win64", "container": "pe",   "binary": "chrome.dll", "pe_magic": 0x20B, "tag": "win64",   "suffix": ".dll", "cft": "win64"},
-    "win":   {"api": "win",   "container": "pe32", "binary": "chrome.dll", "pe_magic": 0x10B, "tag": "win32",   "suffix": ".dll", "cft": "win32"},
-    "linux": {"api": "linux", "container": "elf",  "binary": "chrome",     "pe_magic": None,  "tag": "linux64", "suffix": "",     "cft": "linux64"},
+    "win64":     {"api": "win64", "container": "pe",   "binary": "chrome.dll", "pe_magic": 0x20B, "tag": "win64",   "suffix": ".dll", "cft": "win64"},
+    "win":       {"api": "win",   "container": "pe32", "binary": "chrome.dll", "pe_magic": 0x10B, "tag": "win32",   "suffix": ".dll", "cft": "win32"},
+    "linux":     {"api": "linux", "container": "elf",  "binary": "chrome",     "pe_magic": None,  "tag": "linux64", "suffix": "",     "cft": "linux64"},
+    # macOS: CfT-only. The gate binary is the framework Mach-O inside the .app;
+    # matched brand-agnostically by a "framework" name + the slice's cputype.
+    "mac-x64":   {"api": "mac",       "container": "macho-x64",   "binary": None, "pe_magic": None, "tag": "mac-x64",   "suffix": "", "cft": "mac-x64",   "cputype": 0x01000007, "cft_only": True},
+    "mac-arm64": {"api": "mac_arm64", "container": "macho-arm64", "binary": None, "pe_magic": None, "tag": "mac-arm64", "suffix": "", "cft": "mac-arm64", "cputype": 0x0100000C, "cft_only": True},
 }
 
 # The channel's CURRENT-build offline installers. These URLs always serve the
@@ -85,9 +96,13 @@ VERSION_API = (
 )
 
 # The only official archive of version-pinned builds. It carries Chrome for
-# Testing (unbranded), NOT consumer stable, so it is a --version fallback only.
+# Testing (unbranded), NOT consumer stable, so it is a --version fallback only
+# (and the sole source for the mac platforms, which have no unwrappable installer).
 CFT_ENDPOINT = (
     "https://googlechromelabs.github.io/chrome-for-testing/known-good-versions-with-downloads.json"
+)
+CFT_LAST_KNOWN = (
+    "https://googlechromelabs.github.io/chrome-for-testing/last-known-good-versions-with-downloads.json"
 )
 
 
@@ -158,6 +173,22 @@ def resolve_cft(version, cft_platform):
         return None
     nearest = max(usable, key=version_key)
     return nearest, archive[nearest][cft_platform], f"nearest (<= {version})"
+
+
+def cft_current(cft_platform, channel):
+    """Current Chrome for Testing version for a channel that publishes this
+    platform, or "". Used for the mac platforms' default (latest) fetch."""
+    try:
+        with http_get(CFT_LAST_KNOWN, timeout=30) as response:
+            data = json.loads(response.read().decode("utf-8"))
+    except (urllib.error.URLError, urllib.error.HTTPError, ValueError) as err:
+        print(f"  warning: CfT current-version lookup failed: {err}")
+        return ""
+    chan = data.get("channels", {}).get(channel.capitalize())
+    if not chan:
+        return ""
+    platforms = {d.get("platform") for d in chan.get("downloads", {}).get("chrome", [])}
+    return chan.get("version", "") if cft_platform in platforms else ""
 
 
 def human_size(num_bytes):
@@ -337,20 +368,40 @@ def _is_elf64(path):
     return head[:4] == b"\x7fELF" and len(head) == 5 and head[4] == 2
 
 
-def locate_binary(root, spec):
-    """Find the gate binary in an unpacked tree, matching name AND architecture.
+def _macho_cputype(path):
+    """cputype of a THIN little-endian 64-bit Mach-O (CfT ships per-arch, thin),
+    or None. Used to pick the right slice's framework in a mac .app."""
+    try:
+        with open(path, "rb") as handle:
+            head = handle.read(8)
+    except OSError:
+        return None
+    if len(head) < 8 or struct.unpack_from("<I", head, 0)[0] != 0xFEEDFACF:
+        return None
+    return struct.unpack_from("<I", head, 4)[0]
 
-    A shell-script launcher named `google-chrome` sits beside the Linux ELF, and
-    an installer can carry stub DLLs; the magic/arch check skips both. Picks the
-    largest match, which is always the real ~200 MB browser binary.
+
+def locate_binary(root, spec):
+    """Find the gate binary in an unpacked tree, matching name/kind AND arch.
+
+    A shell-script launcher named `google-chrome` sits beside the Linux ELF, an
+    installer can carry stub DLLs, and a mac .app carries several frameworks and
+    helper Mach-Os; the magic/arch check skips the wrong ones. Picks the largest
+    match, which is always the real ~200 MB browser binary / framework.
     """
     matches = []
     for current_dir, _dirs, files in os.walk(root):
         for filename in files:
+            path = os.path.join(current_dir, filename)
+            container = spec["container"]
+            if container.startswith("macho"):
+                # brand-agnostic: any "*Framework" Mach-O of this slice's cputype
+                if "framework" in filename.lower() and _macho_cputype(path) == spec["cputype"]:
+                    matches.append(path)
+                continue
             if filename.lower() != spec["binary"]:
                 continue
-            path = os.path.join(current_dir, filename)
-            if spec["container"] == "elf":
+            if container == "elf":
                 if _is_elf64(path):
                     matches.append(path)
             elif _pe_optional_magic(path) == spec["pe_magic"]:
@@ -374,13 +425,26 @@ def fetch(platform, channel, version, out_dir, keep):
         print("error: 7-Zip not found (install it, or put 7z on PATH).", file=sys.stderr)
         return 1
 
-    latest = current_version(spec["api"], channel)
+    latest = "" if spec.get("cft_only") else current_version(spec["api"], channel)
     if latest:
         print(f"Current {channel} for {platform}: {latest}")
 
     # Decide the source: the channel's live installer for the current build, or
-    # the Chrome for Testing archive for anything older.
-    if version and version != latest:
+    # the Chrome for Testing archive for anything older -- and always CfT for mac.
+    if spec.get("cft_only"):
+        want = version or cft_current(spec["cft"], channel)
+        if not want:
+            print(f"error: could not determine a CfT {channel} version for {platform}.", file=sys.stderr)
+            return 1
+        resolved = resolve_cft(want, spec["cft"])
+        if not resolved:
+            print(f"error: no Chrome for Testing build at or below {want} for {platform}.", file=sys.stderr)
+            return 1
+        fetch_version, url, note = resolved
+        source = f"Chrome for Testing ({note})"
+        print(f"macOS via CfT: {want} -> {fetch_version}")
+        print("  note: CfT is UNBRANDED; re-verify the derived table against a real Google Chrome.app.")
+    elif version and version != latest:
         resolved = resolve_cft(version, spec["cft"])
         if not resolved:
             print(f"error: no Chrome for Testing build at or below {version} for {platform}.", file=sys.stderr)
@@ -425,12 +489,17 @@ def fetch(platform, channel, version, out_dir, keep):
     print(f"\nSaved {spec['container']} binary ({human_size(size)}):")
     print(f"  {os.path.relpath(dest)}")
     print("\nNext:")
-    print(f"  python scripts/fetch_symbols.py {os.path.relpath(dest)}")
-    if spec["container"] == "elf":
-        print("  python scripts/dump_symtab.py _scratch/chrome.debug _scratch/syms.txt")
+    if spec["container"].startswith("macho"):
+        print(f"  python scripts/derive_milestone.py {os.path.relpath(dest)} --name <ver> --json")
+        print("  # mac symbols are not published for CfT: the x64 slice cross-checks against")
+        print("  # the Linux x64 table; arm64 is located structurally (eyeball the gate).")
     else:
-        print(f"  python scripts/resolve_symbols.py {os.path.relpath(dest)} --symdir _scratch --json _scratch/syms.json")
-    print(f"  python scripts/derive_milestone.py {os.path.relpath(dest)} --symbols _scratch/syms.* --name <ver> --json")
+        print(f"  python scripts/fetch_symbols.py {os.path.relpath(dest)}")
+        if spec["container"] == "elf":
+            print("  python scripts/symbols_from_elf.py _scratch/chrome.debug _scratch/syms.txt")
+        else:
+            print(f"  python scripts/symbols_from_pdb.py {os.path.relpath(dest)} --symdir _scratch --json _scratch/syms.json")
+        print(f"  python scripts/derive_milestone.py {os.path.relpath(dest)} --symbols _scratch/syms.* --name <ver> --json")
     return 0
 
 

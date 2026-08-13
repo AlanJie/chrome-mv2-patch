@@ -2,18 +2,22 @@
 
 ## Repository overview
 
-This repository ships two self-contained patch scripts:
+This repository ships three self-contained patch scripts:
 
 - `chrome-mv2.ps1` is the Windows implementation. It patches PE32+ (x64) and
   PE32 (x86) `chrome.dll` files.
 - `chrome-mv2.sh` is the Linux implementation. It patches the x86-64 ELF
   `chrome` executable.
+- `chrome-mv2-mac.sh` is the macOS implementation. It patches the universal
+  `Google Chrome Framework` Mach-O — the x86_64 slice (`macho-x64`, reusing the
+  `jg` flip) and, opt-in and experimental, the arm64 slice (`macho-arm64`, a
+  `B.cond` GT→AL flip) — then ad-hoc re-signs the app so it launches.
 
 There is no compiled patcher or build step. Do not add instructions for the
 removed Go application, `cmd/chrome-mv2`, `internal/app`, `build.bat`, or
-platform executables. The PowerShell and Bash scripts own all runtime behavior:
-target discovery, signature loading, layout matching, patching, backup and
-restore safety, elevation, diagnostics, and user output.
+platform executables. The PowerShell, Linux Bash, and macOS Bash scripts own all
+runtime behavior: target discovery, signature loading, layout matching,
+patching, backup and restore safety, elevation/signing, diagnostics, and output.
 
 The patch re-enables Manifest V2 (MV2) extensions by flipping the existing
 `IsExtensionAffected` conditional branches in Chrome's browser binary. It uses
@@ -31,6 +35,9 @@ Only flip the direction of an existing branch to its existing target:
 
 - short `jg`: `7F disp8` -> `EB disp8`
 - near `jg`: `0F 8F disp32` -> `90 E9 disp32`
+- arm64 `b.cond` (macOS `bcond`): rewrite ONLY the condition nibble GT(0xC) ->
+  AL(0xE) in the little-endian branch word; the opcode (0x54), bit4, and the
+  entire `imm19` displacement are preserved.
 
 Never delete or blank a `call`, edit the compared manifest-version value, or
 invent control flow. Structurally valid but semantically wrong edits have
@@ -43,6 +50,9 @@ Keep platform behavior in its owning script:
 
 - Windows/PE logic: `chrome-mv2.ps1`
 - Linux/ELF logic: `chrome-mv2.sh`
+- macOS/Mach-O logic: `chrome-mv2-mac.sh` (fat parsing, per-slice patching,
+  `LC_UUID` identity, inside-out ad-hoc `codesign` re-seal). Must stay bash-3.2
+  compatible (stock macOS) and needs no `python3` on the default path.
 - Cross-platform signature derivation only: `scripts/*.py`
 
 The two runtime scripts intentionally implement the same safety contract:
@@ -71,6 +81,10 @@ platform-specific embedded copies:
 - `$EmbeddedSignatures` in `chrome-mv2.ps1` contains the Windows `pe` and `pe32`
   milestones.
 - `EMBEDDED_SIGNATURES` in `chrome-mv2.sh` contains the Linux `elf` milestones.
+- `EMBEDDED_SIGNATURES` in `chrome-mv2-mac.sh` contains the macOS `macho-x64`
+  and `macho-arm64` milestones, **pre-tokenized** (pipe-delimited records) so the
+  default path needs no `python3`/JSON parser. Each runtime script skips
+  milestones whose container it does not own.
 
 Runtime precedence is an explicitly supplied signature file, then a
 `signatures.json` beside the script, then the embedded table. A file in the
@@ -87,20 +101,26 @@ The tools under `scripts/` fetch stock Chrome artifacts and symbols, derive new
 milestones, and verify signature tables. They do not patch installed Chrome.
 See [`scripts/README.md`](../scripts/README.md) for the complete workflow.
 
-- `fetch_chrome_binary.py`: fetch and unwrap a stock `chrome.dll` or Linux
-  `chrome` into `_scratch/`. Requires Python and 7-Zip.
-- `fetch_symbols.py`: fetch the matching PDB or `chrome.debug` into `_scratch/`.
-- `resolve_symbols.py`: resolve Windows PDB symbols through `dbghelp`.
-- `dump_symtab.py`: stream Linux `.symtab` data without the cost of `nm -SC`.
-- `derive_milestone.py`: find short and near gate sites, emit a milestone, and
-  verify a table against a stock binary.
+- `fetch_chrome_binary.py`: fetch and unwrap a stock `chrome.dll`, Linux
+  `chrome`, or the macOS universal framework (`mac-x64`/`mac-arm64`) into
+  `_scratch/`. Requires Python and 7-Zip.
+- `fetch_symbols.py`: fetch the matching PDB (Windows), `chrome.debug` (Linux),
+  or stream the official dSYM's symtab (macOS) into `_scratch/`.
+- `symbols_from_pdb.py`: resolve Windows PDB symbols through `dbghelp`.
+- `symbols_from_elf.py`: stream Linux `.symtab` data without the cost of `nm -SC`.
+- `derive_milestone.py`: find short/near (`jg`) and arm64 `bcond` gate sites,
+  emit a milestone (one per Mach-O slice), and verify a table against a stock
+  binary.
 
 Porting checklist:
 
-1. Fetch a stock binary and its matching symbols.
+1. Fetch a stock binary and its matching symbols (macOS: `fetch_symbols.py`
+   streams the official dSYM's symtab, UUID-matched to consumer Chrome).
 2. Resolve or dump symbols to name/filter candidate gates.
 3. Run `derive_milestone.py --symbols ... --name ... --json`.
-4. Add the entry to `signatures.json` and the correct embedded script table.
+4. Add the entry to `signatures.json` and the correct embedded script table
+   (`chrome-mv2.ps1` pe/pe32, `chrome-mv2.sh` elf, `chrome-mv2-mac.sh`
+   macho-x64/macho-arm64).
 5. Run `derive_milestone.py <binary> --verify signatures.json` and require
    `ALL SITES VERIFIED: True`.
 6. Run the script regression suite.
@@ -115,14 +135,26 @@ from source before changing bytes.
 
 Run the full local suite from the repository root:
 
-```powershell
-pwsh -NoProfile -File scripts/tests/run-tests.ps1
+```bash
+python scripts/run_tests.py
 ```
 
-The suite exercises synthetic PE and ELF fixtures, parses both runtime scripts,
-and covers patch, restore, check, malformed signatures, partial layouts,
-ambiguity, backup validation, and race protection. It requires PowerShell and a
-`bash` environment capable of running the Linux tests.
+The suite (`scripts/run_tests.py`, pure Python) exercises synthetic PE, ELF, and
+Mach-O (fat) fixtures, parses all three runtime scripts, and covers patch,
+restore, check, malformed signatures, partial layouts, ambiguity, the arm64
+opt-in gate, backup validation, and race protection. It drives the shell
+patchers via `bash` and the PowerShell patcher via `pwsh` (the PE test is
+skipped off-Windows). The real-macOS
+runtime proof (patch → ad-hoc re-sign → headless launch → functional MV2 A/B →
+restore, on both Intel and Apple Silicon) runs in GitHub Actions
+(`.github/workflows/tests.yml`), since it needs `codesign` and real hardware. The
+MV2 A/B (`.github/mv2_probe.py`, a CI helper — not part of the derivation
+toolkit) loads a Manifest V2 extension whose persistent background page pings a
+local listener the instant it is enabled, and asserts the patched build enables
+what the stock build disables. At Chrome 151/152 the MV2 disable is a compiled-in
+feature default, so `--enable-features` cannot toggle it and the stock-vs-patched
+differential is the only lever; a build that does not enforce the deprecation is
+reported as inconclusive, never a false pass.
 
 For focused syntax checks:
 
@@ -135,12 +167,13 @@ $errors
 
 ```bash
 bash -n chrome-mv2.sh
+bash -n chrome-mv2-mac.sh
 ```
 
 For a real stock artifact, also run:
 
 ```text
-python scripts/derive_milestone.py <stock chrome.dll|chrome> --verify signatures.json
+python scripts/derive_milestone.py <stock chrome.dll|chrome|Google Chrome Framework> --verify signatures.json
 ```
 
 Use the read-only runtime diagnostics when appropriate:
@@ -151,6 +184,7 @@ Use the read-only runtime diagnostics when appropriate:
 
 ```bash
 ./chrome-mv2.sh check /path/to/chrome --quiet
+./chrome-mv2-mac.sh check "/Applications/Google Chrome.app" --quiet
 ```
 
 Never weaken a decline, backup, identity, bounds, or post-write check merely to

@@ -1,10 +1,15 @@
 """Cross-platform MV2 gate derivation and verification for the patch scripts.
 
-One tool, both containers (PE `chrome.dll` on Windows — 64-bit PE32+ tagged
-`pe` and 32-bit PE32 tagged `pe32` — and ELF `chrome` on Linux) and both `jg`
-encodings (short `0x7F`, near `0x0F 0x8F`). It is a single symbol-free finder
-that works for any future Chrome version on x86 or x86-64, replacing an earlier
-version- and Windows-specific derivation.
+One tool, all containers and both x86 `jg` encodings:
+  - PE `chrome.dll` on Windows: 64-bit PE32+ (`pe`) and 32-bit PE32 (`pe32`)
+  - ELF `chrome` on Linux (`elf`)
+  - the universal "Google Chrome Framework" Mach-O on macOS: the x86_64 slice
+    (`macho-x64`, reusing the x86 short/near `jg` flip) and the arm64 slice
+    (`macho-arm64`, a new `bcond` kind: `cmp w,#2 ; b.gt` with the condition
+    rewritten GT->AL). A fat binary yields one milestone per CPU slice.
+
+It is a single symbol-free finder that works for any future Chrome version,
+replacing an earlier version- and Windows-specific derivation.
 
   derive   (default)  scan a stock binary for IsExtensionAffected gate sites and
                       print a signatures.json entry (container + sites[]).
@@ -15,7 +20,7 @@ version- and Windows-specific derivation.
 
 No third-party dependencies (capstone/pyelftools/pefile not required), so it runs
 on the bare reference boxes. Symbols are optional and only used for *naming*
-candidates — see resolve_symbols.py (Windows PDB) or `nm chrome.debug` (Linux).
+candidates — see symbols_from_pdb.py (Windows PDB) or `nm chrome.debug` (Linux).
 
 The finder mirrors the report-only scanners and masked matchers in
 chrome-mv2.ps1 and chrome-mv2.sh, extended to the near-jg encoding. Only the jg
@@ -46,12 +51,13 @@ DEFAULT_JSON = REPO / "signatures.json"
 # ---------------------------------------------------------------------------
 class Image:
     def __init__(self, container, text_virt, text_raw, text_size, data):
-        self.container = container      # "pe" | "pe32" | "elf"
+        self.container = container      # "pe" | "pe32" | "elf" | "macho-x64" | "macho-arm64"
         self.text_virt = text_virt
         self.text_raw = text_raw
         self.text_size = text_size
         self.data = data
         self._text = None
+        self.uuid = None                # Mach-O LC_UUID (hex), else None
 
     @property
     def text(self):
@@ -115,13 +121,123 @@ def parse_elf(data):
     raise ValueError("no .text section")
 
 
-def open_image(path):
+# ---------------------------------------------------------------------------
+# Mach-O (macOS). The gate-bearing binary is the universal "Google Chrome
+# Framework", a fat archive carrying an x86_64 slice and an arm64 slice, each a
+# thin Mach-O. Unlike ELF there is NO vmaddr->fileoffset delta to apply for byte
+# location: section_64.offset is already the slice-relative file offset, so the
+# absolute file offset is slice_base + section.offset. text_virt keeps the
+# vmaddr only for jgRVA bookkeeping. The x86_64 slice reuses the x86 cmp/jg
+# finder; the arm64 slice uses find_gates_arm64 (cmp #2 ; b.gt -> AL flip).
+# ---------------------------------------------------------------------------
+MH_MAGIC_64 = 0xFEEDFACF          # thin 64-bit Mach-O, little-endian on disk (CF FA ED FE)
+FAT_MAGIC = 0xCAFEBABE            # fat header, big-endian, 32-bit fat_arch entries
+FAT_MAGIC_64 = 0xCAFEBABF         # fat header, big-endian, 64-bit fat_arch entries
+CPU_TYPE_X86_64 = 0x01000007
+CPU_TYPE_ARM64 = 0x0100000C
+LC_SEGMENT_64 = 0x19
+LC_UUID = 0x1B
+
+
+def _parse_macho_thin(data, base, cputype_hint=None):
+    """Parse one thin Mach-O slice starting at file offset `base`. Returns an
+    Image (container macho-x64 / macho-arm64) with the UUID stashed on it, or
+    raises ValueError. Only 64-bit little-endian slices are supported (both
+    Chrome slices are); anything else declines."""
+    if base + 32 > len(data):
+        raise ValueError("Mach-O slice header out of bounds")
+    magic = struct.unpack_from("<I", data, base)[0]
+    if magic != MH_MAGIC_64:
+        raise ValueError("not a 64-bit little-endian Mach-O (magic 0x%08X)" % magic)
+    cputype = struct.unpack_from("<I", data, base + 4)[0]
+    ncmds = struct.unpack_from("<I", data, base + 16)[0]
+    if cputype == CPU_TYPE_X86_64:
+        container = "macho-x64"
+    elif cputype == CPU_TYPE_ARM64:
+        container = "macho-arm64"
+    else:
+        raise ValueError("unsupported Mach-O cputype 0x%08X" % cputype)
+
+    text_addr = text_off = text_size = None
+    uuid = None
+    p = base + 32
+    for _ in range(ncmds):
+        if p + 8 > len(data):
+            break
+        cmd, cmdsize = struct.unpack_from("<II", data, p)
+        if cmdsize < 8 or p + cmdsize > len(data):
+            raise ValueError("Mach-O load command out of bounds")
+        if cmd == LC_SEGMENT_64:
+            segname = data[p + 8:p + 24].split(b"\x00")[0]
+            nsects = struct.unpack_from("<I", data, p + 64)[0]
+            if segname == b"__TEXT":
+                sec = p + 72
+                for _s in range(nsects):
+                    sectname = data[sec:sec + 16].split(b"\x00")[0]
+                    if sectname == b"__text":
+                        text_addr = struct.unpack_from("<Q", data, sec + 32)[0]
+                        text_size = struct.unpack_from("<Q", data, sec + 40)[0]
+                        text_off = struct.unpack_from("<I", data, sec + 48)[0]
+                    sec += 80
+        elif cmd == LC_UUID:
+            uuid = data[p + 8:p + 24].hex()
+        p += cmdsize
+
+    if text_addr is None:
+        raise ValueError("no __TEXT,__text section")
+    raw = base + text_off
+    if raw + text_size > len(data):
+        raise ValueError("Mach-O __text out of file bounds")
+    img = Image(container, text_addr, raw, text_size, data)
+    img.uuid = uuid
+    return img
+
+
+def parse_macho(data):
+    """Return a list of Images, one per slice. A fat binary yields both slices;
+    a thin binary yields one."""
+    magic_be = struct.unpack_from(">I", data, 0)[0]
+    if magic_be in (FAT_MAGIC, FAT_MAGIC_64):
+        is64 = magic_be == FAT_MAGIC_64
+        nfat = struct.unpack_from(">I", data, 4)[0]
+        entry = 32 if is64 else 20
+        images = []
+        off = 8
+        for _ in range(nfat):
+            if off + entry > len(data):
+                break
+            if is64:
+                cputype, _sub, soff, _size = struct.unpack_from(">IIQQ", data, off)
+            else:
+                cputype, _sub, soff, _size = struct.unpack_from(">IIII", data, off)
+            off += entry
+            try:
+                images.append(_parse_macho_thin(data, soff, cputype))
+            except ValueError:
+                continue  # skip a slice we don't handle rather than fail the whole fat file
+        if not images:
+            raise ValueError("no supported Mach-O slices in the fat binary")
+        return images
+    return [_parse_macho_thin(data, 0)]
+
+
+def open_images(path):
+    """Return a list of Images. PE/ELF yield one; a universal Mach-O yields one
+    per CPU slice (x86_64, arm64)."""
     data = Path(path).read_bytes()
     if data[:2] == b"MZ":
-        return parse_pe(data)
+        return [parse_pe(data)]
     if data[:4] == b"\x7fELF":
-        return parse_elf(data)
-    raise ValueError("unrecognized binary (not PE 'MZ' or ELF '\\x7fELF')")
+        return [parse_elf(data)]
+    magic_be = struct.unpack_from(">I", data, 0)[0] if len(data) >= 4 else 0
+    if magic_be in (FAT_MAGIC, FAT_MAGIC_64) or data[:4] == b"\xcf\xfa\xed\xfe":
+        return parse_macho(data)
+    raise ValueError("unrecognized binary (not PE 'MZ', ELF '\\x7fELF', or Mach-O)")
+
+
+def open_image(path):
+    """Back-compat single-image accessor (first slice for a fat Mach-O)."""
+    return open_images(path)[0]
 
 
 # ---------------------------------------------------------------------------
@@ -136,6 +252,9 @@ def open_image(path):
 def _masked_indices(jg_off, kind):
     if kind == "short":
         return {jg_off, jg_off + 1}
+    if kind == "bcond":
+        # the whole 4-byte little-endian B.cond word is special (bit-masked in full_ok)
+        return {jg_off, jg_off + 1, jg_off + 2, jg_off + 3}
     return {jg_off, jg_off + 1, jg_off + 2, jg_off + 3, jg_off + 4, jg_off + 5}
 
 
@@ -164,6 +283,16 @@ def masked_match_count(text, sig, jg_off, kind, cap=None):
     anchor = bytes(sig[anchor_off:anchor_off + anchor_len])
 
     def full_ok(r):
+        # arm64 B.cond: validate the 4-byte little-endian branch word once. Accept
+        # only the stock GT (0xC) or the flipped AL (0xE) condition; the opcode
+        # (0x54) and bit[4]=0 are fixed (bit[4]=1 would be BC.cond), and imm19 is
+        # wildcarded so a displacement shift across a point release still matches.
+        if kind == "bcond":
+            w = int.from_bytes(bytes(text[r + jg_off:r + jg_off + 4]), "little")
+            if (w & 0xFF000010) != 0x54000000:
+                return False
+            if (w & 0xF) not in (0x0C, 0x0E):
+                return False
         for k in range(n):
             if k in masked:
                 b = text[r + k]
@@ -176,7 +305,7 @@ def masked_match_count(text, sig, jg_off, kind, cap=None):
                 elif kind == "near" and k == jg_off + 1:
                     if b != 0x8F and b != 0xE9:
                         return False
-                # displacement bytes: wildcard
+                # displacement bytes (and bcond word, already validated): wildcard
                 continue
             if text[r + k] != sig[k]:
                 return False
@@ -268,10 +397,80 @@ def find_gates(img):
     return gates
 
 
-# Default signature window past the cmp, matching the shipping entries (24-28B).
+# ---------------------------------------------------------------------------
+# The arm64 finder: cmp w,#2 ; b.gt (GT) ; ... type follow-up in the fall-through.
+# arm64 has no cmp/jg; the mv>=3 early-out compiles to a signed-greater-than
+# conditional branch, and the sanctioned flip rewrites its condition GT->AL
+# (0xC->0xE), keeping imm19 so it targets the same not-affected label. Encodings:
+#   cmp w?, #2  = SUBS WZR, Wn, #2 : (word & 0xFFFFFC1F) == 0x7100081F   (Rn wild)
+#   b.gt disp   : B.cond cond=GT   : (word & 0xFF00001F) == 0x5400000C   (imm19 wild)
+# A real gate carries, within the fall-through (mv<=2) path, the Manifest::Type
+# compare (cmp/ccmp w?, #1 or #5). Requiring that follow-up also fixes branch
+# POLARITY: if the fall-through were instead `movz w0,#0 ; ret` the branch target
+# would be the not-affected return (inverted), and flipping to AL would force the
+# WRONG outcome -- such a candidate lacks the follow-up and is declined, never
+# guessed. cmp #3/b.ge, cbz/cbnz/tbz and branchless ccmp/csel shapes simply miss
+# this anchor and decline. See mv2-reversing.md.
+ARM64_BGT_MASK = 0xFF00001F
+ARM64_BGT_VAL = 0x5400000C          # B.cond, cond=GT(0xC), bit[4]=0
+
+
+def _u32le(text, pos):
+    return int.from_bytes(bytes(text[pos:pos + 4]), "little")
+
+
+def _is_arm64_cmp_imm(word, imm):
+    """SUBS WZR, Wn, #imm (32-bit `cmp w?, #imm`), Rn wildcarded."""
+    return (word & 0xFFFFFC1F) == (0x7100001F | (imm << 10))
+
+
+def find_gates_arm64(img):
+    text = img.text
+    n = len(text)
+    gates = []
+
+    def has_followup(after):
+        end = min(after + 64, n - 4)  # ~16 words of the fall-through path
+        j = after
+        while j <= end:
+            w = _u32le(text, j)
+            if _is_arm64_cmp_imm(w, 1) or _is_arm64_cmp_imm(w, 5):
+                return True  # cmp w?, #1 / #5  (Manifest::Type enum)
+            j += 4
+        return False
+
+    # Anchor on the cmp word's fixed tail: a 32-bit `cmp w?, #2` (SUBS WZR,Wn,#2,
+    # sh=0) is 0x7100081F | (Rn<<5), so bytes[2:4] are always 00 71. bytes.find
+    # over ~200 MB is C-fast; the mask/b.gt/follow-up checks run at the few hits.
+    pos = 0
+    while True:
+        h = text.find(b"\x00\x71", pos)
+        if h < 0:
+            break
+        pos = h + 1
+        cp = h - 2                       # candidate cmp-word start
+        if cp < 0 or cp % 4 != 0 or cp + 8 > n:
+            continue
+        if not _is_arm64_cmp_imm(_u32le(text, cp), 2):
+            continue
+        if (_u32le(text, cp + 4) & ARM64_BGT_MASK) == ARM64_BGT_VAL and has_followup(cp + 8):
+            gates.append((cp, cp + 4, "bcond"))
+
+    gates.sort(key=lambda g: g[0])
+    return gates
+
+
+def find_gates_for(img):
+    """Dispatch to the arm64 or x86 finder by container."""
+    return find_gates_arm64(img) if img.container == "macho-arm64" else find_gates(img)
+
+
+# Default signature window past the cmp, matching the shipping entries (24-32B).
 # Long enough to span the follow-up type/location check, so the anchor is a
 # distinctive fixed run and the masked count is meaningful.
-SIGLEN = {"short": 25, "near": 28}
+SIGLEN = {"short": 25, "near": 28, "bcond": 32}
+# Minimum bytes that must follow jg_off inside the signature (the jump itself).
+NEED = {"short": 2, "near": 6, "bcond": 4}
 
 
 def build_site(img, cmp_pos, jg_pos, kind, name):
@@ -279,7 +478,7 @@ def build_site(img, cmp_pos, jg_pos, kind, name):
     times its fixed-window signature matches .text under the scripts' masking."""
     text = img.text
     jg_off = jg_pos - cmp_pos
-    siglen = min(max(SIGLEN[kind], jg_off + (2 if kind == "short" else 6) + 4),
+    siglen = min(max(SIGLEN[kind], jg_off + NEED[kind] + 4),
                  len(text) - cmp_pos)
     sig = text[cmp_pos:cmp_pos + siglen]
     count = len(masked_match_count(text, sig, jg_off, kind, cap=16))
@@ -298,7 +497,7 @@ def build_site(img, cmp_pos, jg_pos, kind, name):
 # idiom in .text (the real gates plus many unrelated enum dispatches). Given a
 # symbol table it keeps only candidates that fall inside one of the MV2 gate
 # functions, and names them after it. Accepts either JSON (flat
-# [{name,rva,size}] or resolve_symbols.py's {label: [[name,rva,size],...]}) or
+# [{name,rva,size}] or symbols_from_pdb.py's {label: [[name,rva,size],...]}) or
 # raw `nm -S` output, so the same flag works from a Windows PDB or a Linux
 # chrome.debug.
 # ---------------------------------------------------------------------------
@@ -371,8 +570,19 @@ def name_for(ranges, jg_rva):
 # ---------------------------------------------------------------------------
 # Modes
 # ---------------------------------------------------------------------------
-def cmd_derive(img, milestone_name, as_json, ranges):
-    gates = find_gates(img)
+def milestone_name_for(base, img):
+    """Mach-O slices get an arch-tagged milestone name (e.g. 151 -> 151-macos-arm64)
+    so the two slices of a universal binary land in distinct, non-cross-probing
+    tables; PE/ELF keep the base name."""
+    if img.container.startswith("macho-"):
+        return f"{base}-macos-{img.container.split('-', 1)[1]}"
+    return base
+
+
+def build_sites(img, ranges):
+    """Locate gates and package each as a signatures.json site dict. Returns
+    (sites, dropped) where dropped counts symbol-filtered non-gate candidates."""
+    gates = find_gates_for(img)
     sites = []
     dropped = 0
     for idx, (cmp_pos, jg_pos, kind) in enumerate(gates, 1):
@@ -381,8 +591,13 @@ def cmd_derive(img, milestone_name, as_json, ranges):
         if ranges and name is None:
             dropped += 1
             continue  # not inside a gate function - discard the false positive
-        site, count = build_site(img, cmp_pos, jg_pos, kind, name)
+        site, _count = build_site(img, cmp_pos, jg_pos, kind, name)
         sites.append(site)
+    return sites, dropped
+
+
+def cmd_derive(img, milestone_name, as_json, ranges):
+    sites, dropped = build_sites(img, ranges)
 
     if as_json:
         entry = {"name": milestone_name, "container": img.container, "sites": sites}
@@ -396,7 +611,7 @@ def cmd_derive(img, milestone_name, as_json, ranges):
               f"{dropped} non-gate candidate(s) dropped:\n")
     else:
         print(f"# {len(sites)} IsExtensionAffected gate candidate(s) "
-              f"(no --symbols: run resolve_symbols.py or nm to name/filter these):\n")
+              f"(no --symbols: run symbols_from_pdb.py or nm to name/filter these):\n")
     for s in sites:
         flag = "" if s["expectedMatches"] <= 2 else "  <-- WIDEN (count>2, sig not unique)"
         print(f"  {s['kind']:5} jg@{s['jgRVA']}  jgOff={s['jgOff']:>2}  "
@@ -444,24 +659,32 @@ def cmd_verify(img, json_path):
 
 def main():
     ap = argparse.ArgumentParser(description="Cross-platform MV2 gate derivation/verification.")
-    ap.add_argument("binary", help="stock chrome.dll (PE) or chrome (ELF)")
+    ap.add_argument("binary", help="stock chrome.dll (PE), chrome (ELF), or Google Chrome Framework (Mach-O)")
     ap.add_argument("--name", default="NEW", help="milestone name for the emitted entry (e.g. 153)")
     ap.add_argument("--json", action="store_true", help="emit a signatures.json entry")
     ap.add_argument("--symbols", metavar="FILE",
-                    help="symbol table (resolve_symbols.py JSON, or `nm -S` output) to "
+                    help="symbol table (symbols_from_pdb.py JSON, or `nm -S` output) to "
                          "name and filter candidates to real gate functions")
     ap.add_argument("--verify", metavar="signatures.json", nargs="?", const=str(DEFAULT_JSON),
                     help="verify an existing table against the binary (default: signatures.json)")
     args = ap.parse_args()
 
     try:
-        img = open_image(args.binary)
+        imgs = open_images(args.binary)
     except (OSError, ValueError) as e:
         print(f"error: {e}", file=sys.stderr)
         return 2
 
+    multi = len(imgs) > 1  # a universal Mach-O has one Image per CPU slice
+
     if args.verify is not None:
-        return cmd_verify(img, args.verify)
+        rc = 0
+        for img in imgs:
+            if multi:
+                print(f"\n=== slice: {img.container} ===")
+            if cmd_verify(img, args.verify) != 0:
+                rc = 1
+        return rc
 
     ranges = []
     if args.symbols:
@@ -473,7 +696,22 @@ def main():
         if not ranges:
             print("warning: no MV2 gate functions found in the symbol file; "
                   "showing all candidates unfiltered", file=sys.stderr)
-    return cmd_derive(img, args.name, args.json, ranges)
+
+    if args.json:
+        # Emit one document; a universal binary yields one milestone per slice.
+        milestones = []
+        for img in imgs:
+            sites, _dropped = build_sites(img, ranges)
+            milestones.append({"name": milestone_name_for(args.name, img),
+                               "container": img.container, "sites": sites})
+        print(json.dumps({"milestones": milestones}, indent=2))
+        return 0
+
+    for img in imgs:
+        if multi:
+            print(f"\n=== slice: {img.container} ===")
+        cmd_derive(img, milestone_name_for(args.name, img), False, ranges)
+    return 0
 
 
 if __name__ == "__main__":

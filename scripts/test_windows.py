@@ -1,7 +1,27 @@
+"""Windows PE regression tests for chrome-mv2.ps1.
+
+The PowerShell patcher is tested white-box (dot-sourced internals: the matcher,
+patch/restore, atomic writer, image parser, milestone selection), so this Python
+file launches that assertion script via `pwsh`. It is skipped cleanly where
+PowerShell is unavailable (e.g. a Linux runner without pwsh); CI runs it on the
+Windows runner. Kept as .py so the whole suite lives flat in scripts/.
+"""
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+REPO = Path(__file__).resolve().parent.parent
+
+# White-box PowerShell assertions. $repo comes from the environment so the body
+# does not depend on its own location.
+PS_TEST = r'''
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
-$repo = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
+$repo = $env:MV2_REPO
 $env:MV2_TEST_LIBRARY_ONLY = '1'
 . (Join-Path $repo 'chrome-mv2.ps1')
 Remove-Item Env:MV2_TEST_LIBRARY_ONLY -ErrorAction SilentlyContinue
@@ -14,22 +34,15 @@ function Assert-True {
     if (-not $Condition) { throw "ASSERTION FAILED: $Message" }
     $script:passed++
 }
-
 function Assert-Throws {
     param([scriptblock]$Action, [string]$Message)
     $threw = $false
     try { & $Action } catch { $threw = $true }
     Assert-True $threw $Message
 }
-
 function New-TestPe {
-    param(
-        [string]$Path,
-        [byte[]]$Signature,
-        [int]$SignatureOffset = 0x40,
-        [uint32]$TimeStamp = 0x12345678,
-        [bool]$Signed = $true
-    )
+    param([string]$Path, [byte[]]$Signature, [int]$SignatureOffset = 0x40,
+          [uint32]$TimeStamp = 0x12345678, [bool]$Signed = $true)
     $buf = [byte[]]::new(0x800)
     $buf[0] = 0x4D; $buf[1] = 0x5A
     [Array]::Copy([BitConverter]::GetBytes([uint32]0x80), 0, $buf, 0x3C, 4)
@@ -55,12 +68,10 @@ function New-TestPe {
     [Array]::Copy($Signature, 0, $buf, 0x400 + $SignatureOffset, $Signature.Length)
     [IO.File]::WriteAllBytes($Path, $buf)
 }
-
 function Write-Signatures {
     param([string]$Path, [array]$Milestones)
     @{ milestones = $Milestones } | ConvertTo-Json -Depth 8 | Set-Content -LiteralPath $Path -Encoding utf8
 }
-
 $temp = Join-Path ([IO.Path]::GetTempPath()) ('chrome mv2 ps tests ' + [Guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $temp | Out-Null
 try {
@@ -102,7 +113,6 @@ try {
     Assert-True ((Get-FileHash -LiteralPath $target -Algorithm SHA256).Hash -eq $patchedHash) 'idempotent re-patch should not rewrite different bytes'
     Assert-True ((Invoke-Restore -Target $targetObj -AssumeYes $true) -eq 0) 'verified restore should succeed'
     Assert-True (([IO.File]::ReadAllBytes($target))[0x444] -eq 0x7F) 'restore should recover stock byte'
-
     $unrelated = [IO.File]::ReadAllBytes($target)
     $unrelated[0x620] = 0xA5
     [IO.File]::WriteAllBytes($target, $unrelated)
@@ -149,3 +159,37 @@ try {
 } finally {
     Remove-Item -LiteralPath $temp -Recurse -Force -ErrorAction SilentlyContinue
 }
+'''
+
+
+def main():
+    if not sys.platform.startswith("win"):
+        # The PowerShell patcher targets Windows; its white-box test dot-sources
+        # Windows-oriented internals (Add-Type helper, PE parsing). Skip off-Windows
+        # even where pwsh (Core) exists, to avoid cross-platform false failures.
+        print("PowerShell tests skipped: not on Windows")
+        return 0
+    pwsh = shutil.which("pwsh") or shutil.which("powershell")
+    if not pwsh:
+        print("PowerShell tests skipped: no pwsh/powershell on PATH")
+        return 0
+    with tempfile.NamedTemporaryFile("w", suffix=".ps1", delete=False, encoding="utf-8") as f:
+        f.write(PS_TEST)
+        ps_path = f.name
+    env = dict(os.environ, MV2_REPO=str(REPO))
+    try:
+        r = subprocess.run([pwsh, "-NoProfile", "-File", ps_path], env=env,
+                           capture_output=True, text=True)
+    finally:
+        os.unlink(ps_path)
+    sys.stdout.write(r.stdout)
+    if r.returncode != 0:
+        sys.stderr.write(r.stderr)
+        sys.exit(r.returncode)
+    return 0
+
+
+if __name__ == "__main__":
+    main()
+
+

@@ -324,6 +324,132 @@
           "sig": "837B28020F8F840000008B8B640100008B411880BB54010000007508"
         }
       ]
+    },
+    {
+      "name": "151-macos-x64",
+      "container": "macho-x64",
+      "_comment": "macOS Intel slice of the universal Google Chrome Framework, 151.0.7922.138. Seven inlined IsExtensionAffected gate sites (same ManifestV2Handler architecture as Windows 151); the three shared gates are byte-identical to 151-linux, and every site was symbol-verified against the official arm64/x86_64 dSYM (UUID-matched to consumer Chrome). Same jg->jmp flip as Windows/Linux.",
+      "sites": [
+        {
+          "name": "StandardManagementPolicyProvider::MustRemainDisabled",
+          "kind": "short",
+          "jgRVA": "0x01B652F7",
+          "jgOff": 3,
+          "expectedMatches": 1,
+          "sig": "83FA027F5B8B493083F80175494531F683F905740583F90A75"
+        },
+        {
+          "name": "ManifestV2Handler::OnExtensionSystemReady",
+          "kind": "short",
+          "jgRVA": "0x030822AA",
+          "jgOff": 4,
+          "expectedMatches": 1,
+          "sig": "837950027F2D488B91280200008B423080B90802000000750C"
+        },
+        {
+          "name": "ManifestV2Handler::ShouldBlockExtensionEnable",
+          "kind": "short",
+          "jgRVA": "0x04727A9D",
+          "jgOff": 3,
+          "expectedMatches": 1,
+          "sig": "83FA027F298B493083F801751783F9050F95C283F90A0F95C0"
+        },
+        {
+          "name": "ManifestV2Handler::IsExtensionAffected",
+          "kind": "short",
+          "jgRVA": "0x071364A4",
+          "jgOff": 4,
+          "expectedMatches": 1,
+          "sig": "837E50027F2F554889E5488B8E280200008B413080BE080200"
+        },
+        {
+          "name": "ManifestV2Handler::ShouldBlockExtensionInstallation",
+          "kind": "short",
+          "jgRVA": "0x071364F7",
+          "jgOff": 3,
+          "expectedMatches": 1,
+          "sig": "83FE027F1F83FA01751083F9050F95C283F90A0F95C020D05D"
+        },
+        {
+          "name": "ManifestV2Handler::MaybeReEnableExtension",
+          "kind": "short",
+          "jgRVA": "0x07136608",
+          "jgOff": 4,
+          "expectedMatches": 1,
+          "sig": "837B50027F30488B8B280200008B413080BB08020000007508"
+        },
+        {
+          "name": "StandardManagementPolicyProvider::UserMayInstall",
+          "kind": "near",
+          "jgRVA": "0x07B4CFF9",
+          "jgOff": 3,
+          "expectedMatches": 1,
+          "sig": "83FA020F8FA40000008B493083F8010F850F02000083F9050F848F00"
+        }
+      ]
+    },
+    {
+      "name": "151-macos-arm64",
+      "container": "macho-arm64",
+      "_comment": "macOS Apple Silicon slice, 151.0.7922.138. arm64 has no cmp/jg; the mv>=3 early-out is `cmp w,#2 ; b.gt` and the flip rewrites the branch condition GT(0xC)->AL(0xE), keeping imm19 (kind 'bcond'; see mv2-reversing.md). All seven gates were symbol-named from the official arm64 dSYM (UUID 4c4c4467...). EXPERIMENTAL: the arm64 flip is verified in CI (patch->re-sign->launch->MV2 load), not long-term use; the runtime patches arm64 only behind --arm64.",
+      "sites": [
+        {
+          "name": "ManifestV2Handler::OnExtensionSystemReady",
+          "kind": "bcond",
+          "jgRVA": "0x0178A5E8",
+          "jgOff": 4,
+          "expectedMatches": 1,
+          "sig": "1F090071AC0100542A1541F9483140B929214839C9000037496940B93F050071"
+        },
+        {
+          "name": "StandardManagementPolicyProvider::MustRemainDisabled",
+          "kind": "bcond",
+          "jgRVA": "0x021EFD80",
+          "jgOff": 4,
+          "expectedMatches": 1,
+          "sig": "5F0900716C040054293140B91F05007181030054140080523F15007160000054"
+        },
+        {
+          "name": "ManifestV2Handler::ShouldBlockExtensionEnable",
+          "kind": "bcond",
+          "jgRVA": "0x03ED7910",
+          "jgOff": 4,
+          "expectedMatches": 1,
+          "sig": "5F090071CC010054293140B91F050071E10000543F15007124194A7AE0079F1A"
+        },
+        {
+          "name": "ManifestV2Handler::IsExtensionAffected",
+          "kind": "bcond",
+          "jgRVA": "0x0642852C",
+          "jgOff": 4,
+          "expectedMatches": 1,
+          "sig": "1F090071CC010054291441F9283140B92A204839CA000037296940B93F050071"
+        },
+        {
+          "name": "ManifestV2Handler::ShouldBlockExtensionInstallation",
+          "kind": "bcond",
+          "jgRVA": "0x06428570",
+          "jgOff": 4,
+          "expectedMatches": 1,
+          "sig": "3F0800716C0100545F040071A10000547F14007164184A7AE0079F1AC0035FD6"
+        },
+        {
+          "name": "ManifestV2Handler::MaybeReEnableExtension",
+          "kind": "bcond",
+          "jgRVA": "0x064286A8",
+          "jgOff": 4,
+          "expectedMatches": 1,
+          "sig": "1F090071AC010054691641F9283140B96A224839CA000037296940B93F050071"
+        },
+        {
+          "name": "StandardManagementPolicyProvider::UserMayInstall",
+          "kind": "bcond",
+          "jgRVA": "0x06DB8584",
+          "jgOff": 4,
+          "expectedMatches": 1,
+          "sig": "5F090071EC000054293140B91F050071210F00543F15007124194A7AC1060054"
+        }
+      ]
     }
   ]
 }

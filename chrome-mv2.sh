@@ -168,8 +168,14 @@ for ms in milestones:
         raise ValueError("duplicate milestone " + name)
     seen_ms.add(name)
     container = ms.get("container")
-    if container not in ("elf", "pe", "pe32"):
+    if container not in ("elf", "pe", "pe32", "macho-x64", "macho-arm64"):
         raise ValueError("milestone %s has unsupported container %r" % (name, container))
+    # This script patches only the Linux ELF. A shared signatures.json may also
+    # carry the Windows (pe/pe32) and macOS (macho-x64/macho-arm64) tables, so
+    # skip any non-ELF milestone rather than validate a kind this engine does not
+    # implement (the arm64 "bcond" flip lives in chrome-mv2-mac.sh).
+    if container != "elf":
+        continue
     sites = ms.get("sites")
     if not isinstance(sites, list) or not sites:
         raise ValueError("milestone %s contains no sites" % name)
@@ -244,7 +250,9 @@ load_milestones() {
     parsed_file=$(mktemp /tmp/chrome-mv2-signatures.XXXXXX)
     SIGNATURE_PARSE_FILE="$parsed_file"
     local parse_output
-    if ! parse_output=$(printf '%s' "$json_data" | parse_signature_json); then
+    # Strip CR: python emits \r\n on some hosts (e.g. Git Bash on Windows), and a
+    # trailing \r on the last tab-field would corrupt the sig. A no-op on Linux.
+    if ! parse_output=$(printf '%s' "$json_data" | parse_signature_json | tr -d '\r'); then
         errf "Failed to parse signature data from ${src_label}:"
         printf '    %s\n' "$parse_output"
         rm -f -- "$parsed_file"

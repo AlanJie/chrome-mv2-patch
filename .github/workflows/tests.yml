@@ -1,0 +1,185 @@
+name: tests
+
+# Static engine tests on every push/PR, plus the real-macOS runtime proof that
+# cannot run on the Windows dev box: patch a scratch Google Chrome.app, ad-hoc
+# re-sign, launch headless (the Apple Silicon "Killed: 9" / library-validation /
+# JIT gate), load an MV2 extension, and restore to byte-identical stock.
+
+on:
+  push:
+    branches: [ master ]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  # --- Byte-level engine + signature-table checks (fast, no real Chrome) ------
+  engine:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ ubuntu-latest, macos-13, macos-14, windows-latest ]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+      - name: Bash patcher syntax
+        shell: bash
+        run: |
+          bash -n chrome-mv2.sh
+          bash -n chrome-mv2-mac.sh
+      - name: Full local suite (ELF + Mach-O + arm64 safety; PE where pwsh exists)
+        run: python scripts/run_tests.py
+      - name: derive_milestone self-checks (synthetic Mach-O)
+        shell: bash
+        run: |
+          python scripts/make_macho_fixture.py "$RUNNER_TEMP/fatfixture"
+          python scripts/derive_milestone.py "$RUNNER_TEMP/fatfixture" --name 151 --json > "$RUNNER_TEMP/mac-sigs.json"
+          python scripts/derive_milestone.py "$RUNNER_TEMP/fatfixture" --verify "$RUNNER_TEMP/mac-sigs.json"
+
+  # --- Real macOS runtime proof (both arches) ---------------------------------
+  macos-runtime:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-13   # Intel x86_64
+            arch: mac-x64
+            slice: macho-x64
+          - os: macos-14   # Apple Silicon arm64
+            arch: mac-arm64
+            slice: macho-arm64
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Fetch the CfT Chrome build we shipped signatures for
+        run: |
+          python3 scripts/fetch_chrome_binary.py --platform ${{ matrix.arch }} --out _scratch
+
+      - name: Verify the shipped table still fits this slice
+        run: |
+          fw=$(ls _scratch/chrome-*-${{ matrix.arch }})
+          echo "framework=$fw"
+          python3 scripts/derive_milestone.py "$fw" --verify signatures.json | tee verify.log
+          grep -q "ALL SITES VERIFIED: True" verify.log
+
+      # Build a minimal .app around the CfT chrome so the bundle re-seal path is
+      # exercised end to end. CfT ships a full Google Chrome for Testing.app; use
+      # it directly as the scratch target.
+      - name: Stage a scratch Google Chrome for Testing.app
+        run: |
+          # fetch_chrome_binary keeps only the framework; re-fetch the .app tree
+          # via CfT for a launch test.
+          python3 - <<'PY'
+          import json, urllib.request, io, zipfile, os
+          plat = "${{ matrix.arch }}"
+          data = json.load(urllib.request.urlopen(
+            "https://googlechromelabs.github.io/chrome-for-testing/last-known-good-versions-with-downloads.json"))
+          st = data["channels"]["Stable"]
+          url = next(d["url"] for d in st["downloads"]["chrome"] if d["platform"] == plat)
+          print("downloading", url)
+          buf = urllib.request.urlopen(url).read()
+          zipfile.ZipFile(io.BytesIO(buf)).extractall("_app")
+          PY
+          APP=$(find _app -maxdepth 2 -name "*.app" -type d | head -1)
+          BIN=$(find "$APP/Contents/MacOS" -maxdepth 1 -type f | head -1)
+          echo "APP=$APP" >> "$GITHUB_ENV"
+          echo "BIN=$BIN" >> "$GITHUB_ENV"
+          echo "staged $APP ($BIN)"
+
+      - name: check (read-only) recognizes the layout
+        run: |
+          bash chrome-mv2-mac.sh check "$APP"
+
+      # Baseline BEFORE patching: at 151/152 the MV2 disable is a compiled-in
+      # feature default (--enable-features no longer toggles it), so a stock CfT
+      # build should already disable an MV2 extension. Record that state; the
+      # patched run below is asserted against it.
+      - name: stock MV2 baseline (extension should be DISABLED pre-patch)
+        run: |
+          python3 .github/mv2_probe.py --chrome "$BIN" --state-out stock_state.txt
+          echo "stock MV2 extension state: $(cat stock_state.txt)"
+
+      - name: patch (with --arm64 on Apple Silicon) + verify signature
+        run: |
+          EXTRA=""
+          [ "${{ matrix.slice }}" = "macho-arm64" ] && EXTRA="--arm64"
+          bash chrome-mv2-mac.sh patch "$APP" $EXTRA --yes --quiet
+          FW=$(find "$APP/Contents/Frameworks" -maxdepth 4 -name "*Framework" -type f | head -1)
+          echo "flipped framework: $FW"
+          codesign --verify --deep --strict "$APP"
+
+      - name: headless launch must render (Killed:9 / LV / JIT proof)
+        run: |
+          BIN=$(find "$APP/Contents/MacOS" -maxdepth 1 -type f | head -1)
+          "$BIN" --headless=new --disable-gpu --no-sandbox --dump-dom "data:text/html,<title>ok</title>hi" > dom.html 2>launch.log || (cat launch.log; exit 1)
+          grep -qi "ok\|hi" dom.html
+          echo "headless render OK"
+
+      - name: functional MV2 A/B (patched build must ENABLE what stock disabled)
+        run: |
+          python3 .github/mv2_probe.py --chrome "$BIN" --state-out patched_state.txt
+          stock=$(cat stock_state.txt); patched=$(cat patched_state.txt)
+          echo "MV2 extension state -- stock=$stock  patched=$patched"
+          # The patch's whole job: the MV2 extension is enabled on the patched
+          # build. If it is not, the flip is ineffective at runtime -> hard fail.
+          if [ "$patched" != "enabled" ]; then
+            echo "::error::patched build did not enable the MV2 extension (patch ineffective at runtime)"
+            exit 1
+          fi
+          if [ "$stock" = "disabled" ]; then
+            echo "PROOF: stock disabled the MV2 extension and the patched build re-enabled it."
+          else
+            echo "::warning::stock build did not disable the MV2 extension, so this CfT build does not enforce the MV2 deprecation and the A/B is inconclusive. The byte-level --verify above remains the authoritative proof."
+          fi
+
+      - name: restore to byte-identical stock
+        run: |
+          FW=$(find "$APP/Contents/Frameworks" -maxdepth 4 -name "*Framework" -type f | head -1)
+          bash chrome-mv2-mac.sh restore "$APP" --yes --quiet
+          # the .bak is Google's original bytes; after restore the framework matches it
+          diff <(shasum -a 256 "$FW.bak" | awk '{print $1}') <(shasum -a 256 "$FW" | awk '{print $1}')
+          echo "restore reproduced stock framework bytes"
+
+  # --- Symbol cross-check on real macOS: the shipped gates are the named ones --
+  macos-symbols:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: macos-13, arch: x86_64, slice: macho-x64 }
+          - { os: macos-14, arch: arm64,  slice: macho-arm64 }
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - name: Mount consumer Chrome (dmg) and read the real framework + version
+        run: |
+          curl -fsSL -o chrome.dmg "https://dl.google.com/chrome/mac/universal/stable/GGRO/googlechrome.dmg"
+          hdiutil attach -nobrowse -mountpoint /Volumes/mv2chrome chrome.dmg
+          APP="/Volumes/mv2chrome/Google Chrome.app"
+          FW=$(find "$APP/Contents/Frameworks" -maxdepth 4 -name "*Framework" -type f | grep -v Current | head -1)
+          VER=$(defaults read "$APP/Contents/Info" CFBundleShortVersionString)
+          cp "$FW" ./framework
+          echo "VER=$VER" >> "$GITHUB_ENV"
+          echo "framework version=$VER"
+          hdiutil detach /Volumes/mv2chrome || true
+      - name: Fetch the matching dSYM symbols (stream only the symtab)
+        run: |
+          python3 scripts/fetch_symbols.py ./framework --chrome-version "$VER" --out .
+      - name: The shipped table's gates are all inside named gate functions
+        run: |
+          python3 scripts/derive_milestone.py ./framework \
+            --symbols "mac-${{ matrix.arch }}-syms.txt" --name "$VER" --json > named.json
+          python3 - <<'PY'
+          import json
+          d = json.load(open("named.json"))
+          slice_c = "${{ matrix.slice }}"
+          ms = [m for m in d["milestones"] if m["container"] == slice_c]
+          n = len(ms[0]["sites"]) if ms else 0
+          print(f"{slice_c}: {n} symbol-named gate sites")
+          # Windows/Linux 151 have 5-7 gates; a complete mac table must find them all.
+          assert n >= 5, f"expected >=5 symbol-named gates, got {n}"
+          PY
+

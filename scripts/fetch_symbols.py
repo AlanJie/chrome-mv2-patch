@@ -8,25 +8,36 @@ Dispatches on the target's own file magic:
   ELF (chrome)     -> read build-id + .gnu_debuglink, stream debug-info/
                       chrome.debug out of the per-version debug-info zip via HTTP
                       range requests, and verify build-id + CRC both ways.
+  Mach-O (macOS)   -> for each slice, stream the per-arch dSYM archive from
+                      dl.google.com/chrome/mac/{channel}/dsym/, keep ONLY its
+                      LC_SYMTAB (not the multi-GB DWARF), verify the slice
+                      LC_UUID, and emit nm-style `addr type name` lines. dSYMs
+                      are UUID-matched to CONSUMER Chrome (unwrap the .dmg), not
+                      Chrome for Testing. Needs --chrome-version.
 
 Downloads land in _scratch/ by default (gitignored) — override with --out. Only
-the one wanted zip member is transferred for the ELF path; nothing is buffered
-whole. Pure stdlib: no unzip, no requests, no external modules.
+the one wanted zip member (ELF) / the symtab slice (Mach-O) is kept; nothing is
+buffered whole. Pure stdlib: no unzip, no requests, no external modules.
 
 Usage:
     python scripts/fetch_symbols.py <chrome.dll|chrome> [--out DIR] [--chrome-version V]
+    python scripts/fetch_symbols.py "<Google Chrome Framework>" --chrome-version 151.0.7922.138
 
 Then feed the result to the rest of the pipeline:
-    Windows: python scripts/resolve_symbols.py <chrome.dll> --symdir _scratch --json _scratch/syms.json
-    Linux:   python scripts/dump_symtab.py _scratch/chrome.debug _scratch/syms.txt
-    both  -> python scripts/derive_milestone.py <binary> --symbols … --name <ver> --json
+    Windows: python scripts/symbols_from_pdb.py <chrome.dll> --symdir _scratch --json _scratch/syms.json
+    Linux:   python scripts/symbols_from_elf.py _scratch/chrome.debug _scratch/syms.txt
+    macOS:   fetch_symbols writes _scratch/mac-<arch>-syms.txt directly
+    all   -> python scripts/derive_milestone.py <binary> --symbols … --name <ver> --json
 """
 
 import argparse
 import binascii
+import bz2
+import io
 import re
 import struct
 import sys
+import tarfile
 import urllib.error
 import urllib.request
 import zlib
@@ -38,6 +49,188 @@ DEFAULT_OUT = REPO / "_scratch"
 PDB_SYMBOL_BASE = "https://chromium-browser-symsrv.commondatastorage.googleapis.com"
 DEBUG_SYMBOL_BASE = "https://edgedl.me.gvt1.com/chrome/linux/symbols"
 DEBUG_MEMBER = "debug-info/chrome.debug"
+
+# ===========================================================================
+# Mach-O (macOS) -> dSYM symbol table
+# ===========================================================================
+DSYM_BASE = "https://dl.google.com/chrome/mac/{channel}/dsym/googlechrome-{version}-{arch}-dsym.tar.bz2"
+MH_MAGIC_64 = 0xFEEDFACF
+FAT_MAGIC = 0xCAFEBABE
+FAT_MAGIC_64 = 0xCAFEBABF
+LC_SYMTAB = 0x2
+LC_UUID_ = 0x1B
+CPU_BY_ARCH = {"x86_64": 0x01000007, "arm64": 0x0100000C}
+GATE_KW = ("isextensionaffected", "shouldblockextension", "onextensionsystemready",
+           "maybereenableextension", "usermayinstall", "mustremaindisabled")
+
+
+def _macho_slices(data):
+    """[(container, arch, base, uuid)] for a fat or thin Mach-O file's slices."""
+    be = struct.unpack_from(">I", data, 0)[0]
+    heads = []
+    if be in (FAT_MAGIC, FAT_MAGIC_64):
+        is64 = be == FAT_MAGIC_64
+        nfat = struct.unpack_from(">I", data, 4)[0]
+        entry = 32 if is64 else 20
+        off = 8
+        for _ in range(nfat):
+            cpu = struct.unpack_from(">I", data, off)[0]
+            base = struct.unpack_from(">Q" if is64 else ">I", data, off + 8)[0]
+            heads.append((cpu, base))
+            off += entry
+    else:
+        heads.append((struct.unpack_from("<I", data, 4)[0], 0))
+    out = []
+    for cpu, base in heads:
+        arch = next((a for a, c in CPU_BY_ARCH.items() if c == cpu), None)
+        if arch is None:
+            continue
+        out.append(("macho-" + ("x64" if arch == "x86_64" else "arm64"), arch, base,
+                    _macho_slice_uuid(data, base)))
+    return out
+
+
+def _macho_slice_uuid(data, base):
+    ncmds = struct.unpack_from("<I", data, base + 16)[0]
+    p = base + 32
+    for _ in range(ncmds):
+        cmd, cmdsize = struct.unpack_from("<II", data, p)
+        if cmd == LC_UUID_:
+            return data[p + 8:p + 24].hex()
+        p += cmdsize
+    return None
+
+
+def _read_exact(f, n):
+    b = bytearray()
+    while len(b) < n:
+        c = f.read(n - len(b))
+        if not c:
+            break
+        b += c
+    return bytes(b)
+
+
+def _dsym_symbols(version, arch, expect_uuid, out_path, channel="stable"):
+    """Stream the dSYM, keep only the DWARF Mach-O's LC_SYMTAB, and write nm-style
+    lines for the gate functions. Returns True on success."""
+    url = DSYM_BASE.format(channel=channel, version=version, arch=arch)
+    print(f"Streaming dSYM: {url}")
+    want_cpu = CPU_BY_ARCH[arch]
+    try:
+        req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
+        resp = urllib.request.urlopen(req, timeout=300)
+    except (urllib.error.HTTPError, urllib.error.URLError) as e:
+        print(f"  dSYM download failed: {e}")
+        return False
+    with resp:
+        tar = tarfile.open(fileobj=resp, mode="r|bz2")
+        member = next((m for m in tar if m.isfile() and "/DWARF/" in m.name), None)
+        if member is None:
+            print("  no DWARF member in dSYM"); return False
+        print(f"  member: {member.name} ({member.size} B)")
+        f = tar.extractfile(member)
+        head = _read_exact(f, 8192)
+        pos = len(head)
+        be = struct.unpack_from(">I", head, 0)[0]
+        base = 0
+        if be in (FAT_MAGIC, FAT_MAGIC_64):
+            is64 = be == FAT_MAGIC_64
+            nfat = struct.unpack_from(">I", head, 4)[0]
+            entry = 32 if is64 else 20
+            o = 8
+            for _ in range(nfat):
+                cpu = struct.unpack_from(">I", head, o)[0]
+                soff = struct.unpack_from(">Q" if is64 else ">I", head, o + 8)[0]
+                if cpu == want_cpu:
+                    base = soff
+                o += entry
+        return _dsym_parse_symtab(f, head, pos, base, expect_uuid, arch, out_path)
+
+
+def _dsym_parse_symtab(f, head, pos, base, expect_uuid, arch, out_path):
+    def stream_to(target):
+        nonlocal pos
+        while pos < target:
+            c = f.read(min(1 << 20, target - pos))
+            if not c:
+                raise ValueError("stream ended early while skipping")
+            pos += len(c)
+
+    if base >= len(head):
+        stream_to(base)
+        hdr = _read_exact(f, 32); pos += 32; have = b""
+    else:
+        hdr = head[base:base + 32]; have = head[base + 32:]
+    if struct.unpack_from("<I", hdr, 0)[0] != MH_MAGIC_64:
+        print("  dSYM slice is not a 64-bit Mach-O"); return False
+    ncmds, sizeofcmds = struct.unpack_from("<II", hdr, 16)
+    need = sizeofcmds - len(have)
+    extra = _read_exact(f, need) if need > 0 else b""
+    lc = (have + extra)[:sizeofcmds]
+    pos = base + 32 + sizeofcmds if base >= len(head) else len(head) + len(extra)
+
+    uuid = None; symoff = nsyms = stroff = strsize = 0
+    p = 0
+    for _ in range(ncmds):
+        cmd, cmdsize = struct.unpack_from("<II", lc, p)
+        if cmd == LC_UUID_:
+            uuid = lc[p + 8:p + 24].hex()
+        elif cmd == LC_SYMTAB:
+            symoff, nsyms, stroff, strsize = struct.unpack_from("<IIII", lc, p + 8)
+        p += cmdsize
+    print(f"  dSYM uuid={uuid} (expect {expect_uuid}); nsyms={nsyms}")
+    if expect_uuid and uuid != expect_uuid:
+        print("  [-] dSYM UUID does not match the target framework slice; refusing.")
+        return False
+
+    sym_abs = (base + symoff, base + symoff + nsyms * 16)
+    str_abs = (base + stroff, base + stroff + strsize)
+    hi = max(sym_abs[1], str_abs[1])
+    symbuf = bytearray(nsyms * 16); strbuf = bytearray(strsize)
+    while pos < hi:
+        chunk = f.read(min(1 << 20, hi - pos))
+        if not chunk:
+            raise ValueError("stream ended early before symtab/strtab")
+        cs, ce = pos, pos + len(chunk)
+        for (a, b), buf in ((sym_abs, symbuf), (str_abs, strbuf)):
+            s = max(a, cs); e = min(b, ce)
+            if s < e:
+                buf[s - a:e - a] = chunk[s - cs:e - cs]
+        pos = ce
+
+    def name_at(strx):
+        end = strbuf.find(b"\x00", strx)
+        return bytes(strbuf[strx:end]).decode("latin1", "replace") if end >= 0 else ""
+
+    rows = []
+    for i in range(nsyms):
+        strx, _t, _s, _d, n_value = struct.unpack_from("<IBBHQ", symbuf, i * 16)
+        if n_value == 0 or strx == 0:
+            continue
+        nm = name_at(strx)
+        if any(k in nm.lower() for k in GATE_KW):
+            rows.append((n_value, nm))
+    rows.sort()
+    with open(out_path, "w", encoding="utf-8") as o:
+        for addr, nm in rows:
+            o.write(f"{addr:x} t {nm}\n")
+    print(f"  [+] wrote {len(rows)} gate-name symbol(s) -> {out_path}")
+    return len(rows) > 0
+
+
+def fetch_dsyms(data, out_dir, version):
+    if not version:
+        print("Error: macOS dSYM fetch needs --chrome-version (e.g. 151.0.7922.138).")
+        return False
+    ok = False
+    for container, arch, base, uuid in _macho_slices(data):
+        out_path = Path(out_dir) / f"mac-{arch}-syms.txt"
+        print(f"\n== {container} ({arch}), slice uuid {uuid} ==")
+        if _dsym_symbols(version, arch, uuid, str(out_path)):
+            ok = True
+    return ok
+
 
 
 # ---------------------------------------------------------------------------
@@ -437,7 +630,10 @@ def main():
         return 0 if fetch_pdb(data, args.binary, out_dir) else 1
     if data[:4] == b"\x7fELF":
         return 0 if fetch_debug(data, out_dir, args.chrome_version) else 1
-    print(f"error: {args.binary} is neither a PE ('MZ') nor an ELF ('\\x7fELF') binary.", file=sys.stderr)
+    be = struct.unpack_from(">I", data, 0)[0] if len(data) >= 4 else 0
+    if be in (FAT_MAGIC, FAT_MAGIC_64) or data[:4] == b"\xcf\xfa\xed\xfe":
+        return 0 if fetch_dsyms(data, out_dir, args.chrome_version) else 1
+    print(f"error: {args.binary} is neither a PE ('MZ'), ELF, nor Mach-O binary.", file=sys.stderr)
     return 1
 
 

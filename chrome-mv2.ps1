@@ -407,9 +407,14 @@ function Import-Milestones {
         }
         if ($milestoneNames.ContainsKey($msName)) { throw "duplicate milestone name '$msName'" }
         $milestoneNames[$msName] = $true
-        if ($container -notin 'pe', 'pe32', 'elf') {
+        if ($container -notin 'pe', 'pe32', 'elf', 'macho-x64', 'macho-arm64') {
             throw "milestone $msName has unsupported container '$container'"
         }
+        # This script patches only Windows PE. A shared signatures.json may also
+        # carry the Linux (elf) and macOS (macho-x64/macho-arm64) tables, so skip
+        # any non-PE milestone rather than validate a kind this engine does not
+        # implement (the arm64 'bcond' flip lives in chrome-mv2-mac.sh).
+        if ($container -notin 'pe', 'pe32') { continue }
         if ($null -eq $rm.sites -or @($rm.sites).Count -eq 0) {
             throw "milestone $msName contains no sites"
         }

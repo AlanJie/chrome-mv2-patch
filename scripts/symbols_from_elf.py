@@ -9,7 +9,7 @@ is a substring of the mangled name (…19IsExtensionAffected…), which is all t
 keyword filter in derive_milestone.load_symbols needs.
 
 Usage:
-    python scripts/dump_symtab.py <elf-with-symbols> [out.txt]
+    python scripts/symbols_from_elf.py <elf-with-symbols> [out.txt]
     python scripts/derive_milestone.py <chrome> --symbols out.txt --name <ver>-linux --json
 """
 

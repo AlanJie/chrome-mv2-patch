@@ -119,6 +119,25 @@ ELF has **no security directory and no checksum**, so writing the flipped bytes 
 
 **`.deb` and `.rpm` ship the identical ELF.** Google builds the Linux x86-64 `chrome` once per release and wraps that same payload in both the Debian and RPM packages. Verified on 151.0.7922.108: the `chrome` ELF extracted from `google-chrome-stable_current_x86_64.rpm` has the same **build-id** (`014c3867…`) as the installed `.deb` binary and is **byte-for-byte identical** to the stock `.deb` (the only diffs observed were the 5 gate sites, and only because the live install had already been patched — its `chrome.bak` is bit-identical to the RPM ELF). So **one `elf` signature table covers both package families** — the signatures key on the ELF, never on the packaging. An RPM host (Fedora/RHEL/openSUSE) installs to the same `/opt/google/chrome/chrome`, so the patcher's existing target enumeration and atomic-write path apply unchanged; only the revert-on-update mechanism differs (`dnf/zypper` + `rpm -V` flags the modified binary, the analogue of `apt upgrade` / `dpkg --verify`). The RPM payload is an `xz`-compressed `cpio` (`070701` newc); `rpm2cpio` isn't needed — the header's `PAYLOADCOMPRESSOR`/`PAYLOADFORMAT` tags name it and stdlib `lzma` streams one member out.
 
+### 3c. macOS — one universal (fat) Mach-O + code signing
+
+macOS ships the browser as `Google Chrome.app`; the gate-bearing binary is the framework Mach-O at `Contents/Frameworks/Google Chrome Framework.framework/Versions/<v>/Google Chrome Framework`. It is a **universal (fat) binary** with two thin slices — **x86_64** and **arm64** — each with its own `__TEXT,__text`. `chrome-mv2-mac.sh` owns this platform; `scripts/derive_milestone.py` grew a Mach-O parser that returns one `Image` per slice.
+
+| Property | Value |
+| :--- | :--- |
+| Fat header | big-endian, `FAT_MAGIC 0xCAFEBABE` (32-bit `fat_arch`) / `0xCAFEBABF` (64-bit) |
+| Thin slice | `MH_MAGIC_64 0xFEEDFACF`, on disk `CF FA ED FE` (little-endian) |
+| cputype | x86_64 `0x01000007`, arm64 `0x0100000C` (mask cpusubtype `& 0x00FFFFFF`) |
+| `__text` | `LC_SEGMENT_64 0x19` → segment `__TEXT`, section `__text` |
+| Build identity | `LC_UUID 0x1B` (per slice); stable across the flip **and** the re-sign |
+| Signature | `LC_CODE_SIGNATURE 0x1D` → `CS_SuperBlob` in `__LINKEDIT` |
+
+**No vmaddr→fileoffset delta for byte location** — the opposite of ELF. `section_64.offset` is already the *slice-relative file offset*, so the absolute file offset of `__text` is `fat_arch.offset + section.offset`. (The vmaddr delta only re-enters when mapping a symbol's `n_value`.) The derivation stores `text_virt = section.addr` for `jgRVA` bookkeeping and `text_raw = fat_arch.offset + section.offset`.
+
+**Code signing is load-bearing.** Any byte edit invalidates the `CS_SuperBlob` page hash; on Apple Silicon the kernel refuses to launch an invalid/absent signature (`Killed: 9`). Unlike the Windows PE trick (zero the Security directory and run unsigned), Mach-O has **no strip-and-run** path — the binary must be **re-signed**. A bare-Mach-O ad-hoc sign is *insufficient*: signing is bundle-scoped (the `.framework` and the enclosing `.app` seal the framework's cdhash), and **library validation** rejects an ad-hoc framework loaded by Google's Team-ID-signed main executable. So the script re-signs **inside-out, ad-hoc** — the framework bundle, then the `.app` (making the main executable ad-hoc too so LV passes among all-ad-hoc components) — **preserving entitlements/flags** (`--preserve-metadata=entitlements,flags,requirements`; the JIT entitlements `allow-jit` / `allow-unsigned-executable-memory` are mandatory or V8/renderers crash), then `codesign --verify --deep --strict`. The backup is the **original Google-signed** framework captured *before* any edit (re-signing is one-way lossy), so `restore` is a byte-exact copy back with no re-sign. `spctl` will report "rejected" for an ad-hoc app — expected and benign for an already-installed, de-quarantined app; it does not block launch.
+
+**Other macOS specifics** (in `chrome-mv2-mac.sh`): quit **all** Chrome processes first — macOS has no `ETXTBSY` guard and a re-signed page whose cdhash differs kills the *live* process (`SIGBUS`), not just a stale mapping; patch the real `Versions/<v>/…` file, not the `Versions/Current`/top-level symlinks; read the version from the app's `Info.plist` `CFBundleShortVersionString`; `/Applications/Google Chrome.app` is third-party, so not SIP-protected (needs only write access); Keystone auto-update replaces the whole `.app`, reverting the patch (the UUID change flags it, the analogue of `apt upgrade`). Stock macOS ships **bash 3.2** and no usable system `python3`, so the script avoids bash-4 features and ships its table pre-tokenized (JSON via `--signatures` is optional and only then needs `python3`).
+
 ---
 
 ## 4. The per-platform site tables
@@ -206,7 +225,7 @@ So the flip carries over unchanged (`7F` → `EB`, same disp8). The `.text` vadd
 
 **Architecture note — Linux 151 resembles Windows *152*, not 151.** `ManifestV2Handler::IsExtensionAffected` (`0x98d3cb0`) is a bare 14-byte thunk that tail-calls the shared predicate and carries no gate; `MaybeReEnableExtension` (`0x98d3df0`) and the tiny `OnExtensionSystemReady` (`0x67d9af0`, 0x24 bytes) both **call** the shared predicate out-of-line rather than inlining a `cmp/jg` — so, unlike Windows, there is no separate `OnExtensionSystemReady` flip site; the shared-predicate flip covers them. The two `StandardManagementPolicyProvider` copies **are** inlined and need their own flips, and `UserMayInstall`'s is a **near** `jg` — invisible to a short-only sweep, the §7 lesson. Six gate symbols, five physical flips.
 
-**Flip verified by execution.** Beyond byte-diffing (5 edits, 6 bytes, all direction-only — §7 CARDINAL RULE), the shared predicate was mapped and called in-process against a synthetic Extension: **stock** returns 1 (affected) for `mv=2` and 0 for `mv=3`; **patched** returns 0 for both — MV2 unblocked, MV3 unchanged. Chrome itself starts and renders cleanly on the patched binary (headless, full install tree). The derivation used the `.symtab`-direct dump (`scripts/dump_symtab.py`, ~3 min) rather than `nm -SC`, which is impractically slow on the 1.4 GB `chrome.debug` with 3 GB RAM.
+**Flip verified by execution.** Beyond byte-diffing (5 edits, 6 bytes, all direction-only — §7 CARDINAL RULE), the shared predicate was mapped and called in-process against a synthetic Extension: **stock** returns 1 (affected) for `mv=2` and 0 for `mv=3`; **patched** returns 0 for both — MV2 unblocked, MV3 unchanged. Chrome itself starts and renders cleanly on the patched binary (headless, full install tree). The derivation used the `.symtab`-direct dump (`scripts/symbols_from_elf.py`, ~3 min) rather than `nm -SC`, which is impractically slow on the 1.4 GB `chrome.debug` with 3 GB RAM.
 
 ---
 
@@ -236,6 +255,41 @@ Byte-diff of the patched scratch copy: **7 bytes across 5 edits, all direction-o
 
 ---
 
+### 4e. macOS — the universal framework, x86_64 + arm64 (151.0.7922.138)
+
+Both slices of the universal `Google Chrome Framework` carry the **same seven gates as Windows 151**; only the container and (for arm64) the branch encoding differ. All fourteen sites were **symbol-verified** against the official dSYMs (see below), then confirmed to relocate cleanly against both the consumer framework (unwrapped from the `.dmg`) and the Chrome for Testing build. Distinct container tags (`macho-x64`, `macho-arm64`) keep the slices from cross-probing, exactly like `pe`/`pe32`/`elf`.
+
+**Symbols do exist for macOS — via the dSYM endpoint.** Google serves per-arch dSYM archives at `https://dl.google.com/chrome/mac/{channel}/dsym/googlechrome-{version}-{arch}-dsym.tar.bz2` (the endpoint Chromium's `tools/mac/download_symbols.py` uses; `arch` ∈ `x86_64`,`arm64`). They are **UUID-matched to consumer Chrome**, so they line up with the framework unwrapped from the consumer `.dmg`, *not* the Chrome for Testing build (same version string, different `LC_UUID` — verified: CfT arm64 `4c4c447e…` vs consumer `4c4c4467…`). `scripts/fetch_symbols.py` streams the ~2.4 GB archive, keeps only the DWARF Mach-O's `LC_SYMTAB` (the symtab/strtab sit near the front, so it never decompresses the multi-GB debug sections), verifies the slice `LC_UUID`, and emits `nm`-style lines for `scripts/derive_milestone.py --symbols`. That is how every gate below was named and attributed by function.
+
+**x86_64 slice (`macho-x64`) — seven short/near sites, byte-identical idioms to Linux/Windows.** The flip primitive is unchanged (`7F`→`EB`, `0F 8F`→`90 E9`). The shared-predicate, enable, install-thunk, `OnExtensionSystemReady`, and `MaybeReEnableExtension` signatures are byte-for-byte the Windows/Linux 151 bytes.
+
+| Site | `jg` RVA | Enc. |
+| :--- | :--- | :--- |
+| `ManifestV2Handler::IsExtensionAffected` | `0x071364A4` | short |
+| `ManifestV2Handler::ShouldBlockExtensionInstallation` | `0x071364F7` | short |
+| `ManifestV2Handler::ShouldBlockExtensionEnable` | `0x04727A9D` | short |
+| `ManifestV2Handler::OnExtensionSystemReady` | `0x030822AA` | short |
+| `ManifestV2Handler::MaybeReEnableExtension` | `0x07136608` | short |
+| `StandardManagementPolicyProvider::UserMayInstall` (inlined) | `0x07B4CFF9` | **near** |
+| `StandardManagementPolicyProvider::MustRemainDisabled` (inlined) | `0x01B652F7` | short |
+
+An earlier structural-only pass shipped **five** x64 sites (mirroring Linux) and missed `OnExtensionSystemReady` + `MaybeReEnableExtension` — the same "found some, MV2 still blocked" trap as §4a/§7. The dSYM symbols caught the omission; the shipped table is now the complete seven.
+
+**arm64 slice (`macho-arm64`) — the same seven, a new flip primitive.** arm64 has no `cmp/jg`; the `mv >= 3` early-out compiles to:
+
+```asm
+    cmp  w?, #2          ; SUBS WZR, Wn, #2
+    b.gt not_affected    ; taken when mv>=3  (cond GT = 0xC)
+```
+
+The sanctioned flip rewrites **only the branch condition GT→AL**, keeping `imm19` so it targets the same not-affected label — the direction-only analogue of `jg`→`jmp`. `B.cond` word = `0x54000000 | (imm19<<5) | cond`; `cond` is the **low nibble of the little-endian byte0**, so exactly one byte changes: `b0 = (b0 & 0xF0) | 0x0E` (`kind: "bcond"`). Matching is **bit-level**: a word matches iff `(w & 0xFF000010) == 0x54000000` (opcode fixed, bit4=0 to exclude `BC.cond`) and `(w & 0xF) ∈ {0xC stock, 0xE patched}`, with `imm19` wildcarded. `NV` (`0xF`) is *not* written and, if read, is treated as unexpected → declined. All seven arm64 gates (same functions as the x64 table) were symbol-named from the arm64 dSYM.
+
+**Decline, don't guess — the arm64 shapes that break the assumption.** `cmp #3`/`b.ge` (semantically equivalent but anchors on `#2`), `cbz/cbnz/tbz`, and a fully branchless `ccmp/csel` predicate all simply miss the `cmp #2 ; b.gt` anchor → declined. A fall-through polarity validator (the `cmp #1`/`#5` `Manifest::Type` checks must follow the branch) rejects an inverted gate where flipping to AL would force the *wrong* outcome. Register fields are baked into every arm64 word, so a byte-window signature is more release-brittle than x86 (the §7 register-allocation lesson, amplified) — expect arm64 to need re-derivation more often, and to decline cleanly when it does.
+
+**Verification gap.** The tables are byte-grounded and symbol-verified, and cross-check against both consumer and CfT builds. What remains unverified off-Mac is *runtime*: the arm64 flip **semantics** and the whole `codesign` re-seal are exercised in **GitHub Actions on real Intel and Apple Silicon runners** (fetch → `--verify` → patch a scratch `.app` → inside-out ad-hoc re-sign → `codesign --verify --deep --strict` → headless launch → **functional MV2 A/B** → `restore` to byte-identical stock), *not* by long-term daily use. The MV2 A/B (`.github/mv2_probe.py`) is a stock-vs-patched *differential*: it loads a Manifest V2 extension whose persistent background page pings a local listener the instant the extension is enabled — a disabled extension never loads its background page, so silence means disabled — and asserts the **patched** build enables the extension the **stock** build disables. The differential is necessary because by 151/152 the MV2 disable is a compiled-in feature default (`ExtensionManifestV2Unsupported`/`ExtensionManifestV2Disabled`); `--enable-features`/`--disable-features` no longer toggle it, so the flip is the only lever left, and a CfT build that happens not to enforce the deprecation is reported *inconclusive* (the byte-level `--verify` stays authoritative) rather than passed as a false positive. Treat `macho-arm64` as `152-linux` is treated: derived, statically + symbol-verified, and CI-checked, but flagged experimental until it has real desktop mileage.
+
+---
+
 ## 5. Porting to a new Chrome version
 
 When Chrome bumps a milestone it may reorder `Extension` fields or change codegen, and the signatures stop matching. The patcher declines and prints structural candidates. Re-deriving is a bounded, cross-platform job — the mechanism never changes, only the bytes. The toolkit lives in `scripts/` (see `scripts/README.md`); it is dependency-free and works on both PE and ELF, both `jg` encodings.
@@ -249,14 +303,14 @@ When Chrome bumps a milestone it may reorder `Extension` fields or change codege
    or `chrome.debug` (Linux) into `_scratch/`, dispatching on the file's magic.
    A very fresh channel whose symbols aren't indexed yet returns HTTP 404 — pick
    one that exists.
-2. **Name the gate functions** (optional but strongly recommended — a symbol-free scan surfaces ~150 gate-shaped idioms). Windows: `python scripts/resolve_symbols.py <chrome.dll> --json syms.json` (dbghelp memory-maps the multi-GB PDB; IDA/Ghidra OOM). Linux: `python scripts/dump_symtab.py _scratch/chrome.debug _scratch/syms.txt` (see §6 step 2 for why not `nm -SC`).
+2. **Name the gate functions** (optional but strongly recommended — a symbol-free scan surfaces ~150 gate-shaped idioms). Windows: `python scripts/symbols_from_pdb.py <chrome.dll> --json syms.json` (dbghelp memory-maps the multi-GB PDB; IDA/Ghidra OOM). Linux: `python scripts/symbols_from_elf.py _scratch/chrome.debug _scratch/syms.txt` (see §6 step 2 for why not `nm -SC`).
 3. **Find, name, and emit** the milestone entry:
    ```
    python scripts/derive_milestone.py <binary> --symbols syms.(json|txt) --name <ver> --json
    ```
    The finder scans `.text` for `cmp <mv>,2 ; jg` in **both** encodings, applies the same follow-up (`cmp reg,{1,5}` type / `cmp byte[reg+disp32],0` location) and the same masking the runtime scripts use, and reports each site's match count. Each real site shows `matches=1` (or `2` for a shared body); a `matches>2` site needs a wider signature.
 4. **Add** the entry to `signatures.json` (`container` = `pe` 64-bit / `pe32` 32-bit / `elf`) and synchronize it into the matching embedded table: `$EmbeddedSignatures` in `chrome-mv2.ps1` for Windows or `EMBEDDED_SIGNATURES` in `chrome-mv2.sh` for Linux. Keep older milestones — each script probes all applicable entries and applies the best match. An external JSON can update signatures without editing the script, but the self-contained release scripts must embed every supported entry.
-5. **Re-verify**: `python scripts/derive_milestone.py <binary> --verify` must print `ALL SITES VERIFIED: True` (a milestone fully covers the build). Run `pwsh -NoProfile -File scripts/tests/run-tests.ps1`, then patch a **scratch copy**, confirm on-disk bytes, and GUI-test. Partial or ambiguous layouts are declined by default; developer overrides exist for investigation, not normal releases.
+5. **Re-verify**: `python scripts/derive_milestone.py <binary> --verify` must print `ALL SITES VERIFIED: True` (a milestone fully covers the build). Run `python scripts/run_tests.py`, then patch a **scratch copy**, confirm on-disk bytes, and GUI-test. Partial or ambiguous layouts are declined by default; developer overrides exist for investigation, not normal releases.
 
 **If the `cmp …,2 ; jg` skeleton is gone entirely** (Google changed the check, or added a manifest-parser floor that hard-rejects MV2 earlier), the flip strategy no longer applies; re-analyze the gate logic from source (`manifest_v2_handler.cc` / `mv2_deprecation_impact_checker.cc` at the new `branch-heads/*` tag) before touching any bytes.
 
@@ -310,7 +364,7 @@ The 151 and 152 tables are derived, shipped, and verified (§4c, §4d). The exac
 
 - **Stock binary download**: `scripts/fetch_chrome_binary.py` (stdlib + 7-Zip) downloads a channel's current offline installer, unwraps the nested container chain (Windows `.exe`/`.msi` → `updater.7z` → `chrome.7z` → `Chrome-bin/`; Linux `.deb` → `data.tar.xz` → `opt/google/chrome/`), and leaves just the gate binary — `chrome.dll` (PE32+/PE32) or the `chrome` ELF — in `_scratch/`, arch-tagged and magic-checked. `--version` falls back to the Chrome for Testing archive (unbranded — re-verify against the real install). Adapted from a broader multi-platform release fetcher; macOS is dropped since it is not a patcher target.
 - **Symbol download**: `scripts/fetch_symbols.py` (stdlib-only) derives the RSDS key from a PE and pulls the exact PDB from the Chromium symbol server, or reads an ELF's build-id + `.gnu_debuglink` and streams `debug-info/chrome.debug` out of the per-version zip via HTTP range requests — verified against the binary's build-id and CRC both ways. Output lands in `_scratch/` (gitignored).
-- **PDB query without IDA/Ghidra** (Windows): the PDB is multi-GB; IDA/Ghidra OOM. `scripts/resolve_symbols.py` uses `dbghelp.dll` via `ctypes` — `SymInitialize`, `SymLoadModuleExW` (first load ~2 min), `SymEnumSymbolsW`. RVA = symbol address − image base.
-- **ELF symbol names without `nm`** (Linux): `nm -SC` on the 1.4 GB `chrome.debug` demangles and sorts the whole file and runs many minutes (impractical on a small-RAM box). `scripts/dump_symtab.py` streams just `.symtab` + its string table and emits `nm -S`-style lines in ~3 min; the finder's keyword filter matches the still-mangled names. Feed its output to `derive_milestone.py --symbols`.
+- **PDB query without IDA/Ghidra** (Windows): the PDB is multi-GB; IDA/Ghidra OOM. `scripts/symbols_from_pdb.py` uses `dbghelp.dll` via `ctypes` — `SymInitialize`, `SymLoadModuleExW` (first load ~2 min), `SymEnumSymbolsW`. RVA = symbol address − image base.
+- **ELF symbol names without `nm`** (Linux): `nm -SC` on the 1.4 GB `chrome.debug` demangles and sorts the whole file and runs many minutes (impractical on a small-RAM box). `scripts/symbols_from_elf.py` streams just `.symtab` + its string table and emits `nm -S`-style lines in ~3 min; the finder's keyword filter matches the still-mangled names. Feed its output to `derive_milestone.py --symbols`.
 - **Derivation/verification**: `scripts/derive_milestone.py` is stdlib-only (no capstone/pyelftools/pefile), parses PE (PE32 `pe32` and PE32+ `pe`) and ELF, and anchors its `.text` scans on the longest fixed byte run so a pure-Python pass over ~250 MB is fast. It mirrors the match-count, masking, and report-only scan rules in both runtime scripts, extended to the near-`jg` encoding.
 - The canonical derivation table is `signatures.json`. Its original 151/152 entries were derived from a Windows-only C++ reference patcher (preserved in git history at commit `e12fe16`); new milestones are authored into the JSON, verified with `scripts/derive_milestone.py --verify`, and synchronized into the appropriate embedded script table.
