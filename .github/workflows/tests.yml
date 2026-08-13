@@ -1,9 +1,12 @@
 name: tests
 
-# Static engine tests on every push/PR, plus the real-macOS runtime proof that
-# cannot run on the Windows dev box: patch a scratch Google Chrome.app, ad-hoc
-# re-sign, launch headless (the Apple Silicon "Killed: 9" / library-validation /
-# JIT gate), load an MV2 extension, and restore to byte-identical stock.
+# Static engine tests on every push/PR (Linux, macOS, Windows x64, and native
+# Windows arm64), plus the real-hardware runtime proofs the dev box can't run:
+# on macOS, patch a scratch Google Chrome.app, ad-hoc re-sign, launch headless
+# (the Apple Silicon "Killed: 9" / library-validation / JIT gate), load an MV2
+# extension, and restore to byte-identical stock; on Windows arm64, fetch the
+# current stable arm64 chrome.dll, verify the shipped table fits, and round-trip
+# patch -> idempotent re-patch -> byte-identical restore on a native arm64 runner.
 
 on:
   push:
@@ -17,7 +20,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        os: [ ubuntu-latest, macos-13, macos-14, windows-latest ]
+        os: [ ubuntu-latest, macos-13, macos-14, windows-latest, windows-11-arm ]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -102,11 +105,9 @@ jobs:
           python3 .github/mv2_probe.py --chrome "$BIN" --state-out stock_state.txt
           echo "stock MV2 extension state: $(cat stock_state.txt)"
 
-      - name: patch (with --arm64 on Apple Silicon) + verify signature
+      - name: patch + verify signature
         run: |
-          EXTRA=""
-          [ "${{ matrix.slice }}" = "macho-arm64" ] && EXTRA="--arm64"
-          bash chrome-mv2-mac.sh patch "$APP" $EXTRA --yes --quiet
+          bash chrome-mv2-mac.sh patch "$APP" --yes --quiet
           FW=$(find "$APP/Contents/Frameworks" -maxdepth 4 -name "*Framework" -type f | head -1)
           echo "flipped framework: $FW"
           codesign --verify --deep --strict "$APP"
@@ -183,3 +184,50 @@ jobs:
           assert n >= 5, f"expected >=5 symbol-named gates, got {n}"
           PY
 
+  # --- Real Windows-on-ARM runtime proof (native arm64) -----------------------
+  # No Chrome for Testing win-arm64 build exists, so this fetches the current
+  # stable *consumer* arm64 chrome.dll from the arm64 enterprise MSI (a stable
+  # URL), verifies the shipped pe-arm64 table still fits it, then patches a
+  # scratch copy and round-trips it on a native arm64 runner. Windows has no
+  # code-signing launch gate (the patch only zeroes the Authenticode dir + fixes
+  # the PE checksum), so byte-level patch/idempotent-repatch/restore is the proof;
+  # the functional MV2 re-enable is the same shared C++ already A/B-proven on
+  # Linux/macOS. Goes red -- signalling a new -win-arm64 milestone is due -- when
+  # stable arm64 rolls to a version the table doesn't cover (same contract as the
+  # macOS runtime job).
+  windows-arm64-runtime:
+    runs-on: windows-11-arm
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.x'
+
+      - name: Fetch the current stable arm64 chrome.dll and verify the shipped table
+        shell: pwsh
+        run: |
+          python scripts/fetch_chrome_binary.py --platform win-arm64 --out _scratch
+          $dll = (Get-ChildItem _scratch/chrome-*-win-arm64.dll)[0].FullName
+          "DLL=$dll" | Out-File $env:GITHUB_ENV -Append
+          python scripts/derive_milestone.py "$dll" --verify signatures.json | Tee-Object verify.log
+          if (-not (Select-String verify.log -Pattern 'ALL SITES VERIFIED: True' -Quiet)) {
+            throw "shipped pe-arm64 table does not fully fit the current stable arm64 build; add a new -win-arm64 milestone"
+          }
+
+      - name: Patch a scratch copy (default-on, no flag), re-patch idempotently, restore to stock
+        shell: pwsh
+        env:
+          MV2_TEST_NO_ELEVATION: "1"
+        run: |
+          Copy-Item "$env:DLL" scratch.dll
+          $sig = (Resolve-Path signatures.json).Path
+          $stock = (Get-FileHash scratch.dll -Algorithm SHA256).Hash
+          pwsh -NoProfile -File chrome-mv2.ps1 patch (Resolve-Path scratch.dll).Path -Yes -Quiet -Signatures $sig
+          if ($LASTEXITCODE -ne 0) { throw "patch exited $LASTEXITCODE" }
+          $patched = (Get-FileHash scratch.dll -Algorithm SHA256).Hash
+          if ($patched -eq $stock) { throw "patch did not change the binary" }
+          pwsh -NoProfile -File chrome-mv2.ps1 patch (Resolve-Path scratch.dll).Path -Yes -Quiet -Signatures $sig
+          if ((Get-FileHash scratch.dll -Algorithm SHA256).Hash -ne $patched) { throw "re-patch was not idempotent" }
+          pwsh -NoProfile -File chrome-mv2.ps1 restore (Resolve-Path scratch.dll).Path -Yes -Quiet -Signatures $sig
+          if ((Get-FileHash scratch.dll -Algorithm SHA256).Hash -ne $stock) { throw "restore did not reproduce stock bytes" }
+          Write-Host "arm64 patch -> idempotent re-patch -> restore round-trip OK (b.gt->b.al flips, byte-identical restore)"

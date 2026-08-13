@@ -1,9 +1,9 @@
 """macOS Mach-O regression tests for chrome-mv2-mac.sh, driven as a black box.
 
 Builds a synthetic universal (fat) fixture in Python and exercises patch /
-restore / check, host-aware slice selection, the arm64 --arm64 opt-in gate,
-idempotency, decline paths, and backup metadata. The host CPU is pinned per
-scenario via MV2_TEST_HOST_ARCH so results are independent of the CI runner's
+restore / check, host-aware slice selection (each Mac patches only its own CPU's
+slice), idempotency, decline paths, and backup metadata. The host CPU is pinned
+per scenario via MV2_TEST_HOST_ARCH so results are independent of the CI runner's
 own architecture. The loose-file target path skips bundle re-signing, so this
 runs anywhere (no real Chrome, no codesign).
 """
@@ -49,49 +49,43 @@ def main():
 
     A.true(cmd("check", target, sigs).returncode == 0, "check parses the fat fixture")
 
-    # On an x86_64 host the x64 slice is the default target; arm64 is the
-    # non-host slice and stays stock WITHOUT --arm64.
+    # On an x86_64 host the x64 slice is the default (and only) target; arm64 is
+    # the non-host slice and is left stock (patching code that never runs here).
     cmd("patch", target, sigs)
     A.eq(T.byte_at(target, x64_jg), 0xEB, "x64 short jg flipped by default (x64 host)")
-    A.eq(nib(target, arm_jg), 0x0C, "arm64 left stock (GT) without --arm64")
+    A.eq(nib(target, arm_jg), 0x0C, "arm64 left stock (GT) on an x64 host")
     A.is_file(f"{target}.bak", "patch creates a backup")
     A.is_file(f"{target}.bak.meta", "patch creates backup metadata")
 
-    # restore, then force BOTH with --arm64 (x64 host + arm64 forced)
-    cmd("restore", target, sigs)
-    A.eq(T.byte_at(target, x64_jg), 0x7F, "restore recovers x64 stock byte")
-    cmd("patch", target, sigs, "--arm64")
-    A.eq(T.byte_at(target, x64_jg), 0xEB, "x64 flipped with --arm64")
-    A.eq(nib(target, arm_jg), 0x0E, "arm64 b.cond flipped GT(0xC)->AL(0xE) with --arm64")
-
     # idempotent rerun preserves bytes
     h1 = T.sha256(target)
-    cmd("patch", target, sigs, "--arm64")
+    cmd("patch", target, sigs)
     A.eq(T.sha256(target), h1, "idempotent patch preserves bytes")
 
-    # full restore -> both slices stock
+    # restore -> host slice stock again
     cmd("restore", target, sigs)
-    A.eq(T.byte_at(target, x64_jg), 0x7F, "restore recovers x64 stock")
-    A.eq(nib(target, arm_jg), 0x0C, "restore recovers arm64 stock (GT)")
+    A.eq(T.byte_at(target, x64_jg), 0x7F, "restore recovers x64 stock byte")
+    A.eq(nib(target, arm_jg), 0x0C, "arm64 still stock after restore (GT)")
 
     # --- host-aware default on Apple Silicon --------------------------------
-    # On an arm64 host the arm64 slice is the default target. --yes pre-authorizes
-    # the experimental confirmation; the x64 slice is the non-host slice and is
-    # left stock even though no --arm64 was passed.
+    # On an arm64 host the arm64 slice is the default target and is patched with
+    # no opt-in flag and no extra confirmation (same as x64 on an Intel host);
+    # the x64 slice is the non-host slice and is left stock.
     ahost = tmp / "fixture-armhost"
     ax64_jg, aarm_jg = T.make_fat_macho(ahost)
-    cmd("patch", ahost, sigs, "--yes", env=ENV_ARM)
-    A.eq(nib(ahost, aarm_jg), 0x0E, "arm64 flipped by default on an arm64 host")
+    cmd("patch", ahost, sigs, env=ENV_ARM)
+    A.eq(nib(ahost, aarm_jg), 0x0E, "arm64 b.cond flipped GT(0xC)->AL(0xE) by default on an arm64 host")
     A.eq(T.byte_at(ahost, ax64_jg), 0x7F, "x64 left stock on an arm64 host (non-host slice)")
+    A.is_file(f"{ahost}.bak", "arm64-host patch creates a backup")
 
-    # arm64 host + --quiet WITHOUT --arm64: the experimental slice is declined and
-    # x64 is non-host, so nothing is patched and no backup is created.
-    aquiet = tmp / "fixture-armquiet"
-    T.make_fat_macho(aquiet)
-    A.true(cmd("patch", aquiet, sigs, env=ENV_ARM).returncode != 0,
-           "arm64 host + --quiet without --arm64 patches nothing")
-    A.true(not Path(f"{aquiet}.bak").exists(),
-           "declined arm64 (quiet, unconfirmed) creates no backup")
+    # idempotent rerun on the arm64 host preserves bytes
+    h2 = T.sha256(ahost)
+    cmd("patch", ahost, sigs, env=ENV_ARM)
+    A.eq(T.sha256(ahost), h2, "idempotent arm64 patch preserves bytes")
+
+    # full restore -> arm64 slice stock again
+    cmd("restore", ahost, sigs, env=ENV_ARM)
+    A.eq(nib(ahost, aarm_jg), 0x0C, "restore recovers arm64 stock (GT)")
 
     # refuse to overwrite unrelated modifications
     cmd("patch", target, sigs)

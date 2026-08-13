@@ -18,16 +18,11 @@
 #
 # ARCHITECTURE: the framework is a universal (fat) Mach-O, but only ONE slice
 # ever executes - the one matching this Mac's CPU. The script detects the host
-# CPU (Apple Silicon vs Intel) and by DEFAULT patches only that slice; touching
-# the other slice would edit code that never runs. --arm64 forces the arm64
-# slice into scope on any host (e.g. an Intel box preparing a build for ASi).
-#
-# EXPERIMENTAL arm64: macOS publishes no symbols, so the arm64 table is derived
-# structurally and is NOT yet runtime-verified. On an Apple Silicon host the
-# arm64 slice is the one that runs, so it is patched by default but behind a
-# one-time interactive confirmation (pre-authorized by --arm64 or --yes; a
-# --quiet run without --arm64 declines it). It declines rather than guesses on
-# any layout mismatch.
+# CPU (Apple Silicon vs Intel) and patches only that slice; touching the other
+# slice would edit code that never runs. Both slices' gate tables are
+# symbol-verified against Google's official dSYMs, so arm64 and x86_64 are
+# patched the same way, with no extra confirmation. It declines rather than
+# guesses on any layout mismatch.
 #
 # CODE SIGNING: any byte edit invalidates the Mach-O signature; on Apple Silicon
 # an invalid/absent signature is killed on launch. After flipping bytes this
@@ -40,10 +35,10 @@
 # only flip the direction of an existing branch to its EXISTING target.
 #
 # Usage:
-#   bash chrome-mv2-mac.sh [patch|restore|check] [path] [--arm64] [--yes] [--quiet]
+#   bash chrome-mv2-mac.sh [patch|restore|check] [path] [--yes] [--quiet]
 #
-# By default the slice matching this Mac's CPU is patched. On Apple Silicon that
-# is the (experimental) arm64 slice, confirmed interactively unless --arm64/--yes.
+# By default the slice matching this Mac's CPU is patched (arm64 on Apple
+# Silicon, x86_64 on Intel).
 #
 # Requirements: bash 3.2+ (stock macOS), python3 ONLY for --signatures JSON,
 #   codesign (at /usr/bin/codesign, built into macOS - no Xcode CLT needed) for
@@ -88,6 +83,20 @@ S|ManifestV2Handler::IsExtensionAffected|bcond|0x0642852C|4|1|1F090071CC01005429
 S|ManifestV2Handler::ShouldBlockExtensionInstallation|bcond|0x06428570|4|1|3F0800716C0100545F040071A10000547F14007164184A7AE0079F1AC0035FD6
 S|ManifestV2Handler::MaybeReEnableExtension|bcond|0x064286A8|4|1|1F090071AC010054691641F9283140B96A224839CA000037296940B93F050071
 S|StandardManagementPolicyProvider::UserMayInstall|bcond|0x06DB8584|4|1|5F090071EC000054293140B91F050071210F00543F15007124194A7AC1060054
+E
+M|152-macos-x64|macho-x64
+S|StandardManagementPolicyProvider::MustRemainDisabled|short|0x01BA0A91|4|1|837E50027F6F498B8E280200008B41304180BE080200000075
+S|ManifestV2Handler::OnExtensionSystemReady|short|0x0312B1FA|4|1|837950027F2D488B91280200008B423080B90802000000750C
+S|ManifestV2Handler::IsExtensionAffected|short|0x048BB6E4|4|1|837E50027F2F554889E5488B8E280200008B413080BE080200
+S|ManifestV2Handler::ShouldBlockExtensionInstallation|short|0x075489B8|4|1|837B50027F30488B8B280200008B413080BB08020000007508
+S|ManifestV2Handler::ShouldBlockExtensionInstallation (2)|short|0x07548BB9|3|1|83FF027F1D83FE087718B90A0100000FA3F1730E83FA050F95
+S|StandardManagementPolicyProvider::UserMayInstall|near|0x07F56A10|4|1|837B50020F8FB7000000488B8B280200008B413080BB080200000075
+E
+M|152-macos-arm64|macho-arm64
+S|StandardManagementPolicyProvider::MustRemainDisabled|bcond|0x02218740|4|1|1F090071EC040054891641F9283140B98A2248398A000037296940B93F050071
+S|ManifestV2Handler::OnExtensionSystemReady|bcond|0x0320635C|4|1|1F090071AC0100542A1541F9483140B929214839C9000037496940B93F050071
+S|ManifestV2Handler::IsExtensionAffected|bcond|0x03FFBD84|4|1|1F090071CC010054291441F9283140B92A204839CA000037296940B93F050071
+S|ManifestV2Handler::ShouldBlockExtensionInstallation / StandardManagementPolicyProvider::UserMayInstall (shared body)|bcond|0x066F0E38|4|2|1F090071AC010054691641F9283140B96A224839CA000037296940B93F050071
 E
 '
 
@@ -931,7 +940,6 @@ quit_chrome() {
 # ============================================================================
 WORK_FILE=""
 QUIET=false
-ALLOW_ARM64=false
 
 # The Mach-O container matching this Mac's CPU - the ONLY slice that executes.
 # Detection order: an explicit test override, then the hardware bit (correct even
@@ -961,21 +969,17 @@ host_arch_label() {
 }
 
 # Should this slice be patched? Sets SKIP_REASON on decline. Uses BEST_* (already
-# probed) and HOST_CONTAINER. By default only the host slice is eligible; --arm64
-# forces the arm64 slice on any host. $1=container $2=allow_partial
+# probed) and HOST_CONTAINER: only the slice matching this Mac's CPU is eligible
+# (patching the other slice would edit code that never runs here). $1=container
+# $2=allow_partial
 slice_decision() {
     local container="$1" allow_partial="$2"
     SKIP_REASON=""
     if (( BEST_SATISFIED == 0 )); then SKIP_REASON="no known layout matched"; return 1; fi
     if ! $BEST_FULL && (( BEST_TIES > 1 )); then SKIP_REASON="ambiguous (${BEST_TIES} milestones tied)"; return 1; fi
-    if [[ "$container" == "macho-arm64" ]]; then
-        if [[ "$HOST_CONTAINER" != "macho-arm64" ]] && ! $ALLOW_ARM64; then
-            SKIP_REASON="the arm64 slice does not run on this $(host_arch_label) Mac; pass --arm64 to patch it anyway"; return 1
-        fi
-    else  # macho-x64
-        if [[ "$HOST_CONTAINER" != "macho-x64" ]]; then
-            SKIP_REASON="the x86_64 slice does not run on this $(host_arch_label) Mac"; return 1
-        fi
+    if [[ "$HOST_CONTAINER" != "$container" ]]; then
+        local label="${container#macho-}"; [[ "$label" == "x64" ]] && label="x86_64"
+        SKIP_REASON="the ${label} slice does not run on this $(host_arch_label) Mac"; return 1
     fi
     if ! $BEST_FULL && ! $allow_partial; then
         SKIP_REASON="only ${BEST_SATISFIED}/${BEST_TOTAL} sites; needs --allow-partial"; return 1
@@ -1044,20 +1048,6 @@ do_restore() {
     return 0
 }
 
-# Confirm the experimental arm64 slice when it is in scope only because it is the
-# host slice (i.e. NOT forced with --arm64). Returns 0 to proceed, 1 to skip.
-# --arm64 or --yes pre-authorize (no prompt); --quiet without --arm64 declines.
-# $1 = assume_yes ("true"/"false").
-confirm_experimental_arm64() {
-    local assume_yes="$1"
-    if $ALLOW_ARM64; then return 0; fi
-    if $assume_yes; then return 0; fi
-    if $QUIET; then return 1; fi
-    echo -n "${C_BOLD}The arm64 slice is EXPERIMENTAL and runtime-unverified. Patch it? [y/N]: ${C_RESET}"
-    local line; read -r line || return 1
-    case "$line" in y|Y) return 0 ;; *) return 1 ;; esac
-}
-
 do_patch() {
     local target="$1" app_path="$2" assume_yes="$3" allow_partial="$4"
     local size; size=$(file_size "$target")
@@ -1073,16 +1063,8 @@ do_patch() {
         local c="${SLICE_CONTAINER[$idx]}"
         probe_slice "$idx" "$target"
         if slice_decision "$c" "$allow_partial"; then
-            if [[ "$c" == "macho-arm64" ]] && ! $ALLOW_ARM64; then
-                # In scope because it is the host slice - confirm the experimental patch.
-                if ! confirm_experimental_arm64 "$assume_yes"; then
-                    warnf "  ${c}: skipped (experimental arm64 patch not confirmed; pass --arm64 to force)."
-                    continue
-                fi
-            fi
             to_patch+=("$idx"); ic+=("$c"); any=true
             infof "  ${c}: will patch (Chrome ${BEST_MS_NAME}, ${BEST_SATISFIED}/${BEST_TOTAL} sites)."
-            [[ "$c" == "macho-arm64" ]] && warnf "  ${c}: EXPERIMENTAL, runtime-unverified - test the launched app."
         else
             warnf "  ${c}: skipped (${SKIP_REASON})."
             [[ "$c" == "macho-x64" ]] && default_declined=true
@@ -1158,9 +1140,6 @@ do_patch() {
     rule
     successf "Manifest V2 re-enabled for: ${ic[*]}"
     [[ -n "$app_path" ]] && echo "          Relaunch Chrome. Revert with: bash $0 restore \"$app_path\""
-    for k in "${to_patch[@]}"; do
-        [[ "${SLICE_CONTAINER[$k]}" == "macho-arm64" ]] && echo "          NOTE: the arm64 slice is experimental - confirm MV2 works and report back."
-    done
     rule
     return 0
 }
@@ -1207,11 +1186,7 @@ Arguments:
                          Mach-O file. If omitted, installed apps are listed.
 
 Options:
-      --arm64            Force the arm64 slice on any host (EXPERIMENTAL,
-                         unverified). Also skips the arm64 confirmation on an
-                         Apple Silicon Mac, where arm64 is the default slice.
-  -y, --yes              Quit a running Chrome, and confirm the experimental
-                         arm64 patch, without asking.
+  -y, --yes              Quit a running Chrome without asking.
   -q, --quiet            Do not prompt (for scripting).
       --allow-partial    Developer override: write an incomplete milestone.
       --force-restore    Restore a backup from a different Chrome build.
@@ -1239,11 +1214,10 @@ trap cleanup EXIT
 main() {
     init_colors
     local cmd="patch" target_path="" assume_yes=false allow_partial=false force_restore=false
-    QUIET=false; ALLOW_ARM64=false
+    QUIET=false
     local positional=()
     while (( $# > 0 )); do
         case "$1" in
-            --arm64) ALLOW_ARM64=true ;;
             --yes|-y) assume_yes=true ;;
             --quiet|-q) QUIET=true ;;
             --allow-partial) allow_partial=true ;;

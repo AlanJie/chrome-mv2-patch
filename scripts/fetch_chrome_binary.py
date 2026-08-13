@@ -6,6 +6,7 @@ carries the inlined `IsExtensionAffected` gates --
 
     Windows x64    chrome.dll   (PE32+, container "pe")
     Windows x86    chrome.dll   (PE32,  container "pe32")
+    Windows arm64  chrome.dll   (PE32+, container "pe-arm64")
     Linux  x86-64  chrome       (ELF,   container "elf")
     macOS  x86-64  Google Chrome Framework  (Mach-O, container "macho-x64")
     macOS  arm64   Google Chrome Framework  (Mach-O, container "macho-arm64")
@@ -14,6 +15,13 @@ macOS has no consumer offline installer we can unwrap off-Mac (it ships a `.dmg`
 so the mac platforms always fetch the per-arch Chrome for Testing zip -- a plain
 zip 7-Zip opens trivially. CfT is UNBRANDED, so a mac table derived from it must
 be re-verified against a real `Google Chrome.app` install (the macOS CI does this).
+
+Windows on ARM (win-arm64) has no Chrome for Testing build, so it cannot pin an
+old version via CfT. Its current stable/beta build is fetched from the arm64
+enterprise MSI (`googlechromestandaloneenterprise_arm64.msi`, a stable
+non-versioned URL); to pin an older build pass `--url` (the per-build
+dl.google.com/release2 installer), or hand-copy an arm64 chrome.dll. The unwrap
+chain is otherwise identical to win64's MSI path.
 
 Google publishes offline installers only for each channel's CURRENT build, so
 that is what this fetches by default -- the same consumer binary the patcher
@@ -30,6 +38,7 @@ The binary is unwrapped out of the installer and dropped in `_scratch/`
     python scripts/fetch_chrome_binary.py --platform win       # 32-bit chrome.dll
     python scripts/fetch_chrome_binary.py --platform mac-arm64 # Apple Silicon framework
     python scripts/fetch_chrome_binary.py --platform mac-x64   # Intel framework
+    python scripts/fetch_chrome_binary.py --platform win-arm64          # arm64 enterprise MSI
     python scripts/fetch_chrome_binary.py --channel beta
     python scripts/fetch_chrome_binary.py --version 152.0.7977.30
     python scripts/fetch_chrome_binary.py --list               # just print current versions
@@ -57,15 +66,23 @@ DEFAULT_OUT = REPO / "_scratch"
 
 CHANNELS = ("stable", "beta")
 
-# The three patcher targets, keyed by the --platform value. Each carries the
+# The patcher targets, keyed by the --platform value. Each carries the
 # VersionHistory API platform id, the container tag derive_milestone.py stamps,
 # the gate binary's filename, and how to recognise the right one on disk:
-#   PE optional-header magic 0x20B (PE32+) / 0x10B (PE32) tells x64 from x86,
-#   so a 32-bit fetch never grabs a stray 64-bit dll and vice-versa. The Linux
-#   ELF is matched by class byte (2 == 64-bit) instead.
+#   PE optional-header magic 0x20B (PE32+) / 0x10B (PE32) tells x64/arm64 from
+#   x86, and the "machine" field (0x8664 x64 vs 0xAA64 arm64) then splits the two
+#   PE32+ builds so a win64 fetch never grabs the arm64 dll and vice-versa. The
+#   Linux ELF is matched by class byte (2 == 64-bit) instead.
 PLATFORMS = {
-    "win64":     {"api": "win64", "container": "pe",   "binary": "chrome.dll", "pe_magic": 0x20B, "tag": "win64",   "suffix": ".dll", "cft": "win64"},
+    "win64":     {"api": "win64", "container": "pe",   "binary": "chrome.dll", "pe_magic": 0x20B, "machine": 0x8664, "tag": "win64",   "suffix": ".dll", "cft": "win64"},
     "win":       {"api": "win",   "container": "pe32", "binary": "chrome.dll", "pe_magic": 0x10B, "tag": "win32",   "suffix": ".dll", "cft": "win32"},
+    # Windows on ARM: native arm64 chrome.dll (PE32+, machine 0xAA64), same
+    # bcond flip as macOS arm64. Chrome for Testing has no win-arm64 build, so
+    # there is no CfT --version fallback; the stable/beta arm64 *enterprise MSI*
+    # (INSTALLERS below) is a stable non-versioned URL for the current build.
+    # Pin an older build with --url (a per-build dl.google.com/release2 installer),
+    # or hand-copy an arm64 chrome.dll.
+    "win-arm64": {"api": "win_arm64", "container": "pe-arm64", "binary": "chrome.dll", "pe_magic": 0x20B, "machine": 0xAA64, "tag": "win-arm64", "suffix": ".dll"},
     "linux":     {"api": "linux", "container": "elf",  "binary": "chrome",     "pe_magic": None,  "tag": "linux64", "suffix": "",     "cft": "linux64"},
     # macOS: CfT-only. The gate binary is the framework Mach-O inside the .app;
     # matched brand-agnostically by a "framework" name + the slice's cputype.
@@ -75,18 +92,21 @@ PLATFORMS = {
 
 # The channel's CURRENT-build offline installers. These URLs always serve the
 # version the API reports for the channel, so no version appears in the link.
-# Windows stable ships a self-extracting EXE; Windows beta only an enterprise
-# MSI; Linux both channels a .deb -- all three carry the full Chrome-bin.
+# Windows x64/x86 stable ship a self-extracting EXE; Windows beta and all
+# Windows arm64 builds ship an enterprise MSI (no consumer arm64 standalone EXE
+# exists); Linux both channels a .deb -- all carry the full Chrome-bin.
 INSTALLERS = {
     "stable": {
-        "win64": "https://dl.google.com/chrome/install/standalonesetup64.exe",
-        "win":   "https://dl.google.com/chrome/install/standalonesetup.exe",
-        "linux": "https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb",
+        "win64":     "https://dl.google.com/chrome/install/standalonesetup64.exe",
+        "win":       "https://dl.google.com/chrome/install/standalonesetup.exe",
+        "win-arm64": "https://dl.google.com/dl/chrome/install/googlechromestandaloneenterprise_arm64.msi",
+        "linux":     "https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb",
     },
     "beta": {
-        "win64": "https://dl.google.com/tag/s/dl/chrome/install/beta/googlechromebetastandaloneenterprise64.msi",
-        "win":   "https://dl.google.com/tag/s/dl/chrome/install/beta/googlechromebetastandaloneenterprise.msi",
-        "linux": "https://dl.google.com/linux/direct/google-chrome-beta_current_amd64.deb",
+        "win64":     "https://dl.google.com/tag/s/dl/chrome/install/beta/googlechromebetastandaloneenterprise64.msi",
+        "win":       "https://dl.google.com/tag/s/dl/chrome/install/beta/googlechromebetastandaloneenterprise.msi",
+        "win-arm64": "https://dl.google.com/tag/s/dl/chrome/install/beta/googlechromebetastandaloneenterprise_arm64.msi",
+        "linux":     "https://dl.google.com/linux/direct/google-chrome-beta_current_amd64.deb",
     },
 }
 
@@ -359,6 +379,23 @@ def _pe_optional_magic(path):
         return None
 
 
+def _pe_machine(path):
+    """PE COFF machine field (0x8664 x64 / 0xAA64 arm64 / 0x14C x86), or None.
+    Splits the two PE32+ builds (x64 vs arm64) that share optional-header magic."""
+    try:
+        with open(path, "rb") as handle:
+            head = handle.read(0x40)
+            if head[:2] != b"MZ" or len(head) < 0x40:
+                return None
+            e_lfanew = struct.unpack_from("<I", head, 0x3C)[0]
+            handle.seek(e_lfanew)
+            if handle.read(4) != b"PE\x00\x00":
+                return None
+            return struct.unpack("<H", handle.read(2))[0]
+    except (OSError, struct.error):
+        return None
+
+
 def _is_elf64(path):
     try:
         with open(path, "rb") as handle:
@@ -405,6 +442,10 @@ def locate_binary(root, spec):
                 if _is_elf64(path):
                     matches.append(path)
             elif _pe_optional_magic(path) == spec["pe_magic"]:
+                # PE32+ x64 and arm64 share magic 0x20B; the machine field (when
+                # the spec pins one) is what tells the arm64 dll from the x64 one.
+                if spec.get("machine") and _pe_machine(path) != spec["machine"]:
+                    continue
                 matches.append(path)
     return max(matches, key=os.path.getsize) if matches else None
 
@@ -418,7 +459,7 @@ def list_current():
         print(f"{key:<10} {spec['container']:<10} {cells[0]:<18} {cells[1]:<18}")
 
 
-def fetch(platform, channel, version, out_dir, keep):
+def fetch(platform, channel, version, out_dir, keep, url_override=None):
     spec = PLATFORMS[platform]
     seven_zip = find_seven_zip()
     if not seven_zip:
@@ -429,9 +470,15 @@ def fetch(platform, channel, version, out_dir, keep):
     if latest:
         print(f"Current {channel} for {platform}: {latest}")
 
-    # Decide the source: the channel's live installer for the current build, or
-    # the Chrome for Testing archive for anything older -- and always CfT for mac.
-    if spec.get("cft_only"):
+    # Decide the source: an explicit --url (needed only to pin an OLD win-arm64
+    # build, which has no CfT fallback), the channel's live installer for the
+    # current build, or the Chrome for Testing archive for a pinned older version
+    # -- and always CfT for mac.
+    if url_override:
+        url = url_override
+        fetch_version = version or "custom"
+        source = "explicit --url"
+    elif spec.get("cft_only"):
         want = version or cft_current(spec["cft"], channel)
         if not want:
             print(f"error: could not determine a CfT {channel} version for {platform}.", file=sys.stderr)
@@ -445,6 +492,13 @@ def fetch(platform, channel, version, out_dir, keep):
         print(f"macOS via CfT: {want} -> {fetch_version}")
         print("  note: CfT is UNBRANDED; re-verify the derived table against a real Google Chrome.app.")
     elif version and version != latest:
+        if not spec.get("cft"):
+            # win-arm64 has no Chrome for Testing build to pin against.
+            print(f"error: --platform {platform} cannot pin --version (no Chrome for Testing arm64 "
+                  f"build). Fetch the current build without --version, or pass --url <installer> "
+                  f"(a per-build https://dl.google.com/release2/chrome/<hash>_<ver>/... installer).",
+                  file=sys.stderr)
+            return 1
         resolved = resolve_cft(version, spec["cft"])
         if not resolved:
             print(f"error: no Chrome for Testing build at or below {version} for {platform}.", file=sys.stderr)
@@ -530,6 +584,11 @@ def parse_args(argv=None):
              "Google no longer serves that build as an installer",
     )
     parser.add_argument(
+        "--url", metavar="INSTALLER_URL",
+        help="download this installer directly instead of resolving a source; "
+             "use it to pin an older win-arm64 build (which has no CfT fallback)",
+    )
+    parser.add_argument(
         "--out", metavar="DIR", default=str(DEFAULT_OUT),
         help="output directory (default: _scratch/)",
     )
@@ -556,7 +615,7 @@ def main(argv=None):
         list_current()
         return 0
     os.makedirs(args.out, exist_ok=True)
-    return fetch(args.platform, args.channel, args.version, args.out, args.keep)
+    return fetch(args.platform, args.channel, args.version, args.out, args.keep, args.url)
 
 
 if __name__ == "__main__":

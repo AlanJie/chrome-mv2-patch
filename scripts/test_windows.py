@@ -42,13 +42,13 @@ function Assert-Throws {
 }
 function New-TestPe {
     param([string]$Path, [byte[]]$Signature, [int]$SignatureOffset = 0x40,
-          [uint32]$TimeStamp = 0x12345678, [bool]$Signed = $true)
+          [uint32]$TimeStamp = 0x12345678, [bool]$Signed = $true, [uint16]$Machine = 0x8664)
     $buf = [byte[]]::new(0x800)
     $buf[0] = 0x4D; $buf[1] = 0x5A
     [Array]::Copy([BitConverter]::GetBytes([uint32]0x80), 0, $buf, 0x3C, 4)
     $nt = 0x80
     $buf[$nt] = 0x50; $buf[$nt + 1] = 0x45
-    [Array]::Copy([BitConverter]::GetBytes([uint16]0x8664), 0, $buf, $nt + 4, 2)
+    [Array]::Copy([BitConverter]::GetBytes([uint16]$Machine), 0, $buf, $nt + 4, 2)
     [Array]::Copy([BitConverter]::GetBytes([uint16]1), 0, $buf, $nt + 6, 2)
     [Array]::Copy([BitConverter]::GetBytes($TimeStamp), 0, $buf, $nt + 8, 4)
     [Array]::Copy([BitConverter]::GetBytes([uint16]0xF0), 0, $buf, $nt + 20, 2)
@@ -154,6 +154,48 @@ try {
     )
     $ambiguousResult = Invoke-PatchMilestones -Buf ([IO.File]::ReadAllBytes($pePath)) -Img $partialImg -Milestones $ambiguous -AllowPartial $true -Apply $true
     Assert-True ($ambiguousResult.Status -eq 0 -and $ambiguousResult.Reason -match 'tied') 'ambiguous partial layouts should be declined'
+
+    # --- Windows on ARM (pe-arm64 / bcond) -----------------------------------
+    # arm64 gate: cmp w,#2 ; b.gt ; nop ; cmp w,#1. The flip rewrites ONLY the
+    # B.cond condition GT(0xC)->AL(0xE) - one byte, imm19 preserved - the same
+    # code path as the macOS arm64 slice. Little-endian words:
+    #   7100091F cmp w,#2 | 5400008C b.gt | D503201F nop | 7100051F cmp w,#1
+    $armSig = [byte[]]@(0x1F,0x09,0x00,0x71, 0x8C,0x00,0x00,0x54, 0x1F,0x20,0x03,0xD5, 0x1F,0x05,0x00,0x71)
+    $armTarget = Join-Path $temp 'arm64 fixture.dll'
+    $armSigPath = Join-Path $temp 'arm64 signatures.json'
+    New-TestPe -Path $armTarget -Signature $armSig -Machine 0xAA64
+    $armImg = Open-Image ([IO.File]::ReadAllBytes($armTarget))
+    Assert-True ($armImg.Format -eq 'pe-arm64') 'arm64 PE (machine 0xAA64) must be tagged pe-arm64, not pe'
+
+    $armBuf = [IO.File]::ReadAllBytes($armTarget)
+    $astart = 0x440
+    Assert-True (Test-SigAt -Buf $armBuf -Start $astart -Sig $armSig -JgOff 4 -Kind 2) 'stock b.gt should match (bcond)'
+    $armBuf[$astart + 4] = 0x8E   # cond AL = already patched
+    Assert-True (Test-SigAt -Buf $armBuf -Start $astart -Sig $armSig -JgOff 4 -Kind 2) 'patched b.al should match (idempotent)'
+    Initialize-NativeHelpers
+    Assert-True ([Mv2Native]::SigMatchesAt($armBuf, $astart, $armSig, 4, 2)) 'compiled matcher accepts b.al'
+    $armBuf[$astart + 4] = 0x8D   # cond LE = inverted sense, must not match
+    Assert-True (-not (Test-SigAt -Buf $armBuf -Start $astart -Sig $armSig -JgOff 4 -Kind 2)) 'b.le condition must not match'
+    Assert-True (-not [Mv2Native]::SigMatchesAt($armBuf, $astart, $armSig, 4, 2)) 'compiled matcher rejects b.le'
+    $armBuf[$astart + 4] = 0x8C; $armBuf[$astart + 7] = 0x14   # opcode 0x14 = unconditional B, not B.cond
+    Assert-True (-not (Test-SigAt -Buf $armBuf -Start $astart -Sig $armSig -JgOff 4 -Kind 2)) 'non-B.cond opcode must not match'
+
+    Write-Signatures -Path $armSigPath -Milestones @(
+        @{ name='test-pe-arm64'; container='pe-arm64'; sites=@(
+            @{ name='gate'; kind='bcond'; jgRVA='0x00001044'; jgOff=4; expectedMatches=1; sig='1F0900718C0000541F2003D51F050071' }
+        ) }
+    )
+    $script:Signatures = $armSigPath
+    $armObj = [pscustomobject]@{ Path=$armTarget; Channel='Test'; Running=$false; Holders=0 }
+    Assert-True ((Invoke-Patch -Target $armObj -AssumeYes $true) -eq 0) 'arm64 synthetic PE patch should succeed'
+    Assert-True (([IO.File]::ReadAllBytes($armTarget))[0x444] -eq 0x8E) 'patch should flip b.gt (0x8C) -> b.al (0x8E)'
+    Assert-True (Test-Path -LiteralPath "$armTarget.bak") 'arm64 patch should create a backup'
+    $armHash = (Get-FileHash -LiteralPath $armTarget -Algorithm SHA256).Hash
+    Assert-True ((Invoke-Patch -Target $armObj -AssumeYes $true) -eq 0) 'idempotent arm64 re-patch should succeed'
+    Assert-True ((Get-FileHash -LiteralPath $armTarget -Algorithm SHA256).Hash -eq $armHash) 'idempotent arm64 re-patch should not rewrite different bytes'
+    Assert-True ((Invoke-Restore -Target $armObj -AssumeYes $true) -eq 0) 'arm64 restore should succeed'
+    Assert-True (([IO.File]::ReadAllBytes($armTarget))[0x444] -eq 0x8C) 'restore should recover the stock b.gt byte'
+    $script:Signatures = $sigPath
 
     Write-Host "PowerShell tests passed: $passed assertions"
 } finally {

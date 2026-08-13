@@ -68,5 +68,15 @@ m = n_matches(wrong, site["sig"], site["jgOff"])
 print(f"[5] LE-condition binary matches stock sig: {m} (expect 0)")
 ok &= m == 0
 
+# 6. The arm64 bcond finder is shared by macOS arm64 AND Windows-on-ARM (pe-arm64):
+#    find_gates_for must dispatch BOTH arm64 containers to find_gates_arm64, and
+#    the x86 containers to the jg finder. A pe-arm64 image finds the same gate.
+g_win = dm.find_gates_for(Img("pe-arm64", stock))
+print(f"[6] pe-arm64 dispatch -> arm64 finder: {len(g_win)} gate(s) kind={g_win[0][2] if g_win else None} (expect 1 bcond)")
+ok &= len(g_win) == 1 and g_win[0][2] == "bcond"
+g_x64 = dm.find_gates_for(Img("pe", stock))  # x64 jg finder must NOT match arm64 bytes
+print(f"[7] pe (x64) dispatch -> jg finder on arm64 bytes: {len(g_x64)} (expect 0)")
+ok &= len(g_x64) == 0
+
 print("ALL bcond SAFETY CHECKS:", "PASS" if ok else "FAIL")
 sys.exit(0 if ok else 1)

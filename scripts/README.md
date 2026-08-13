@@ -5,9 +5,11 @@ the Chrome MV2 gate signatures used by `../chrome-mv2.ps1`, `../chrome-mv2.sh`,
 and `../chrome-mv2-mac.sh`. The canonical editable table is `../signatures.json`.
 Works for any future Chrome version on x86, x86-64, and arm64:
 64-bit PE `chrome.dll` (container `pe`), 32-bit PE `chrome.dll` (container
-`pe32`), the ELF `chrome` on Linux (container `elf`), and the universal
-`Google Chrome Framework` Mach-O on macOS — its x86_64 slice (`macho-x64`) and
-arm64 slice (`macho-arm64`). Replaces the old single-build `port152/` workspace.
+`pe32`), 64-bit **arm64** PE `chrome.dll` on Windows-on-ARM (container
+`pe-arm64`, the same `bcond` flip as macOS arm64), the ELF `chrome` on Linux
+(container `elf`), and the universal `Google Chrome Framework` Mach-O on macOS —
+its x86_64 slice (`macho-x64`) and arm64 slice (`macho-arm64`).
+Replaces the old single-build `port152/` workspace.
 
 Full rationale: [`../mv2-reversing.md`](../mv2-reversing.md) §"Porting to a new version".
 
@@ -40,6 +42,11 @@ python scripts/derive_milestone.py <stock chrome.dll|chrome>  --verify
    gate binary in `_scratch/`:
    - Windows x64: `python scripts/fetch_chrome_binary.py --platform win64`
    - Windows x86: `python scripts/fetch_chrome_binary.py --platform win`
+   - Windows arm64: `python scripts/fetch_chrome_binary.py --platform win-arm64`
+     (fetches the current stable arm64 build from the arm64 enterprise MSI;
+     Chrome for Testing has no arm64 build, so pin an older build with
+     `--url <per-build installer>` rather than `--version`, or hand-copy an
+     arm64 `chrome.dll`.)
    - Linux:       `python scripts/fetch_chrome_binary.py --platform linux`
    - macOS Intel: `python scripts/fetch_chrome_binary.py --platform mac-x64`
    - macOS ARM:   `python scripts/fetch_chrome_binary.py --platform mac-arm64`
@@ -77,7 +84,7 @@ python scripts/derive_milestone.py <stock chrome.dll|chrome>  --verify
    A `matches>2` site needs a wider signature.
 4. **Add** the emitted entry to the `milestones` array in
    `../signatures.json`, then copy the platform entry into the matching embedded
-   table: `$EmbeddedSignatures` in `../chrome-mv2.ps1` for `pe`/`pe32`,
+   table: `$EmbeddedSignatures` in `../chrome-mv2.ps1` for `pe`/`pe32`/`pe-arm64`,
    `EMBEDDED_SIGNATURES` in `../chrome-mv2.sh` for `elf`, or the pre-tokenized
    `EMBEDDED_SIGNATURES` in `../chrome-mv2-mac.sh` for `macho-x64`/`macho-arm64`.
    The scripts use an explicit signature path first, then `signatures.json`
@@ -101,6 +108,16 @@ a 32-bit `chrome.dll`. `derive_milestone.py` tags it `container: "pe32"` (vs `pe
 for 64-bit), and `symbols_from_pdb.py` reads the PE32 `ImageBase`, so a 32-bit
 build only ever probes/verifies against `pe32` milestones. The shipped `151-x86`
 entry was derived this way from a 32-bit `chrome.dll` + its matching PDB.
+
+**Windows-on-ARM (arm64) Chrome** is handled the same way too, but its
+`chrome.dll` is a PE32+ like x64 — the COFF machine field (`0xAA64` arm64 vs
+`0x8664` x64) is what `derive_milestone.py` reads to tag `container: "pe-arm64"`,
+so arm64 and x64 never cross-probe. arm64 has no `cmp/jg`; the gate is
+`cmp w,#2 ; b.gt` and the flip rewrites only the `B.cond` condition GT→AL (kind
+`bcond`, byte-for-byte the same flip as the macOS arm64 slice — see
+mv2-reversing.md). The shipped `151-win-arm64` entry was derived from the
+consumer arm64 `chrome.dll` (fetched via `--url`) and symbol-verified against its
+PDB (`symbols_from_pdb.py` reads the PE32+ `ImageBase` regardless of machine).
 
 The masking and match-count rules mirror both runtime scripts:
 `Find-AffectedJgSites` / `Invoke-PatchMilestones` in `chrome-mv2.ps1` and

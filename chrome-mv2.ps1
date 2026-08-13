@@ -1,12 +1,13 @@
 <#
 .SYNOPSIS
     Google Chrome Manifest V2 Patcher - single-file, self-contained PowerShell
-    port for Windows (chrome.dll only).
+    port for Windows (chrome.dll only; x64, x86, and arm64).
 
 .DESCRIPTION
     Re-enables Manifest V2 extension support in Google Chrome by flipping the
     inlined IsExtensionAffected manifest-version checks. Same milestone engine,
-    same match/decline semantics, same .bak handling.
+    same match/decline semantics, same .bak handling. Handles x64/x86 (PE, PE32)
+    and Windows-on-ARM (PE32+ arm64, machine 0xAA64).
 
     Self-contained: the Windows signature tables are EMBEDDED in this file
     ($EmbeddedSignatures below), so the script needs no signatures.json and no
@@ -30,6 +31,8 @@
 
       JG_SHORT  0x7F disp8       -> 0xEB disp8        (jmp short, same disp8)
       JG_NEAR   0x0F 0x8F disp32 -> 0x90 0xE9 disp32  (nop ; jmp near, same disp32)
+      BCOND     arm64 b.gt (cond GT 0xC) -> b.al (cond AL 0xE), imm19 preserved
+                (the low nibble of the B.cond word's byte0; one byte changes)
 
     PERFORMANCE NOTE - why this file is shaped the way it is:
     chrome.dll is ~285 MB. A per-byte loop in PowerShell is ~1000x slower than a
@@ -113,7 +116,7 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$AppVersion      = '1.2.0'
+$AppVersion      = '1.3.0'
 $SignaturesFile  = 'signatures.json'
 $script:CsLoaded = $false
 
@@ -121,23 +124,26 @@ $script:CsLoaded = $false
 # signatures.json next to the script overrides this if present.
 #
 # Schema. Per milestone: name (label used in output), container ("pe" = PE32+/x64,
-# "pe32" = PE32/x86 - milestones whose container does not match the target are
-# skipped), sites[]. Per site:
+# "pe32" = PE32/x86, "pe-arm64" = PE32+/arm64 - milestones whose container does
+# not match the target are skipped), sites[]. Per site:
 #   name            label used in output
-#   kind            "short" (7F disp8) or "near" (0F 8F disp32)
-#   jgRVA           RVA of the jg opcode byte in the build this entry was derived
-#                   from - a shortcut to try first, NOT a requirement
-#   jgOff           index of that jg opcode byte within sig
+#   kind            "short" (7F disp8), "near" (0F 8F disp32), or "bcond"
+#                   (arm64 B.cond GT->AL, low nibble of the 4-byte branch word)
+#   jgRVA           RVA of the jg / b.cond opcode byte in the build this entry was
+#                   derived from - a shortcut to try first, NOT a requirement
+#   jgOff           index of that opcode byte within sig
 #   expectedMatches how many times sig must occur in .text; >1 means one shared
 #                   body the linker folded, and every copy gets flipped
-#   sig             hex bytes, jg opcode included at jgOff
+#   sig             hex bytes, jg / b.cond opcode included at jgOff
 $EmbeddedSignatures = @'
 {
   "milestones": [
     {"name":"151","container":"pe","sites":[{"name":"IsExtensionAffected","kind":"short","jgRVA":"0x083012E4","jgOff":4,"expectedMatches":1,"sig":"837A50027F34488B8A280200008B413080BA08020000007508"},{"name":"ShouldBlockExtensionInstallation","kind":"short","jgRVA":"0x08301323","jgOff":3,"expectedMatches":1,"sig":"83FA027F234183F80175114183F9050F95C14183F90A"},{"name":"ShouldBlockExtensionEnable","kind":"short","jgRVA":"0x03291F6B","jgOff":7,"expectedMatches":1,"sig":"8B41684183F8027F288B493083F801751683F9050F95C2"},{"name":"OnExtensionSystemReady startup loop","kind":"short","jgRVA":"0x01618C4C","jgOff":4,"expectedMatches":1,"sig":"837950027F2D488B91280200008B423080B90802000000750C"},{"name":"MaybeReEnableExtension","kind":"short","jgRVA":"0x08301436","jgOff":4,"expectedMatches":1,"sig":"837E50027F2D488B8E280200008B413080BE08020000007508"},{"name":"UserMayInstall (inlined)","kind":"short","jgRVA":"0x08E736BA","jgOff":6,"expectedMatches":1,"sig":"8B416883FA027F3B8B493083F8010F851A01000083F905742A"},{"name":"MustRemainDisabled (inlined)","kind":"short","jgRVA":"0x016448AA","jgOff":6,"expectedMatches":1,"sig":"8B416883FA027F788B493083F801756631FF83F905740583F9"}]},
     {"name":"152","container":"pe","sites":[{"name":"manifest_v2_util::IsExtensionAffected (free predicate; covers install thunk)","kind":"short","jgRVA":"0x082D26F5","jgOff":3,"expectedMatches":1,"sig":"83F9027F1F83FA08771AB90A0100000FA3D173104183F805"},{"name":"ShouldBlockExtensionEnable / IsExtensionAffected (shared body)","kind":"short","jgRVA":"0x03348754","jgOff":4,"expectedMatches":2,"sig":"837A50027F34488B8A280200008B413080BA080200000075"},{"name":"OnExtensionSystemReady startup loop","kind":"short","jgRVA":"0x0124109C","jgOff":4,"expectedMatches":1,"sig":"837950027F2D488B91280200008B423080B90802000000750C"},{"name":"MaybeReEnableExtension","kind":"short","jgRVA":"0x082D24D6","jgOff":4,"expectedMatches":1,"sig":"837E50027F2D488B8E280200008B413080BE08020000007508"},{"name":"UserMayInstall (inlined)","kind":"short","jgRVA":"0x08DDC241","jgOff":4,"expectedMatches":1,"sig":"837F50027F4E488B8F280200008B413080BF0802000000750C"},{"name":"MustRemainDisabled (inlined, near jg)","kind":"near","jgRVA":"0x015A8D31","jgOff":4,"expectedMatches":1,"sig":"837F50020F8F8B000000488B8F280200008B413080BF080200000075"}]},
     {"name":"151-x86","container":"pe32","sites":[{"name":"OnExtensionSystemReady startup loop","kind":"short","jgRVA":"0x00B20DB9","jgOff":4,"expectedMatches":1,"sig":"837928027F2C8B91640100008B421880B95401000000750C8B"},{"name":"MustRemainDisabled (inlined)","kind":"short","jgRVA":"0x0111E3EC","jgOff":3,"expectedMatches":1,"sig":"83FA027F728B491883F801756031DB83F905740583F90A752B"},{"name":"ShouldBlockExtensionEnable","kind":"short","jgRVA":"0x029E11BE","jgOff":3,"expectedMatches":1,"sig":"83FA027F2B8B491883F801751983F9050F95C283F90A0F95C0"},{"name":"IsExtensionAffected","kind":"short","jgRVA":"0x07022F9A","jgOff":4,"expectedMatches":1,"sig":"837A28027F368B8A640100008B411880BA540100000075088B"},{"name":"ShouldBlockExtensionInstallation","kind":"short","jgRVA":"0x07022FE7","jgOff":4,"expectedMatches":1,"sig":"837D08027F278B450C83F80175158B451083F8050F95C183F8"},{"name":"MaybeReEnableExtension","kind":"short","jgRVA":"0x0702310D","jgOff":4,"expectedMatches":1,"sig":"837E28027F248B8E640100008B411880BE540100000075088B"},{"name":"UserMayInstall (inlined)","kind":"short","jgRVA":"0x079D46E7","jgOff":3,"expectedMatches":1,"sig":"83FA027F338B491883F8010F85FD00000083F905742283F90A"}]},
-    {"name":"152-x86","container":"pe32","sites":[{"name":"manifest_v2_util::IsExtensionAffected (free predicate; covers install thunk)","kind":"short","jgRVA":"0x06FB7547","jgOff":4,"expectedMatches":1,"sig":"837D08027F278B4D0C31C083F908771FBA0A0100000FA3CA73"},{"name":"ShouldBlockExtensionEnable / IsExtensionAffected (shared body)","kind":"short","jgRVA":"0x0299ED6A","jgOff":4,"expectedMatches":2,"sig":"837A28027F368B8A640100008B411880BA540100000075088B"},{"name":"OnExtensionSystemReady startup loop","kind":"short","jgRVA":"0x00A580A6","jgOff":4,"expectedMatches":1,"sig":"837928027F2C8B91640100008B421880B95401000000750C8B"},{"name":"MaybeReEnableExtension","kind":"short","jgRVA":"0x06FB736D","jgOff":4,"expectedMatches":1,"sig":"837E28027F248B8E640100008B411880BE540100000075088B"},{"name":"UserMayInstall (inlined)","kind":"short","jgRVA":"0x0791012F","jgOff":4,"expectedMatches":1,"sig":"837F28027F458B8F640100008B411880BF5401000000750C8B"},{"name":"MustRemainDisabled (inlined, near jg)","kind":"near","jgRVA":"0x010851A8","jgOff":4,"expectedMatches":1,"sig":"837B28020F8F840000008B8B640100008B411880BB54010000007508"}]}
+    {"name":"152-x86","container":"pe32","sites":[{"name":"manifest_v2_util::IsExtensionAffected (free predicate; covers install thunk)","kind":"short","jgRVA":"0x06FB7547","jgOff":4,"expectedMatches":1,"sig":"837D08027F278B4D0C31C083F908771FBA0A0100000FA3CA73"},{"name":"ShouldBlockExtensionEnable / IsExtensionAffected (shared body)","kind":"short","jgRVA":"0x0299ED6A","jgOff":4,"expectedMatches":2,"sig":"837A28027F368B8A640100008B411880BA540100000075088B"},{"name":"OnExtensionSystemReady startup loop","kind":"short","jgRVA":"0x00A580A6","jgOff":4,"expectedMatches":1,"sig":"837928027F2C8B91640100008B421880B95401000000750C8B"},{"name":"MaybeReEnableExtension","kind":"short","jgRVA":"0x06FB736D","jgOff":4,"expectedMatches":1,"sig":"837E28027F248B8E640100008B411880BE540100000075088B"},{"name":"UserMayInstall (inlined)","kind":"short","jgRVA":"0x0791012F","jgOff":4,"expectedMatches":1,"sig":"837F28027F458B8F640100008B411880BF5401000000750C8B"},{"name":"MustRemainDisabled (inlined, near jg)","kind":"near","jgRVA":"0x010851A8","jgOff":4,"expectedMatches":1,"sig":"837B28020F8F840000008B8B640100008B411880BB54010000007508"}]},
+    {"name":"151-win-arm64","container":"pe-arm64","sites":[{"name":"ManifestV2Handler::OnExtensionSystemReady","kind":"bcond","jgRVA":"0x01058388","jgOff":4,"expectedMatches":1,"sig":"3F0900718C010054091541F90A214839283140B98A000037296940B93F050071"},{"name":"StandardManagementPolicyProvider::MustRemainDisabled","kind":"bcond","jgRVA":"0x0125352C","jgOff":4,"expectedMatches":1,"sig":"5F0900716C050054293140B91F050071810400543F150071F4031F2A60000054"},{"name":"ManifestV2Handler::ShouldBlockExtensionEnable","kind":"bcond","jgRVA":"0x02C0729C","jgOff":4,"expectedMatches":1,"sig":"5F090071CC010054293140B91F050071E10000543F15007124194A7AE0079F1A"},{"name":"MV2DeprecationImpactChecker::IsExtensionAffected","kind":"bcond","jgRVA":"0x02C07334","jgOff":4,"expectedMatches":1,"sig":"1F0900710C020054291441F92A204839283140B98A000037296940B93F050071"},{"name":"ManifestV2Handler::ShouldBlockExtensionInstallation","kind":"bcond","jgRVA":"0x07836B6C","jgOff":4,"expectedMatches":1,"sig":"3F0800716C0100545F040071A10000547F14007164184A7AE0079F1AC0035FD6"},{"name":"ManifestV2Handler::MaybeReEnableExtension","kind":"bcond","jgRVA":"0x07836C94","jgOff":4,"expectedMatches":1,"sig":"1F0900710C020054691641F96A224839283140B98A000037296940B93F050071"},{"name":"StandardManagementPolicyProvider::UserMayInstall","kind":"bcond","jgRVA":"0x082F94F8","jgOff":4,"expectedMatches":1,"sig":"5F090071EC010054293140B91F050071610700543F150071400100543F290071"}]},
+    {"name":"152-win-arm64","container":"pe-arm64","sites":[{"name":"ManifestV2Handler::OnExtensionSystemReady","kind":"bcond","jgRVA":"0x01014CBC","jgOff":4,"expectedMatches":1,"sig":"3F0900718C010054091541F90A214839283140B98A000037296940B93F050071"},{"name":"StandardManagementPolicyProvider::MustRemainDisabled / StandardManagementPolicyProvider::UserMayInstall (shared body)","kind":"bcond","jgRVA":"0x013591BC","jgOff":4,"expectedMatches":2,"sig":"1F090071EC050054891641F98A224839283140B98A000037296940B93F050071"},{"name":"ManifestV2Handler::ShouldBlockExtensionEnable / ManifestV2Handler::IsExtensionAffected (shared body)","kind":"bcond","jgRVA":"0x02C1FD9C","jgOff":4,"expectedMatches":2,"sig":"1F0900710C020054291441F92A204839283140B98A000037296940B93F050071"},{"name":"ManifestV2Handler::MaybeReEnableExtension","kind":"bcond","jgRVA":"0x07702AEC","jgOff":4,"expectedMatches":1,"sig":"1F0900710C020054691641F96A224839283140B98A000037296940B93F050071"}]}
   ]
 }
 '@
@@ -219,14 +225,26 @@ public static class Mv2Native
 {
     public const int KindShort = 0;
     public const int KindNear  = 1;
+    public const int KindBcond = 2;
 
     // Signature match at one position. Exact match on every byte
-    // except the jg opcode and its displacement, which are masked per encoding:
+    // except the jump opcode and its displacement, which are masked per encoding:
     //   short: [jgOff] in {7F,EB}; [jgOff+1] disp8 wild
     //   near : opcode pair is exactly {0F 8F,90 E9}; [jgOff+2..+5] wild
+    //   bcond: the 4-byte LE arm64 B.cond word at [jgOff] - opcode 0x54 + bit4=0
+    //          fixed, cond nibble in {0xC stock GT, 0xE patched AL}, imm19 wild
     public static bool SigMatchesAt(byte[] buf, long start, byte[] sig, int jgOff, int kind)
     {
         if (start < 0 || start + sig.Length > buf.LongLength) return false;
+        if (kind == KindBcond)
+        {
+            // Validate the whole branch word once (little-endian) before the byte loop.
+            long w0 = start + jgOff;
+            uint word = (uint)(buf[w0] | (buf[w0 + 1] << 8) | (buf[w0 + 2] << 16) | (buf[w0 + 3] << 24));
+            if ((word & 0xFF000010u) != 0x54000000u) return false;
+            uint cond = word & 0xFu;
+            if (cond != 0x0Cu && cond != 0x0Eu) return false;
+        }
         for (int k = 0; k < sig.Length; k++)
         {
             byte p = buf[start + k];
@@ -236,7 +254,7 @@ public static class Mv2Native
                 else if (k == jgOff + 1) { /* disp8 wildcard */ }
                 else if (p != sig[k])    { return false; }
             }
-            else
+            else if (kind == KindNear)
             {
                 if (k == jgOff)
                 {
@@ -246,6 +264,11 @@ public static class Mv2Native
                 else if (k == jgOff + 1)                   { /* pair checked above */ }
                 else if (k >= jgOff + 2 && k <= jgOff + 5) { /* disp32 wildcard */ }
                 else if (p != sig[k])                      { return false; }
+            }
+            else // KindBcond: the 4 branch-word bytes were validated above
+            {
+                if (k >= jgOff && k <= jgOff + 3) { /* branch word, wild imm19 */ }
+                else if (p != sig[k])            { return false; }
             }
         }
         return true;
@@ -407,14 +430,14 @@ function Import-Milestones {
         }
         if ($milestoneNames.ContainsKey($msName)) { throw "duplicate milestone name '$msName'" }
         $milestoneNames[$msName] = $true
-        if ($container -notin 'pe', 'pe32', 'elf', 'macho-x64', 'macho-arm64') {
+        if ($container -notin 'pe', 'pe32', 'pe-arm64', 'elf', 'macho-x64', 'macho-arm64') {
             throw "milestone $msName has unsupported container '$container'"
         }
-        # This script patches only Windows PE. A shared signatures.json may also
-        # carry the Linux (elf) and macOS (macho-x64/macho-arm64) tables, so skip
-        # any non-PE milestone rather than validate a kind this engine does not
-        # implement (the arm64 'bcond' flip lives in chrome-mv2-mac.sh).
-        if ($container -notin 'pe', 'pe32') { continue }
+        # This script patches only Windows PE (x64 'pe', x86 'pe32', arm64
+        # 'pe-arm64'). A shared signatures.json may also carry the Linux (elf) and
+        # macOS (macho-x64/macho-arm64) tables, so skip any non-PE milestone rather
+        # than validate a kind this engine does not implement.
+        if ($container -notin 'pe', 'pe32', 'pe-arm64') { continue }
         if ($null -eq $rm.sites -or @($rm.sites).Count -eq 0) {
             throw "milestone $msName contains no sites"
         }
@@ -431,7 +454,15 @@ function Import-Milestones {
             switch ($rs.kind) {
                 'short' { $kind = 0 }      # Mv2Native.KindShort
                 'near'  { $kind = 1 }      # Mv2Native.KindNear
+                'bcond' { $kind = 2 }      # Mv2Native.KindBcond (arm64 B.cond GT->AL)
                 default { throw "milestone $($rm.name) site '$($rs.name)': unknown kind '$($rs.kind)'" }
+            }
+            # A bcond site must sit in an arm64 PE; short/near are x86/x64 only.
+            if ($kind -eq 2 -and $container -ne 'pe-arm64') {
+                throw "milestone $msName site '$siteName': 'bcond' kind is only valid in a pe-arm64 milestone"
+            }
+            if ($kind -ne 2 -and $container -eq 'pe-arm64') {
+                throw "milestone $msName site '$siteName': pe-arm64 milestones use the 'bcond' kind, not '$($rs.kind)'"
             }
 
             $sigText = [string]$rs.sig
@@ -455,6 +486,17 @@ function Import-Milestones {
             }
             if ($kind -eq 1 -and $sig[$jgOff + 1] -ne 0x8F) {
                 throw ("milestone $msName site '$siteName': near jg second opcode is 0x{0:X2}, expected 0x8F" -f $sig[$jgOff + 1])
+            }
+            if ($kind -eq 2) {
+                if (($jgOff + 3) -ge $sig.Length) {
+                    throw "milestone $msName site '$siteName': bcond needs 4 bytes but sig ends early"
+                }
+                # Stock B.cond word (little-endian) must be a GT branch: 0x54.......C.
+                $w = [uint32]$sig[$jgOff] -bor ([uint32]$sig[$jgOff + 1] -shl 8) -bor `
+                     ([uint32]$sig[$jgOff + 2] -shl 16) -bor ([uint32]$sig[$jgOff + 3] -shl 24)
+                if (($w -band 0xFF00001F) -ne 0x5400000C) {
+                    throw ("milestone $msName site '$siteName': jgOff is not a stock b.gt (GT) B.cond word (0x{0:X8})" -f $w)
+                }
             }
             $expected = [int]$rs.expectedMatches
             if ($expected -lt 1) {
@@ -535,15 +577,21 @@ function Open-PeImage {
         throw "not a valid PE: .text raw data is out of bounds"
     }
 
+    # PE32+ carries both x64 (machine 0x8664) and Windows-on-ARM arm64 (0xAA64);
+    # the machine field splits them so an arm64 dll matches only pe-arm64
+    # milestones (the arm64 'bcond' flip) and never the x64 'pe' jg tables.
+    $machine = [BitConverter]::ToUInt16($Buf, $eLfanew + 4)
+    $format  = if ($is32) { 'pe32' } elseif ($machine -eq 0xAA64) { 'pe-arm64' } else { 'pe' }
+
     return [pscustomobject]@{
-        Format     = if ($is32) { 'pe32' } else { 'pe' }   # matches a milestone's "container"
+        Format     = $format                               # matches a milestone's "container"
         TextRVA    = $textRVA
         TextRaw    = $textRaw
         TextSize   = $textSize
         ChecksumAt = $optOff + 64                          # same offset in PE32 and PE32+
         SecDirAt   = $optOff + $fixedLen + 4 * 8           # data directory [4] = Security
         NtHeaderAt = [int64]$eLfanew
-        Machine    = [BitConverter]::ToUInt16($Buf, $eLfanew + 4)
+        Machine    = $machine
         TimeStamp  = [BitConverter]::ToUInt32($Buf, $eLfanew + 8)
         Is32       = $is32
     }
@@ -707,19 +755,31 @@ function Test-SigAt {
     param([byte[]]$Buf, [int64]$Start, [byte[]]$Sig, [int]$JgOff, [int]$Kind)
 
     if ($Start -lt 0 -or ($Start + $Sig.Length) -gt $Buf.LongLength) { return $false }
+    if ($Kind -eq 2) {
+        # arm64 B.cond word (little-endian) at JgOff: 0x54 opcode + bit4=0 fixed,
+        # cond nibble in {0xC stock GT, 0xE patched AL}, imm19 wild.
+        $w = [uint32]$Buf[$Start + $JgOff] -bor ([uint32]$Buf[$Start + $JgOff + 1] -shl 8) -bor `
+             ([uint32]$Buf[$Start + $JgOff + 2] -shl 16) -bor ([uint32]$Buf[$Start + $JgOff + 3] -shl 24)
+        if (($w -band 0xFF000010) -ne 0x54000000) { return $false }
+        $cond = $w -band 0xF
+        if ($cond -ne 0x0C -and $cond -ne 0x0E) { return $false }
+    }
     for ($k = 0; $k -lt $Sig.Length; $k++) {
         $p = $Buf[$Start + $k]
         if ($Kind -eq 0) {
             if     ($k -eq $JgOff)     { if ($p -ne 0x7F -and $p -ne 0xEB) { return $false } }
             elseif ($k -eq $JgOff + 1) { }                       # disp8 wildcard
             elseif ($p -ne $Sig[$k])   { return $false }
-        } else {
+        } elseif ($Kind -eq 1) {
             if ($k -eq $JgOff) {
                 $p1 = $Buf[$Start + $JgOff + 1]
                 if (-not (($p -eq 0x0F -and $p1 -eq 0x8F) -or ($p -eq 0x90 -and $p1 -eq 0xE9))) { return $false }
             }
             elseif ($k -eq $JgOff + 1) { }                         # pair checked above
             elseif ($k -ge $JgOff + 2 -and $k -le $JgOff + 5) { } # disp32 wildcard
+            elseif ($p -ne $Sig[$k])   { return $false }
+        } else {                                                   # bcond
+            if ($k -ge $JgOff -and $k -le $JgOff + 3) { }         # branch word validated above
             elseif ($p -ne $Sig[$k])   { return $false }
         }
     }
@@ -860,7 +920,7 @@ function Invoke-PatchMilestones {
             if ($Apply) { $Buf[$f.JgRaw] = 0xEB }          # jg -> jmp short
             $applied++; $res.Flips++
             $res.Written += [pscustomobject]@{ RVA = $jgRVA; Bytes = [byte[]]@(0xEB) }
-        } else {
+        } elseif ($f.Site.Kind -eq 1) {
             $o0 = $Buf[$f.JgRaw]; $o1 = $Buf[$f.JgRaw + 1]
             if ($o0 -eq 0x90 -and $o1 -eq 0xE9) {
                 Write-Host ("    [i] {0}: {1} jg->jmp at RVA 0x{2:X} already applied (no change)." -f $ms, $f.Site.Name, $jgRVA)
@@ -880,13 +940,37 @@ function Invoke-PatchMilestones {
             }
             $applied++; $res.Flips++
             $res.Written += [pscustomobject]@{ RVA = $jgRVA; Bytes = [byte[]]@(0x90, 0xE9) }
+        } else {
+            # bcond (arm64): the branch's cond nibble is the low nibble of byte0.
+            # Flip GT (0xC) -> AL (0xE); imm19 and everything else are preserved,
+            # so a valid branch to its existing target simply becomes unconditional.
+            $cur     = $Buf[$f.JgRaw]
+            $cond    = $cur -band 0x0F
+            $patched = [byte](($cur -band 0xF0) -bor 0x0E)
+            if ($cond -eq 0x0E) {
+                Write-Host ("    [i] {0}: {1} b.gt->b.al at RVA 0x{2:X} already applied (no change)." -f $ms, $f.Site.Name, $jgRVA)
+                $already++; $res.Already++
+                $res.Written += [pscustomobject]@{ RVA = $jgRVA; Bytes = [byte[]]@($patched) }
+                continue
+            }
+            if ($cond -ne 0x0C) {
+                Write-Host ("    {0} {1}: {2} unexpected b.cond 0x{3:X} at RVA 0x{4:X} (expected GT nibble 0xC) - skipping this site." -f `
+                    $script:TagWarn, $ms, $f.Site.Name, $cur, $jgRVA)
+                continue
+            }
+            $res.Stock++
+            if ($Apply) { $Buf[$f.JgRaw] = $patched }      # b.gt -> b.al (cond GT->AL)
+            $applied++; $res.Flips++
+            $res.Written += [pscustomobject]@{ RVA = $jgRVA; Bytes = [byte[]]@($patched) }
         }
 
         $suffix = if ($f.Relocated) { '  (RELOCATED - point-release layout)' } else { '' }
+        $verb = if ($f.Site.Kind -eq 2) { 'b.gt->b.al' } else { 'jg->jmp' }
         if ($Apply) {
-            Write-Host ("    {0} {1}: {2} jg->jmp at RVA 0x{3:X}{4}" -f $script:TagOK, $ms, $f.Site.Name, $jgRVA, $suffix)
+            Write-Host ("    {0} {1}: {2} {3} at RVA 0x{4:X}{5}" -f $script:TagOK, $ms, $f.Site.Name, $verb, $jgRVA, $suffix)
         } else {
-            Write-Host ("    {0} {1}: {2} stock jg at RVA 0x{3:X}{4}" -f $script:TagOK, $ms, $f.Site.Name, $jgRVA, $suffix)
+            $stockWord = if ($f.Site.Kind -eq 2) { 'stock b.gt' } else { 'stock jg' }
+            Write-Host ("    {0} {1}: {2} {3} at RVA 0x{4:X}{5}" -f $script:TagOK, $ms, $f.Site.Name, $stockWord, $jgRVA, $suffix)
         }
     }
     $res.Flips += $already   # count already-applied sites toward the flip total

@@ -227,8 +227,13 @@ def fetch_dsyms(data, out_dir, version):
     for container, arch, base, uuid in _macho_slices(data):
         out_path = Path(out_dir) / f"mac-{arch}-syms.txt"
         print(f"\n== {container} ({arch}), slice uuid {uuid} ==")
-        if _dsym_symbols(version, arch, uuid, str(out_path)):
-            ok = True
+        # A given version's dSYM lives under exactly one channel's path; try the
+        # usual channels in turn (stable is by far the common case, but a beta-only
+        # build -- e.g. a milestone still rolling to stable -- is under /beta/).
+        for channel in ("stable", "beta", "dev", "canary"):
+            if _dsym_symbols(version, arch, uuid, str(out_path), channel=channel):
+                ok = True
+                break
     return ok
 
 

@@ -43,7 +43,7 @@
 
 set -euo pipefail
 
-readonly APP_VERSION="1.2.0"
+readonly APP_VERSION="1.3.0"
 
 # ============================================================================
 # Embedded ELF signature tables (151-linux & 152-linux).

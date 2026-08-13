@@ -1,7 +1,9 @@
 """Cross-platform MV2 gate derivation and verification for the patch scripts.
 
 One tool, all containers and both x86 `jg` encodings:
-  - PE `chrome.dll` on Windows: 64-bit PE32+ (`pe`) and 32-bit PE32 (`pe32`)
+  - PE `chrome.dll` on Windows: 64-bit PE32+ x64 (`pe`), 32-bit PE32 x86 (`pe32`),
+    and 64-bit PE32+ arm64 (`pe-arm64`, the Windows-on-ARM native dll - same
+    `bcond` flip as macOS arm64 below)
   - ELF `chrome` on Linux (`elf`)
   - the universal "Google Chrome Framework" Mach-O on macOS: the x86_64 slice
     (`macho-x64`, reusing the x86 short/near `jg` flip) and the arm64 slice
@@ -51,7 +53,7 @@ DEFAULT_JSON = REPO / "signatures.json"
 # ---------------------------------------------------------------------------
 class Image:
     def __init__(self, container, text_virt, text_raw, text_size, data):
-        self.container = container      # "pe" | "pe32" | "elf" | "macho-x64" | "macho-arm64"
+        self.container = container      # "pe" | "pe32" | "pe-arm64" | "elf" | "macho-x64" | "macho-arm64"
         self.text_virt = text_virt
         self.text_raw = text_raw
         self.text_size = text_size
@@ -84,10 +86,17 @@ def parse_pe(data):
     magic = struct.unpack_from("<H", data, opt)[0]
     if magic not in (0x10B, 0x20B):
         raise ValueError("unsupported PE optional header magic 0x%X" % magic)
-    # PE32 (x86) and PE32+ (x64) share the same section-table format; only the
-    # gate machine code differs, so tag the container distinctly ("pe32" vs "pe")
-    # to keep 32- and 64-bit milestone tables from cross-probing.
-    container = "pe32" if magic == 0x10B else "pe"
+    machine = struct.unpack_from("<H", data, e_lfanew + 4)[0]
+    # PE32 (x86), PE32+ x64, and PE32+ arm64 share the same section-table format;
+    # only the gate machine code differs, so tag the container distinctly to keep
+    # the milestone tables from cross-probing. x64 (machine 0x8664) and arm64
+    # (0xAA64) are both PE32+ (magic 0x20B) - the machine field disambiguates them.
+    if magic == 0x10B:
+        container = "pe32"          # PE32, x86 cmp/jg
+    elif machine == 0xAA64:
+        container = "pe-arm64"      # PE32+, arm64 cmp/b.gt (same bcond flip as macOS arm64)
+    else:
+        container = "pe"            # PE32+, x64 cmp/jg
     sec_off = opt + size_opt
     for i in range(num_sections):
         b = sec_off + i * 40
@@ -462,7 +471,7 @@ def find_gates_arm64(img):
 
 def find_gates_for(img):
     """Dispatch to the arm64 or x86 finder by container."""
-    return find_gates_arm64(img) if img.container == "macho-arm64" else find_gates(img)
+    return find_gates_arm64(img) if img.container in ("macho-arm64", "pe-arm64") else find_gates(img)
 
 
 # Default signature window past the cmp, matching the shipping entries (24-32B).
@@ -573,9 +582,12 @@ def name_for(ranges, jg_rva):
 def milestone_name_for(base, img):
     """Mach-O slices get an arch-tagged milestone name (e.g. 151 -> 151-macos-arm64)
     so the two slices of a universal binary land in distinct, non-cross-probing
-    tables; PE/ELF keep the base name."""
+    tables; a Windows arm64 PE gets 151 -> 151-win-arm64 for the same reason; PE
+    x64/x86 and ELF keep the base name."""
     if img.container.startswith("macho-"):
         return f"{base}-macos-{img.container.split('-', 1)[1]}"
+    if img.container == "pe-arm64":
+        return f"{base}-win-arm64"
     return base
 
 
