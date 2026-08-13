@@ -26,9 +26,16 @@
 #
 # CODE SIGNING: any byte edit invalidates the Mach-O signature; on Apple Silicon
 # an invalid/absent signature is killed on launch. After flipping bytes this
-# script ad-hoc re-signs INSIDE-OUT (framework bundle, then the .app) preserving
-# entitlements, verifies the signature, and only then atomically replaces the
-# target. It uses /usr/bin/codesign, which ships with macOS (NOT the Xcode
+# script ad-hoc re-signs INSIDE-OUT, signing every nested bundle and Mach-O
+# INDIVIDUALLY (deepest first, the .app last) with
+# --preserve-metadata=entitlements,flags so each component keeps its own
+# entitlements - crucially the Renderer helper's com.apple.security.cs.allow-jit
+# (codesign --deep would strip it and crash renderers). Then it verifies and only
+# then atomically replaces the target. The .bak backup lives OUTSIDE the .app,
+# in the macOS-standard app-data dir keyed by the build UUID
+# ("[~]/Library/Application Support/chrome-mv2-patch/<uuid>/"); stray files inside
+# a signed bundle break its seal, and a Keystone update swaps the whole .app.
+# It uses /usr/bin/codesign, which ships with macOS (NOT the Xcode
 # Command Line Tools); a launchable result requires it, and its absence declines.
 #
 # CARDINAL RULE: never delete or blank a call and never invent control flow -
@@ -158,6 +165,17 @@ read_byte() { local h; h=$(od -A n -t x1 -j "$2" -N 1 "$1" | tr -d ' \n'); echo 
 
 file_size() { stat -f%z "$1" 2>/dev/null || stat -c%s "$1" 2>/dev/null; }
 file_sha256() { shasum -a 256 -- "$1" 2>/dev/null | awk '{print $1}' || sha256sum -- "$1" | awk '{print $1}'; }
+
+# True if $1 begins with a Mach-O (thin or fat) magic. Used to skip non-code
+# files when enumerating re-sign targets, so codesign is never handed a
+# data blob (which would fail and trigger a needless rollback).
+is_macho() {
+    local m; m=$(od -A n -t x1 -N 4 -- "$1" 2>/dev/null | tr -d ' \n')
+    case "$m" in
+        cffaedfe|cefaedfe|feedfacf|feedface|cafebabe|cafebabf|bebafeca|bfbafeca) return 0 ;;
+        *) return 1 ;;
+    esac
+}
 
 range_within_file() {
     local offset="$1" count="$2" size="$3"
@@ -719,8 +737,68 @@ classify_flip_states_slice() {
 # Identity + backup. Identity is keyed on the per-slice LC_UUIDs (stable across
 # the flip AND the ad-hoc re-sign); the whole-file sha256 is an integrity check
 # only. The backup is the ORIGINAL Google-signed framework file - re-signing is
-# lossy, so restore copies these exact bytes back (no re-sign needed).
+# lossy, so restore copies these exact bytes back.
+#
+# CRITICAL: the .bak (and its .meta) must NOT live inside the .app. Stray files
+# inside a signed bundle break its seal - codesign --sign chokes on them and
+# codesign --verify --strict rejects the app; and a Keystone auto-update swaps
+# the whole .app, wiping anything inside it. So for a real install the backup
+# lives in the macOS-standard app-data location, keyed by the framework's build
+# UUID (the host slice's LC_UUID - see identity_token):
+#     /Library/Application Support/chrome-mv2-patch/<uuid>/   (system app; root)
+#     ~/Library/Application Support/chrome-mv2-patch/<uuid>/  (unprivileged)
+# A loose offline Mach-O (no bundle to corrupt) keeps the plain "<file>.bak".
 # ============================================================================
+BACKUP_BRAND="chrome-mv2-patch"
+TARGET_TOKEN=""     # set by each command from the *target's* identity
+
+# Machine-wide Application Support when we can write it (the /Applications case
+# needs root anyway, and root can write /Library); otherwise the per-user one.
+# Deciding by writability keeps this correct for both a rooted system patch and
+# an unprivileged run against a user-writable copy.
+support_base() {
+    if [[ -w "/Library/Application Support" ]]; then printf '/Library/Application Support\n'
+    else printf '%s/Library/Application Support\n' "${HOME:-/tmp}"; fi
+}
+
+# 32 hex chars -> canonical 8-4-4-4-12 UUID (cosmetic; makes the dir readable).
+format_uuid() {
+    local h="$1"
+    if [[ ${#h} -eq 32 ]]; then
+        printf '%s-%s-%s-%s-%s\n' "${h:0:8}" "${h:8:4}" "${h:12:4}" "${h:16:4}" "${h:20:12}"
+    else printf '%s\n' "$h"; fi
+}
+
+# The backup key: the LC_UUID of the slice that runs on THIS Mac (the one we
+# patch), pulled from IDENTITY_UUIDS ("macho-x64:HEX,macho-arm64:HEX"). Falls
+# back to any slice, then to a hash of the whole identity. compute_identity()
+# for the target must have run first.
+identity_token() {
+    local pair uuid="" IFS=,
+    for pair in $IDENTITY_UUIDS; do
+        case "$pair" in "$HOST_CONTAINER":*) uuid="${pair#*:}"; break ;; esac
+    done
+    [[ -n "$uuid" ]] || uuid="${IDENTITY_UUIDS##*:}"
+    uuid=$(printf '%s' "$uuid" | tr -cd '0-9A-Fa-f')
+    if [[ -z "$uuid" ]]; then
+        uuid=$(printf '%s' "$IDENTITY_UUIDS" | { shasum -a 256 2>/dev/null || sha256sum; } | awk '{print $1}')
+        uuid="${uuid:0:32}"
+    fi
+    format_uuid "$uuid"
+}
+
+# Backup dir: Application Support/<brand>/<uuid> for a real .app; the target's
+# own dir for a loose offline Mach-O.
+backup_dir() {
+    if [[ -n "$APP_PATH" ]]; then printf '%s/%s/%s\n' "$(support_base)" "$BACKUP_BRAND" "$TARGET_TOKEN"
+    else printf '%s\n' "$(dirname "$TARGET_FILE")"; fi
+}
+# Full path of the framework .bak, keyed on the framework's basename.
+backup_path() {
+    if [[ -n "$APP_PATH" ]]; then printf '%s/%s.bak\n' "$(backup_dir)" "$(basename "$TARGET_FILE")"
+    else printf '%s.bak\n' "$TARGET_FILE"; fi
+}
+
 IDENTITY_UUIDS=""
 compute_identity() {
     # requires parse_macho() to have populated SLICE_* for $1
@@ -755,6 +833,7 @@ backup_meta_path() { printf '%s.meta\n' "$1"; }
 
 save_backup_snapshot() {
     local target="$1" backup="$2" source="$3" identity="$4"
+    mkdir -p -- "$(dirname "$backup")" || { errf "Could not create backup dir $(dirname "$backup")."; return 1; }
     local prev=""; [[ -f "$backup" ]] && prev=$(file_sha256 "$backup")
     write_target "$backup" "$source" "$prev" || return 1
     local meta size hash
@@ -791,32 +870,56 @@ validate_backup_snapshot() {
 # Code signing. Any edit invalidates the Mach-O signature; on Apple Silicon the
 # kernel refuses to launch an invalid/absent signature. A bare-Mach-O sign is
 # NOT enough (bundle seals go stale; library validation rejects an ad-hoc
-# framework under Google's Team-ID executable). So re-sign INSIDE-OUT and ad-hoc
-# (framework bundle, then the .app), preserving entitlements/flags, then verify.
+# framework loaded by Google's Team-ID executable, so EVERY loading component
+# must become ad-hoc too).
+#
+# We must NOT use `codesign --deep`: it re-signs nested code ad-hoc but DROPS
+# each component's entitlements, which strips the Renderer helper's
+# com.apple.security.cs.allow-jit (V8 then can't map JIT pages -> renderer
+# crashes). --preserve-metadata on the OUTER app only preserves the outer app's
+# own entitlements, not the nested helpers'. So we walk the bundle INSIDE-OUT
+# and sign every nested bundle + Mach-O INDIVIDUALLY with
+# --preserve-metadata=entitlements,flags, which re-embeds that component's own
+# entitlements and keeps the hardened-runtime flag. `requirements` is dropped so
+# codesign regenerates an ad-hoc designated requirement (the preserved Google DR
+# can't be satisfied by an ad-hoc signature and would fail --verify --strict).
 # ============================================================================
 have_codesign() { command -v codesign >/dev/null 2>&1; }
 
+# Ad-hoc sign ONE component, preserving its own entitlements + flags. Components
+# with no embedded entitlements (most dylibs/loaders) fall back to a plain sign.
+resign_one() {
+    local comp="$1"
+    codesign --force --sign - --preserve-metadata=entitlements,flags "$comp" 2>/dev/null && return 0
+    codesign --force --sign - "$comp" 2>/dev/null && return 0
+    errf "codesign failed on: ${comp}"; return 1
+}
+
 resign_inside_out() {
-    local framework_bundle="$1" app_path="$2"
-    if [[ -z "$framework_bundle" || ! -d "$framework_bundle" ]]; then
-        errf "Framework bundle not found for re-signing: ${framework_bundle}"; return 1
+    local framework_bundle="$1" app_path="$2"   # framework_bundle kept for call-site compat
+    if [[ -z "$app_path" || ! -d "$app_path" ]]; then
+        errf "App bundle not found for re-signing: ${app_path}"; return 1
     fi
-    infof "Ad-hoc re-signing (inside-out): framework, then app ..."
-    # Framework first. --preserve-metadata keeps JIT entitlements (allow-jit,
-    # allow-unsigned-executable-memory) and the hardened-runtime flag; dropping
-    # them crashes V8/renderers.
-    if ! codesign --force --sign - --preserve-metadata=entitlements,flags,requirements "$framework_bundle" 2>/dev/null; then
-        # Some framework versions have no entitlements to preserve; retry plain.
-        codesign --force --sign - "$framework_bundle" || { errf "codesign failed on the framework bundle."; return 1; }
-    fi
-    if [[ -n "$app_path" && -d "$app_path" ]]; then
-        if ! codesign --force --sign - --preserve-metadata=entitlements,flags,requirements "$app_path" 2>/dev/null; then
-            # Fallback: whole-tree ad-hoc re-seal (deprecated --deep, but correct
-            # for making every nested component ad-hoc so library validation passes).
-            codesign --force --deep --sign - "$app_path" || { errf "codesign failed on the app bundle."; return 1; }
-        fi
-    fi
-    return 0
+    infof "Ad-hoc re-signing (inside-out, per-component entitlements preserved)..."
+    # Enumerate nested bundles (.app/.framework/.xpc) and candidate Mach-O files,
+    # each prefixed by its path-component count so a numeric sort puts the deepest
+    # (most nested) first - the inside-out order codesign requires.
+    local items=() line path rc=0
+    while IFS= read -r line; do items+=("$line"); done < <(
+        {
+            find "$app_path" -type d \( -name '*.app' -o -name '*.framework' -o -name '*.xpc' \) -print
+            find "$app_path" -type f \( -name '*.dylib' -o -name '*.so' \
+                 -o -path '*/MacOS/*' -o -path '*/Helpers/*' -o -path '*/Libraries/*' \) -print
+        } 2>/dev/null | awk -F/ '{ print NF"\t"$0 }' | sort -rn -k1,1
+    )
+    for line in "${items[@]}"; do
+        path="${line#*$'\t'}"
+        [[ "$path" == "$app_path" ]] && continue                 # outer app signed last
+        if [[ -f "$path" ]] && ! is_macho "$path"; then continue; fi   # skip data blobs
+        resign_one "$path" || rc=1
+    done
+    resign_one "$app_path" || rc=1                                 # top of the tree, last
+    return $rc
 }
 
 verify_signature() {
@@ -990,7 +1093,7 @@ slice_decision() {
 do_check() {
     local target="$1"
     parse_macho "$target" || return 1
-    compute_identity "$target"
+    compute_identity "$target"; TARGET_TOKEN=$(identity_token)
     okf "Mach-O identity (per-slice UUID): ${IDENTITY_UUIDS}"
     okf "Size=$(file_size "$target"), SHA-256=$(file_sha256 "$target")"
     local idx
@@ -1012,23 +1115,25 @@ do_check() {
             fi
         fi
     done
-    local backup="${target}.bak"
+    local backup; backup=$(backup_path)
     if [[ -f "$backup" ]]; then
         if validate_backup_snapshot "$backup"; then okf "Backup: verified (metadata=$(! $BACKUP_LEGACY && echo true || echo false))."
         else warnf "Backup: invalid."; fi
-    else infof "Backup: absent."; fi
+        infof "Backup path: ${backup}"
+    else infof "Backup: absent (would be ${backup})."; fi
     return 0
 }
 
 do_restore() {
     local target="$1" app_path="$2" assume_yes="$3" force_restore="$4"
-    local backup="${target}.bak"
     infof "Restore mode requested..."
+    parse_macho "$target" >/dev/null || return 1
+    compute_identity "$target"; local target_id="$IDENTITY_UUIDS"
+    TARGET_TOKEN=$(identity_token)                 # backup dir is keyed by this
+    local backup; backup=$(backup_path)
     [[ -f "$backup" ]] || { errf "Backup ${backup} does not exist."; return 1; }
     validate_backup_snapshot "$backup" || { errf "Backup or metadata failed validation."; return 1; }
 
-    parse_macho "$target" >/dev/null || return 1
-    compute_identity "$target"; local target_id="$IDENTITY_UUIDS"
     local target_hash; target_hash=$(file_sha256 "$target")
     if [[ "$target_id" != "$BACKUP_IDENTITY" ]] && ! $force_restore; then
         errf "Backup belongs to a different Chrome build; refusing to downgrade."
@@ -1039,10 +1144,10 @@ do_restore() {
     if [[ -n "$app_path" ]]; then quit_chrome "$app_path" "$assume_yes" || return 1; fi
     write_target "$target" "$backup" "$target_hash" || return 1
     if [[ "$(file_sha256 "$target")" != "$BACKUP_HASH" ]]; then errf "Post-restore SHA-256 mismatch."; return 1; fi
-    # The backup is Google's original signed binary, so no re-sign is needed; but
-    # the bundle seals were replaced during patch, so re-establish them cleanly.
+    # The framework bytes are Google's original, but the bundle seals were
+    # replaced during patch, so re-establish them cleanly (ad-hoc, inside-out).
     if [[ -n "$app_path" ]] && have_codesign; then
-        resign_inside_out "$FRAMEWORK_BUNDLE" "$app_path" || warnf "Re-seal after restore failed; run: codesign --force --deep --sign - \"$app_path\""
+        resign_inside_out "$FRAMEWORK_BUNDLE" "$app_path" || warnf "Re-seal after restore failed; re-run: bash $0 restore \"$app_path\""
     fi
     successf "Original framework restored from backup."
     return 0
@@ -1055,6 +1160,7 @@ do_patch() {
     okf "Target: ${target} (${size} bytes)."
     parse_macho "$target" || return 1
     compute_identity "$target"; local target_id="$IDENTITY_UUIDS"
+    TARGET_TOKEN=$(identity_token)                 # backup dir is keyed by this
     local target_hash; target_hash=$(file_sha256 "$target")
 
     # Decide which slices we will patch (probe each against the live target).
@@ -1072,7 +1178,7 @@ do_patch() {
     done
     if ! $any; then errf "No slice matched a known, permitted MV2 layout; nothing was modified."; return 1; fi
 
-    local backup="${target}.bak"
+    local backup; backup=$(backup_path)
     if [[ ! -f "$backup" ]]; then
         infof "Creating initial backup: ${backup}"
         save_backup_snapshot "$target" "$backup" "$target" "$target_id" || return 1
@@ -1132,7 +1238,6 @@ do_patch() {
             errf "codesign not found at /usr/bin/codesign (unexpected - it ships with macOS)."
             echo "    The framework is patched but UNSIGNED and will not launch on Apple Silicon."
             echo "    Restore stock with:  bash $0 restore \"$app_path\""
-            echo "    or, once codesign is available:  codesign --force --deep --sign - \"$app_path\""
             return 1
         fi
     fi
