@@ -214,7 +214,7 @@ function Format-HexUpper {
 
 function Initialize-NativeHelpers {
     if ($script:CsLoaded) { return }
-    Write-Info 'Compiling native helpers (full .text scan / PE checksum)...'
+    Write-Info 'Getting ready...'
     $sw = [Diagnostics.Stopwatch]::StartNew()
 
     Add-Type -TypeDefinition @'
@@ -351,7 +351,7 @@ public static class Mv2Native
 '@
     $sw.Stop()
     $script:CsLoaded = $true
-    Write-Ok ('Native helpers ready ({0:N1} s).' -f $sw.Elapsed.TotalSeconds)
+    Write-Ok 'Ready.'
 }
 
 # ============================================================================
@@ -528,7 +528,7 @@ function Open-Image {
     param([byte[]]$Buf)
 
     if ($Buf.Length -ge 2 -and $Buf[0] -eq 0x4D -and $Buf[1] -eq 0x5A) { return Open-PeImage $Buf }
-    throw "unrecognized executable (not a PE 'MZ' - this tool patches chrome.dll only)"
+    throw "That doesn't look like a Chrome file (this tool only works on chrome.dll)."
 }
 
 # Validates a PE32 or PE32+ and records only bounds-checked
@@ -536,30 +536,30 @@ function Open-Image {
 function Open-PeImage {
     param([byte[]]$Buf)
 
-    if ($Buf.Length -lt 64) { throw "not a valid PE: file too small" }
+    if ($Buf.Length -lt 64) { throw "not a valid Chrome file: file too small" }
     $eLfanew = [BitConverter]::ToUInt32($Buf, 0x3C)
 
-    if (($eLfanew + 24) -gt $Buf.Length) { throw "not a valid PE: truncated NT headers" }
+    if (($eLfanew + 24) -gt $Buf.Length) { throw "not a valid Chrome file: truncated NT headers" }
     if ($Buf[$eLfanew] -ne 0x50 -or $Buf[$eLfanew+1] -ne 0x45 -or
-        $Buf[$eLfanew+2] -ne 0 -or $Buf[$eLfanew+3] -ne 0) { throw "not a valid PE: bad NT signature" }
+        $Buf[$eLfanew+2] -ne 0 -or $Buf[$eLfanew+3] -ne 0) { throw "not a valid Chrome file: bad NT signature" }
 
     $numSections  = [BitConverter]::ToUInt16($Buf, $eLfanew + 6)
     $sizeOfOptHdr = [BitConverter]::ToUInt16($Buf, $eLfanew + 20)
     $optOff       = [int64]$eLfanew + 24
-    if (($optOff + $sizeOfOptHdr) -gt $Buf.Length) { throw "not a valid PE: optional header out of bounds" }
+    if (($optOff + $sizeOfOptHdr) -gt $Buf.Length) { throw "not a valid Chrome file: optional header out of bounds" }
 
     $magic = [BitConverter]::ToUInt16($Buf, $optOff)
     switch ($magic) {
         0x20B   { $fixedLen = 112; $is32 = $false }   # PE32+ (x86-64)
         0x10B   { $fixedLen = 96;  $is32 = $true  }   # PE32  (x86)
-        default { throw ("not a valid PE: unsupported optional header magic 0x{0:X}" -f $magic) }
+        default { throw ("not a valid Chrome file: unsupported optional header magic 0x{0:X}" -f $magic) }
     }
     if ($sizeOfOptHdr -lt ($fixedLen + 5 * 8)) {
-        throw "not a valid PE: optional header too small for data directories"
+        throw "not a valid Chrome file: optional header too small for data directories"
     }
 
     $secOff = $optOff + $sizeOfOptHdr
-    if (($secOff + [int64]$numSections * 40) -gt $Buf.Length) { throw "not a valid PE: section table out of bounds" }
+    if (($secOff + [int64]$numSections * 40) -gt $Buf.Length) { throw "not a valid Chrome file: section table out of bounds" }
 
     $textRVA = 0; $textRaw = 0; $textSize = 0
     for ($i = 0; $i -lt $numSections; $i++) {
@@ -572,9 +572,9 @@ function Open-PeImage {
             break
         }
     }
-    if ($textSize -eq 0) { throw "could not locate .text section" }
+    if ($textSize -eq 0) { throw "not a valid Chrome file: missing code section" }
     if ([int64]$textRaw -lt 0 -or [int64]$textRaw + [int64]$textSize -gt $Buf.LongLength) {
-        throw "not a valid PE: .text raw data is out of bounds"
+        throw "not a valid Chrome file: .text raw data is out of bounds"
     }
 
     # PE32+ carries both x64 (machine 0x8664) and Windows-on-ARM arm64 (0xAA64);
@@ -614,14 +614,12 @@ function Complete-Image {
     $va = [BitConverter]::ToUInt32($Buf, $Img.SecDirAt)
     $sz = [BitConverter]::ToUInt32($Buf, $Img.SecDirAt + 4)
     if ($va -ne 0 -or $sz -ne 0) {
-        Write-Ok ('Clearing Security Directory (RVA: 0x{0:X}, Size: 0x{1:X})' -f $va, $sz)
         [Array]::Clear($Buf, $Img.SecDirAt, 8)
     }
 
     Initialize-NativeHelpers
     $sum = [Mv2Native]::PeChecksum($Buf, $Img.ChecksumAt)
     [Array]::Copy([BitConverter]::GetBytes([uint32]$sum), 0, $Buf, $Img.ChecksumAt, 4)
-    Write-Ok ('Recalculated PE CheckSum: 0x{0:X}' -f $sum)
 }
 
 function Get-ByteHash {
@@ -672,7 +670,7 @@ function Write-AtomicFile {
 
         $written = [IO.File]::ReadAllBytes($tmp)
         if ($written.LongLength -ne $Buf.LongLength -or (Get-ByteHash $written) -ne (Get-ByteHash $Buf)) {
-            throw "temporary-file verification failed for $TargetPath"
+            throw "Couldn't write to $TargetPath safely - nothing was changed."
         }
 
         if ($PreserveMetadataFrom -and (Test-Path -LiteralPath $PreserveMetadataFrom -PathType Leaf)) {
@@ -681,10 +679,10 @@ function Write-AtomicFile {
         }
 
         if ($ExpectedCurrentHash) {
-            if (-not (Test-Path -LiteralPath $full -PathType Leaf)) { throw 'target disappeared before replacement' }
+            if (-not (Test-Path -LiteralPath $full -PathType Leaf)) { throw 'The file went missing before we could update it.' }
             $now = (Get-FileHash -LiteralPath $full -Algorithm SHA256).Hash.ToLowerInvariant()
             if ($now -ne $ExpectedCurrentHash.ToLowerInvariant()) {
-                throw 'target changed after it was inspected; refusing to overwrite it'
+                throw 'Chrome changed while we were working - nothing was changed. Try again.'
             }
         }
 
@@ -712,7 +710,7 @@ function Remove-BackupFiles {
     foreach ($p in @($BackupPath, (Get-BackupMetadataPath $BackupPath))) {
         if (Test-Path -LiteralPath $p -PathType Leaf) {
             try { Remove-Item -LiteralPath $p -Force -ErrorAction Stop }
-            catch { Write-Warn "Could not remove backup file ${p}: $_" }
+            catch { Write-Warn "Couldn't delete a backup file: ${p}" }
         }
     }
 }
@@ -733,20 +731,20 @@ function Save-BackupSnapshot {
 function Read-ValidatedBackup {
     param([string]$BackupPath)
 
-    if (-not (Test-Path -LiteralPath $BackupPath -PathType Leaf)) { throw "backup does not exist: $BackupPath" }
+    if (-not (Test-Path -LiteralPath $BackupPath -PathType Leaf)) { throw "No backup found at: $BackupPath" }
     $buf = [IO.File]::ReadAllBytes($BackupPath)
-    if ($buf.Length -eq 0) { throw 'backup is empty' }
+    if ($buf.Length -eq 0) { throw 'The backup file is empty.' }
     $img = Open-Image $buf
     $identity = Get-PeIdentity -Buf $buf -Img $img
     $metaPath = Get-BackupMetadataPath $BackupPath
     $legacy = -not (Test-Path -LiteralPath $metaPath -PathType Leaf)
     if (-not $legacy) {
         try { $meta = Get-Content -LiteralPath $metaPath -Raw | ConvertFrom-Json }
-        catch { throw "invalid backup metadata ${metaPath}: $_" }
+        catch { throw "The backup's info file looks wrong: ${metaPath}" }
         if ([int]$meta.Schema -ne 1 -or $meta.Format -ne $identity.Format -or
             [uint16]$meta.Machine -ne $identity.Machine -or [uint32]$meta.TimeStamp -ne $identity.TimeStamp -or
             [int64]$meta.Length -ne $identity.Length -or ([string]$meta.SHA256).ToLowerInvariant() -ne $identity.SHA256) {
-            throw 'backup metadata/hash does not match the backup file'
+            throw "The backup doesn't match its saved info - it may be damaged."
         }
     }
     return [pscustomobject]@{ Buf = $buf; Img = $img; Identity = $identity; Legacy = $legacy }
@@ -895,18 +893,17 @@ function Invoke-PatchMilestones {
     $res.Full      = ($best.Satisfied -eq $best.Ms.Sites.Count)
 
     if (-not $res.Full -and $bestCount -gt 1) {
-        $res.Reason = "$bestCount milestones tied at $($best.Satisfied) located site(s); layout is ambiguous"
+        $res.Reason = "$bestCount possible Chrome versions tied - can't tell which one this is"
         Write-Warn $res.Reason
         return $res
     }
     if (-not $res.Full -and -not $AllowPartial) {
-        $res.Reason = "only $($res.Located)/$($res.Total) sites matched; partial writes require -AllowPartial"
+        $res.Reason = "only $($res.Located) of $($res.Total) changes matched; a partial patch needs -AllowPartial"
         Write-Warn $res.Reason
         return $res
     }
 
-    Write-Info ("Chrome {0} MV2 layout detected ({1}/{2} inlined IsExtensionAffected sites, {3} jg flip(s))." -f `
-        $best.Ms.Name, $res.Located, $res.Total, $best.Flips.Count)
+    Write-Info ("Found Chrome {0}. Applying {1} change(s)..." -f $best.Ms.Name, $best.Flips.Count)
 
     # Three cases per site: already flipped (counted, nothing written), stock jg
     # (flip it), anything else (left alone with a warning - never guess).
@@ -919,14 +916,13 @@ function Invoke-PatchMilestones {
         if ($f.Site.Kind -eq 0) {
             $cur = $Buf[$f.JgRaw]
             if ($cur -eq 0xEB) {
-                Write-Host ("    [i] {0}: {1} jg->jmp at RVA 0x{2:X} already applied (no change)." -f $ms, $f.Site.Name, $jgRVA)
+                Write-Host '    [i] One change was already applied.'
                 $already++; $res.Already++
                 $res.Written += [pscustomobject]@{ RVA = $jgRVA; Bytes = [byte[]]@(0xEB) }
                 continue
             }
             if ($cur -ne 0x7F) {
-                Write-Host ("    {0} {1}: {2} unexpected byte 0x{3:X} at RVA 0x{4:X} (expected 0x7F) - skipping this site." -f `
-                    $script:TagWarn, $ms, $f.Site.Name, $cur, $jgRVA)
+                Write-Host ("    {0} Skipped one change - it didn't look the way we expected." -f $script:TagWarn)
                 continue
             }
             $res.Stock++
@@ -936,14 +932,13 @@ function Invoke-PatchMilestones {
         } elseif ($f.Site.Kind -eq 1) {
             $o0 = $Buf[$f.JgRaw]; $o1 = $Buf[$f.JgRaw + 1]
             if ($o0 -eq 0x90 -and $o1 -eq 0xE9) {
-                Write-Host ("    [i] {0}: {1} jg->jmp at RVA 0x{2:X} already applied (no change)." -f $ms, $f.Site.Name, $jgRVA)
+                Write-Host '    [i] One change was already applied.'
                 $already++; $res.Already++
                 $res.Written += [pscustomobject]@{ RVA = $jgRVA; Bytes = [byte[]]@(0x90, 0xE9) }
                 continue
             }
             if (-not ($o0 -eq 0x0F -and $o1 -eq 0x8F)) {
-                Write-Host ("    {0} {1}: {2} unexpected bytes 0x{3:X} 0x{4:X} at RVA 0x{5:X} (expected 0F 8F) - skipping this site." -f `
-                    $script:TagWarn, $ms, $f.Site.Name, $o0, $o1, $jgRVA)
+                Write-Host ("    {0} Skipped one change - it didn't look the way we expected." -f $script:TagWarn)
                 continue
             }
             $res.Stock++
@@ -961,14 +956,13 @@ function Invoke-PatchMilestones {
             $cond    = $cur -band 0x0F
             $patched = [byte](($cur -band 0xF0) -bor 0x0E)
             if ($cond -eq 0x0E) {
-                Write-Host ("    [i] {0}: {1} b.gt->b.al at RVA 0x{2:X} already applied (no change)." -f $ms, $f.Site.Name, $jgRVA)
+                Write-Host '    [i] One change was already applied.'
                 $already++; $res.Already++
                 $res.Written += [pscustomobject]@{ RVA = $jgRVA; Bytes = [byte[]]@($patched) }
                 continue
             }
             if ($cond -ne 0x0C) {
-                Write-Host ("    {0} {1}: {2} unexpected b.cond 0x{3:X} at RVA 0x{4:X} (expected GT nibble 0xC) - skipping this site." -f `
-                    $script:TagWarn, $ms, $f.Site.Name, $cur, $jgRVA)
+                Write-Host ("    {0} Skipped one change - it didn't look the way we expected." -f $script:TagWarn)
                 continue
             }
             $res.Stock++
@@ -977,20 +971,17 @@ function Invoke-PatchMilestones {
             $res.Written += [pscustomobject]@{ RVA = $jgRVA; Bytes = [byte[]]@($patched) }
         }
 
-        $suffix = if ($f.Relocated) { '  (RELOCATED - point-release layout)' } else { '' }
-        $verb = if ($f.Site.Kind -eq 2) { 'b.gt->b.al' } else { 'jg->jmp' }
         if ($Apply) {
-            Write-Host ("    {0} {1}: {2} {3} at RVA 0x{4:X}{5}" -f $script:TagOK, $ms, $f.Site.Name, $verb, $jgRVA, $suffix)
+            Write-Host ("    {0} Change {1} of {2} applied." -f $script:TagOK, $applied, $best.Flips.Count)
         } else {
-            $stockWord = if ($f.Site.Kind -eq 2) { 'stock b.gt' } else { 'stock jg' }
-            Write-Host ("    {0} {1}: {2} {3} at RVA 0x{4:X}{5}" -f $script:TagOK, $ms, $f.Site.Name, $stockWord, $jgRVA, $suffix)
+            Write-Host ("    {0} Change {1} of {2} found." -f $script:TagOK, $applied, $best.Flips.Count)
         }
     }
     $res.Flips += $already   # count already-applied sites toward the flip total
 
     if (-not $res.Full) {
-        Write-Host ("    {0} Chrome {1}: {2} site(s) not found - this Chrome build may have shifted them. MV2 re-enable is PARTIAL and may still be blocked; please report the version." -f `
-            $script:TagWarn, $best.Ms.Name, ($res.Total - $res.Located))
+        Write-Host ("    {0} {1} change(s) couldn't be found for Chrome {2}, so this may not fully work. Please report this Chrome version." -f `
+            $script:TagWarn, ($res.Total - $res.Located), $best.Ms.Name)
     }
 
     $res.Status = if ($applied -gt 0) { 1 } else { 2 }
@@ -1028,7 +1019,7 @@ function Show-LayoutCandidates {
     param([byte[]]$Buf, $Img)
 
     if ($Img.TextSize -lt 8) { return }
-    Write-Info 'Scanning .text for the IsExtensionAffected skeleton (cmp r/m32,2 ; jg short ; ... ; type/location check)...'
+    Write-Info "This Chrome version isn't recognized yet. Looking for clues to help add support..."
     Initialize-NativeHelpers
 
     $hits = [Mv2Native]::SkeletonScan($Buf, [int64]$Img.TextRaw, [int64]$Img.TextSize)
@@ -1044,7 +1035,7 @@ function Show-LayoutCandidates {
         $shown++
     }
     $extra = if ($hits.Count -gt $shown) { " ($($hits.Count - $shown) not shown)" } else { '' }
-    Write-Info ("Skeleton scan found {0} candidate site(s){1}. None were modified - verify each against mv2-reversing.md 'Porting to a new Chrome version' before hand-patching." -f $hits.Count, $extra)
+    Write-Info ("Found {0} possible spot(s){1}. Nothing was changed - please share this and your Chrome version with the developer." -f $hits.Count, $extra)
 }
 
 # ============================================================================
@@ -1155,7 +1146,7 @@ function Test-Elevated {
 }
 
 function Get-ElevationHint {
-    return "Administrator privileges are REQUIRED to modify chrome.dll in Program Files!`n    Re-run from an elevated terminal (right-click PowerShell -> Run as administrator)."
+    return "This needs administrator access to change Chrome.`n    Right-click PowerShell and choose 'Run as administrator', then try again."
 }
 
 function Get-QuotedArg {
@@ -1242,20 +1233,20 @@ function Invoke-SelfElevate {
         }
         if (-not $injected) {
             # No command payload to guard - refuse rather than risk a UAC loop.
-            Write-Warn 'Cannot self-elevate this invocation; re-run from an elevated terminal.'
+            Write-Warn 'Cannot ask for administrator access this way; re-run from an admin terminal.'
             return $null
         }
         $argString = $rebuilt -join ' '
     }
 
-    Write-Info 'Requesting Administrator privileges (a UAC prompt will appear)...'
+    Write-Info 'Asking for administrator access (you''ll see a Windows prompt)...'
     try {
         $p = Start-Process -FilePath $exe -ArgumentList $argString -Verb RunAs `
                            -WorkingDirectory (Get-Location).Path -Wait -PassThru -ErrorAction Stop
         return $p.ExitCode
     } catch {
         # 1223 = ERROR_CANCELLED: the user dismissed the UAC dialog.
-        Write-Warn 'Elevation was declined - nothing was changed.'
+        Write-Warn 'Admin access was declined - nothing was changed.'
         return $null
     }
 }
@@ -1288,7 +1279,7 @@ function Close-FileHolders {
 
     $holders = @(Get-FileHolders -TargetPath $TargetPath)
     if ($holders.Count -gt 0) {
-        Write-Warn "Force-closing $($holders.Count) process(es) that hold this target."
+        Write-Warn "Closing $($holders.Count) Chrome process(es)..."
     }
     foreach ($h in $holders) {
         try {
@@ -1300,7 +1291,7 @@ function Close-FileHolders {
             $name = if ($h.AppName) { $h.AppName } else { 'process' }
             $p.Kill()
             $p.WaitForExit(5000) | Out-Null
-            Write-Host "    $script:TagOK Closed $name (PID $($h.Pid))."
+            Write-Host "    $script:TagOK Closed $name."
         } catch { }
     }
 
@@ -1327,17 +1318,17 @@ function Request-TargetUnlock {
         Holders = $holders.Count
     }
     if ($AssumeYes) {
-        Write-Warn "Chrome $($Target.Channel) is running and will be force closed (-Yes)."
+        Write-Warn "Chrome $($Target.Channel) is open and will be closed (-Yes)."
     } elseif ($Quiet) {
-        Write-Err "Chrome $($Target.Channel) is running ($($holders.Count) detected holder(s))."
-        Write-Host '    Close it, or pass -Yes to force close it.'
+        Write-Err "Chrome $($Target.Channel) is open."
+        Write-Host '    Close it, or add -Yes to close it automatically.'
         return $false
     } elseif (-not (Confirm-ForceClose $current)) {
         return $false
     }
 
     if (Close-FileHolders -TargetPath $Target.Path) {
-        Write-Ok 'This channel is closed; other Chrome channels were left running.'
+        Write-Ok 'Chrome is closed. Your other Chrome channels are still running.'
         return $true
     }
     return $false
@@ -1490,13 +1481,11 @@ function Show-InstallRow {
     $line = "  $($C.Bold)$Index)$($C.Reset) $($C.Cyn)$($Inst.Channel)$($C.Reset)"
     if ($Inst.Version) { $line += "  $($Inst.Version)" }
     if ($Inst.Running) {
-        $line += "  $($C.Yel)[RUNNING"
-        if ($Inst.Holders -gt 0) { $line += ", $($Inst.Holders) process(es)" }
-        $line += "]$($C.Reset)"
+        $line += "  $($C.Yel)[open]$($C.Reset)"
     } else {
-        $line += "  $($C.Grn)[not running]$($C.Reset)"
+        $line += "  $($C.Grn)[closed]$($C.Reset)"
     }
-    if ($Inst.HasBackup) { $line += " $($C.Dim)(backup present)$($C.Reset)" }
+    if ($Inst.HasBackup) { $line += " $($C.Dim)(backup saved)$($C.Reset)" }
     Write-Host $line
     Write-Host "      $($C.Dim)$($Inst.Path)$($C.Reset)"
 }
@@ -1524,12 +1513,12 @@ function Select-Install {
     param([array]$Installs)
 
     if ($Installs.Count -eq 1) {
-        Write-Ok 'One Chrome channel found:'
+        Write-Ok 'Found one Chrome:'
         Show-InstallRow 1 $Installs[0]
     } else {
-        Write-Host "`n$script:TagInfo $($Installs.Count) Chrome release channels found:"
+        Write-Host "`n$script:TagInfo Found $($Installs.Count) Chrome versions:"
         for ($i = 0; $i -lt $Installs.Count; $i++) { Show-InstallRow ($i + 1) $Installs[$i] }
-        Write-Host "`n$script:TagInfo Only the channel you pick is modified; the others keep running."
+        Write-Host "`n$script:TagInfo Only the one you pick is changed; the others are left alone."
     }
 
     # 'check' is read-only and must never turn into a write, so it neither offers
@@ -1542,9 +1531,9 @@ function Select-Install {
     while ($true) {
         $restoreOpt = if ($allowRestore) { 'r=restore, ' } else { '' }
         $prompt = if ($Installs.Count -eq 1) {
-            "$verb this channel? [Enter=yes, ${restoreOpt}c=custom path, q=quit]"
+            "$verb this Chrome? [Enter=yes, ${restoreOpt}c=custom path, q=quit]"
         } else {
-            "Which channel do you want to ${verbLower}? [1-$($Installs.Count), ${restoreOpt}c=custom path, q=quit]"
+            "Which Chrome do you want to ${verbLower}? [1-$($Installs.Count), ${restoreOpt}c=custom path, q=quit]"
         }
         $line = (Read-Host "`n$prompt").Trim()
 
@@ -1553,12 +1542,12 @@ function Select-Install {
             $script:Command = 'restore'
             if ($Installs.Count -eq 1) { return $Installs[0] }
             # Show restore-specific prompt for multiple channels
-            Write-Host "`n$script:TagInfo Restore mode selected. Choose which channel to restore from backup:"
+            Write-Host "`n$script:TagInfo Restore selected. Which Chrome do you want to restore?"
             while ($true) {
-                $restoreLine = (Read-Host "`nWhich channel do you want to restore? [1-$($Installs.Count), q=cancel]").Trim()
-                if ($restoreLine -in 'q', 'Q') { 
+                $restoreLine = (Read-Host "`nWhich Chrome do you want to restore? [1-$($Installs.Count), q=cancel]").Trim()
+                if ($restoreLine -in 'q', 'Q') {
                     Write-Info 'Restore cancelled.'
-                    return $null 
+                    return $null
                 }
                 $rn = 0
                 if ([int]::TryParse($restoreLine, [ref]$rn) -and $rn -ge 1 -and $rn -le $Installs.Count) {
@@ -1588,13 +1577,12 @@ function Select-Install {
 
 function Confirm-ForceClose {
     param($Inst)
-    Write-Host "`n$($C.Bold)$($C.Yel)  !! WARNING: Chrome $($Inst.Channel) is running !!$($C.Reset)"
-    Write-Host "     Close it now to patch cleanly. If you continue, its $($Inst.Holders) process(es)"
-    Write-Host '     will be FORCE CLOSED and any unsaved tabs or downloads are lost.'
-    Write-Host "     $($C.Dim)Other Chrome channels are unaffected either way.$($C.Reset)"
+    Write-Host "`n$($C.Bold)$($C.Yel)  Chrome $($Inst.Channel) is open.$($C.Reset)"
+    Write-Host '     I need to close it to make the change. Any unsaved tabs will be lost.'
+    Write-Host "     $($C.Dim)Your other Chrome versions won't be touched.$($C.Reset)"
 
     while ($true) {
-        $line = (Read-Host "`nForce close Chrome $($Inst.Channel) and patch? [y/N]").Trim()
+        $line = (Read-Host "`nClose Chrome $($Inst.Channel) and continue? [y/N]").Trim()
         if ($line -in 'y', 'Y') { return $true }
         if ($line -eq '' -or $line -in 'n', 'N') { Write-Info 'Cancelled - nothing was changed.'; return $false }
     }
@@ -1612,37 +1600,37 @@ function Resolve-Target {
 
     if ($TargetPath) {
         if (-not (Test-Path -LiteralPath $TargetPath -PathType Leaf)) {
-            Write-Err 'Error: the given path does not exist.'
+            Write-Err "That path doesn't exist."
             return $null
         }
         return (Get-InstallDetails -TargetPath $TargetPath -Channel '')
     }
 
-    Write-Info 'Scanning for installed Chrome release channels...'
+    Write-Info 'Looking for Chrome...'
     $installs = @(Get-ChromeInstalls)
 
     if ($installs.Count -eq 0) {
         if (-not $Interactive) {
-            Write-Err 'Error: no installed Chrome channel was found.'
-            Write-Host '    Pass the path explicitly, e.g. .\chrome-mv2.ps1 patch C:\path\to\chrome.dll'
+            Write-Err "Couldn't find Chrome on this computer."
+            Write-Host '    Give the path to chrome.dll, e.g. .\chrome-mv2.ps1 patch C:\path\to\chrome.dll'
             return $null
         }
-        Write-Warn 'No installed Chrome channel was found.'
+        Write-Warn "Couldn't find Chrome on this computer."
         $pick = Read-CustomPath
         if ($pick) { return $pick }
         Write-Info 'No path entered - nothing was changed.'
         return $null
     }
     if (-not $Interactive -and $installs.Count -gt 1) {
-        Write-Err "$($installs.Count) channels are installed and -Quiet cannot prompt."
+        Write-Err "Found $($installs.Count) Chrome versions, and -Quiet can't ask which one."
         for ($i = 0; $i -lt $installs.Count; $i++) { Show-InstallRow ($i + 1) $installs[$i] }
-        Write-Host '    Re-run with the path of the channel you want.'
+        Write-Host '    Re-run with the path of the one you want.'
         return $null
     }
     if (-not $Interactive) { return $installs[0] }
 
     $picked = Select-Install $installs
-    if (-not $picked) { Write-Info 'No channel selected - nothing was changed.'; return $null }
+    if (-not $picked) { Write-Info 'Nothing selected - nothing was changed.'; return $null }
     return $picked
 }
 
@@ -1652,17 +1640,17 @@ function Invoke-Patch {
     param($Target, [bool]$AssumeYes)
 
     $buf = [IO.File]::ReadAllBytes($Target.Path)
-    if ($buf.Length -eq 0) { Write-Err 'Error: the target file is empty.'; return 1 }
-    Write-Ok "Loaded $($buf.Length) bytes from $($Target.Path)."
+    if ($buf.Length -eq 0) { Write-Err 'That file is empty.'; return 1 }
+    Write-Ok "Read Chrome from $($Target.Path)."
 
     $img = Open-Image $buf
     $targetIdentity = Get-PeIdentity -Buf $buf -Img $img
     $targetHash = $targetIdentity.SHA256
 
     $milestones = @(Import-Milestones | Where-Object { $_.Container -eq $img.Format })
-    Write-Info "Starting MV2 patching (ManifestV2Handler architecture, $($img.Format.ToUpper()) target)..."
+    Write-Info 'Getting Chrome ready...'
     if ($milestones.Count -eq 0) {
-        Write-Warn "No $($img.Format.ToUpper()) milestone signatures are known yet - declining (nothing modified)."
+        Write-Warn "This kind of Chrome isn't supported yet - nothing was changed."
         Show-LayoutCandidates -Buf $buf -Img $img
         return 1
     }
@@ -1672,112 +1660,109 @@ function Invoke-Patch {
     $backupPath = Get-BackupPath $Target.Path
     if (-not (Test-Path -LiteralPath $backupPath -PathType Leaf)) {
         if (-not (Test-LikelyStock -Img $img -Buf $buf)) {
-            Write-Err 'No clean backup exists and the target is not a signed stock Chrome DLL.'
-            Write-Host '    Restore/reinstall Chrome first; refusing to save patched bytes as the baseline.'
+            Write-Err "There's no backup yet, and this Chrome has already been changed."
+            Write-Host '    Reinstall Chrome first so we can save a clean backup.'
             return 1
         }
         $stockLayout = Get-CleanStockLayout -Buf $buf -Img $img -Milestones $milestones `
             -AllowPartialLayout $AllowPartial.IsPresent
         if (-not $stockLayout.Clean) {
-            Write-Err 'No clean backup exists and the target is not a recognized stock layout.'
+            Write-Err "There's no backup yet, and this doesn't look like an untouched Chrome."
             return 1
         }
-        Write-Info "Creating initial backup copy: $backupPath ..."
+        Write-Info 'Saving a backup...'
         Save-BackupSnapshot -TargetPath $Target.Path -BackupPath $backupPath -Buf $buf -Identity $targetIdentity
         $backup = Read-ValidatedBackup $backupPath
-        Write-Ok 'Initial backup created and verified.'
+        Write-Ok 'Backup saved.'
     } else {
         try {
             $backup = Read-ValidatedBackup $backupPath
         } catch {
-            Write-Err "Backup validation failed: $_"
+            Write-Err "The backup couldn't be verified: $_"
             return 1
         }
         if (-not (Test-LikelyStock -Img $backup.Img -Buf $backup.Buf)) {
-            Write-Err 'The backup does not look like signed stock Chrome; refusing to use it.'
+            Write-Err "The backup doesn't look like an original Chrome, so I won't use it."
             return 1
         }
         $backupLayout = Get-CleanStockLayout -Buf $backup.Buf -Img $backup.Img -Milestones $milestones `
             -AllowPartialLayout $AllowPartial.IsPresent
         if (-not $backupLayout.Clean) {
-            Write-Err 'The backup is not a recognized clean stock layout.'
+            Write-Err "The backup doesn't look like an untouched Chrome."
             return 1
         }
 
         if (-not (Test-SameBuildIdentity -A $targetIdentity -B $backup.Identity)) {
             if (-not (Test-LikelyStock -Img $img -Buf $buf)) {
-                Write-Err 'Chrome changed builds, but the current target is not verifiable stock.'
-                Write-Host '    Reinstall/update Chrome to recreate a clean target before patching.'
+                Write-Err "Chrome was updated, but this copy has already been changed."
+                Write-Host '    Reinstall or update Chrome so we can start from a clean copy.'
                 return 1
             }
             $newStockLayout = Get-CleanStockLayout -Buf $buf -Img $img -Milestones $milestones `
                 -AllowPartialLayout $AllowPartial.IsPresent
             if (-not $newStockLayout.Clean) {
-                Write-Err 'The updated target is signed but does not match a complete known stock layout.'
+                Write-Err "This updated Chrome isn't fully supported yet."
                 return 1
             }
-            Write-Info 'Chrome update detected - replacing the backup with the new signed stock build...'
+            Write-Info 'Chrome was updated - saving a fresh backup...'
             Save-BackupSnapshot -TargetPath $Target.Path -BackupPath $backupPath -Buf $buf -Identity $targetIdentity
             $backup = Read-ValidatedBackup $backupPath
-            Write-Ok 'Backup updated and verified.'
+            Write-Ok 'Backup updated.'
         } elseif ($backup.Legacy) {
             Save-BackupSnapshot -TargetPath $Target.Path -BackupPath $backupPath -Buf $backup.Buf -Identity $backup.Identity
-            Write-Ok 'Legacy backup validated and metadata added.'
+            Write-Ok 'Backup checked and updated.'
         }
     }
 
     $buf = [byte[]]$backup.Buf.Clone()
     $img = Open-Image $buf
 
-    Write-Info "Probing for a known Chrome layout ($($milestones.Count) milestone table(s))..."
+    Write-Info 'Checking your Chrome version...'
     $patch = Invoke-PatchMilestones -Buf $buf -Img $img -Milestones $milestones `
         -AllowPartial $AllowPartial.IsPresent -Apply $true
     if ($patch.Status -eq 0) {
         Show-LayoutCandidates -Buf $buf -Img $img
-        Write-Warn 'No known MV2 layout matched this binary.'
-        Write-Host '    Chrome likely shifted its layout (new milestone or different codegen).'
-        Write-Host '    Nothing was modified. See "Porting to a new Chrome version" in the'
-        Write-Host '    mv2-reversing.md notes and add a milestone to signatures.json (next to the script).'
+        Write-Warn "This Chrome version isn't recognized."
+        Write-Host '    Nothing was changed. It may be too new - please report your Chrome version.'
         return 1
     }
 
-    $msg = if ($patch.Status -eq 1) { 'applied.' } else { 'all sites already patched (no change needed).' }
+    $msg = if ($patch.Status -eq 1) { 'patched.' } else { 'was already patched (no change needed).' }
     Write-Info "Chrome $($patch.Milestone) $msg"
 
     Complete-Image -Img $img -Buf $buf
     if (-not (Test-PatchOutput -Buf $buf -Img $img -Patch $patch)) {
-        Write-Err 'Internal verification failed: prepared output does not contain every selected patch.'
+        Write-Err 'Something went wrong while preparing the change - nothing was changed.'
         return 1
     }
 
     $preparedHash = Get-ByteHash $buf
     if ($preparedHash -eq $targetHash) {
-        Write-Success 'Target is already fully patched; no write was needed.'
+        Write-Success 'Already done - no change was needed.'
         return 0
     }
     if ($targetHash -ne $backup.Identity.SHA256) {
-        Write-Err 'Target contains changes unrelated to this patch; refusing to overwrite them.'
-        Write-Host '    Restore/reinstall Chrome or inspect the binary manually before retrying.'
+        Write-Err "This Chrome has other changes we didn't make, so we won't overwrite it."
+        Write-Host '    Reinstall Chrome, or check the file yourself, then try again.'
         return 1
     }
 
     if (-not (Request-TargetUnlock -Target $Target -AssumeYes $AssumeYes)) {
-        Write-Err 'Target is still locked; nothing was written.'
+        Write-Err 'Chrome is still open - close it and try again.'
         return 1
     }
     Write-Target -TargetPath $Target.Path -Buf $buf -ExpectedCurrentHash $targetHash
     $afterHash = (Get-FileHash -LiteralPath $Target.Path -Algorithm SHA256).Hash.ToLowerInvariant()
-    if ($afterHash -ne $preparedHash) { throw 'post-write SHA-256 verification failed' }
+    if ($afterHash -ne $preparedHash) { throw "The change didn't save correctly." }
 
     Write-Rule
     if ($patch.Full) {
-        Write-Success 'Binary successfully patched!'
-        Write-Host "          Manifest V2 extension support re-enabled (Chrome $($patch.Milestone) layout)."
+        Write-Success 'Done. Manifest V2 re-enabled.'
+        Write-Host "          Your older extensions will work again (Chrome $($patch.Milestone)). Restart Chrome."
     } else {
-        Write-Host "$script:TagWarning Binary was PARTIALLY patched (Chrome $($patch.Milestone) layout, $($patch.Located)/$($patch.Total) gates)."
-        Write-Host '          The flips found were written, but'
-        Write-Host "          $($patch.Total - $patch.Located) gate(s) were not located, so MV2 may STILL be blocked."
-        Write-Host '          Please report the exact version. Revert with: .\chrome-mv2.ps1 restore'
+        Write-Host "$script:TagWarning Only part of the change was applied (Chrome $($patch.Milestone), $($patch.Located)/$($patch.Total))."
+        Write-Host "          $($patch.Total - $patch.Located) part(s) couldn't be found, so this may not fully work."
+        Write-Host '          Please report your Chrome version. To undo: .\chrome-mv2.ps1 restore'
     }
     Write-Rule
     return 0
@@ -1788,83 +1773,80 @@ function Invoke-Patch {
 function Invoke-Restore {
     param($Target, [bool]$AssumeYes)
 
-    Write-Info 'Restore mode requested...'
+    Write-Info 'Restoring the original Chrome...'
     $backupPath = Get-BackupPath $Target.Path
     if (-not (Test-Path -LiteralPath $backupPath -PathType Leaf)) {
-        Write-Err "Error: backup file $backupPath does not exist."
+        Write-Err "No backup found, so there's nothing to restore."
         return 1
     }
     try { $backup = Read-ValidatedBackup $backupPath }
-    catch { Write-Err "Backup validation failed: $_"; return 1 }
+    catch { Write-Err "The backup couldn't be verified: $_"; return 1 }
     if (-not (Test-LikelyStock -Img $backup.Img -Buf $backup.Buf)) {
-        Write-Err 'Backup is not verifiable signed stock Chrome; refusing to restore it.'
+        Write-Err "The backup doesn't look like an original Chrome, so I won't use it."
         return 1
     }
     $milestones = @(Import-Milestones | Where-Object { $_.Container -eq $backup.Img.Format })
     $backupLayout = Get-CleanStockLayout -Buf $backup.Buf -Img $backup.Img -Milestones $milestones -AllowPartialLayout $true
     if (-not $backupLayout.Clean) {
-        Write-Err 'Backup is not a recognized clean stock layout.'
+        Write-Err "The backup doesn't look like an untouched Chrome."
         return 1
     }
-    Write-Ok ("Backup verified: clean stock Chrome {0} ({1}/{2} MV2 gate sites intact)." -f `
-        $backupLayout.Probe.Milestone, $backupLayout.Probe.Located, $backupLayout.Probe.Total)
+    Write-Ok ("Backup looks good (Chrome {0})." -f $backupLayout.Probe.Milestone)
 
     $current = [IO.File]::ReadAllBytes($Target.Path)
     $currentImg = Open-Image $current
     $currentIdentity = Get-PeIdentity -Buf $current -Img $currentImg
     if (-not (Test-SameBuildIdentity -A $currentIdentity -B $backup.Identity) -and -not $ForceRestore) {
-        Write-Err 'Backup belongs to a different Chrome build; refusing to downgrade the installed DLL.'
-        Write-Host '    Use -ForceRestore only if restoring that older build is intentional.'
+        Write-Err "This backup is from a different Chrome version, so I won't use it."
+        Write-Host '    Add -ForceRestore only if you really mean to go back to that version.'
         return 1
     }
     if (-not (Test-SameBuildIdentity -A $currentIdentity -B $backup.Identity)) {
-        Write-Warn 'Forcing restore from a different Chrome build (-ForceRestore).'
+        Write-Warn 'Restoring a different Chrome version (-ForceRestore).'
     }
     if ($currentIdentity.SHA256 -eq $backup.Identity.SHA256) {
-        Write-Success 'Target already matches the verified backup; no write was needed.'
+        Write-Success 'Chrome is already the original - nothing to undo.'
         Remove-BackupFiles $backupPath
-        Write-Info 'Backup removed; the installed DLL is the original stock build.'
+        Write-Info 'Backup removed - Chrome is back to normal.'
         return 0
     }
     if (-not (Request-TargetUnlock -Target $Target -AssumeYes $AssumeYes)) {
-        Write-Err 'Target is still locked; nothing was written.'
+        Write-Err 'Chrome is still open - close it and try again.'
         return 1
     }
     Write-Target -TargetPath $Target.Path -Buf $backup.Buf -ExpectedCurrentHash $currentIdentity.SHA256
     $afterHash = (Get-FileHash -LiteralPath $Target.Path -Algorithm SHA256).Hash.ToLowerInvariant()
-    if ($afterHash -ne $backup.Identity.SHA256) { throw 'post-restore SHA-256 verification failed' }
-    Write-Success 'Original binary successfully restored from backup!'
+    if ($afterHash -ne $backup.Identity.SHA256) { throw "The restore didn't save correctly." }
+    Write-Success 'Done. Your original Chrome is back.'
     Remove-BackupFiles $backupPath
-    Write-Info 'Backup removed; the installed DLL is the original stock build.'
+    Write-Info 'Backup removed - Chrome is back to normal.'
     return 0
 }
 
 function Invoke-Check {
     param($Target)
     $buf = [IO.File]::ReadAllBytes($Target.Path)
-    if ($buf.Length -eq 0) { Write-Err 'Error: the target file is empty.'; return 1 }
+    if ($buf.Length -eq 0) { Write-Err 'That file is empty.'; return 1 }
     $img = Open-Image $buf
     $identity = Get-PeIdentity -Buf $buf -Img $img
-    Write-Ok ("PE identity: {0}, machine=0x{1:X4}, timestamp=0x{2:X8}, size={3}, SHA-256={4}" -f `
-        $identity.Format, $identity.Machine, $identity.TimeStamp, $identity.Length, $identity.SHA256)
 
     $milestones = @(Import-Milestones | Where-Object { $_.Container -eq $img.Format })
-    $probe = Invoke-PatchMilestones -Buf $buf -Img $img -Milestones $milestones -AllowPartial $true -Apply $false
+    $probe = Invoke-PatchMilestones -Buf $buf -Img $img -Milestones $milestones -AllowPartial $true -Apply $false 6>$null
     if ($probe.Status -eq 0) {
-        Write-Warn $(if ($probe.Reason) { $probe.Reason } else { 'No known complete MV2 layout matched.' })
+        if ($probe.Reason -match 'tied') { Write-Warn "Couldn't tell which Chrome version this is." }
+        else { Write-Warn "This Chrome version isn't recognized yet." }
     } else {
-        $state = if ($probe.Stock -gt 0 -and $probe.Already -gt 0) { 'mixed' } elseif ($probe.Stock -gt 0) { 'stock' } else { 'patched' }
-        Write-Ok "Layout: Chrome $($probe.Milestone), $($probe.Located)/$($probe.Total) sites, state=$state."
+        $state = if ($probe.Stock -gt 0 -and $probe.Already -gt 0) { 'partly patched' } elseif ($probe.Stock -gt 0) { 'not patched yet' } else { 'already patched' }
+        Write-Ok "This is Chrome $($probe.Milestone) - $state."
     }
 
     $backupPath = Get-BackupPath $Target.Path
     if (Test-Path -LiteralPath $backupPath -PathType Leaf) {
         try {
             $backup = Read-ValidatedBackup $backupPath
-            $same = Test-SameBuildIdentity -A $identity -B $backup.Identity
-            Write-Ok "Backup: verified, same build=$same, metadata=$(-not $backup.Legacy)."
-        } catch { Write-Warn "Backup: invalid ($_)." }
-    } else { Write-Info 'Backup: absent.' }
+            Write-Ok 'A backup is saved.'
+        } catch { Write-Warn 'A backup exists but looks damaged.' }
+    } else { Write-Info 'No backup saved yet.' }
 
     # Exit-code contract (kept in step with chrome-mv2.sh): 0 = a complete,
     # internally consistent layout was recognized, whether stock or patched;
@@ -1891,7 +1873,7 @@ function Invoke-Main {
     $effectivePath = $Path
     if (-not $effectivePath -and $env:MV2_TARGET_B64) {
         try { $effectivePath = [Text.Encoding]::Unicode.GetString([Convert]::FromBase64String($env:MV2_TARGET_B64)) }
-        catch { Write-Err 'Invalid elevated target marker.'; return 1 }
+        catch { Write-Err 'Something went wrong starting with admin access.'; return 1 }
     }
 
     # Resolve before elevation. Read-only checks never need admin, and an
@@ -1900,9 +1882,9 @@ function Invoke-Main {
     $target = Resolve-Target -TargetPath $effectivePath -Interactive (-not $Quiet)
     if (-not $target) { return 1 }
 
-    Write-Host "$script:TagOK Target channel: $($C.Cyn)$($target.Channel)$($C.Reset)"
-    Write-Host "$script:TagOK Target file: $($target.Path)"
-    if ($target.Version) { Write-Host "$script:TagOK Chrome version detected: $($target.Version)" }
+    Write-Host "$script:TagOK Chrome: $($C.Cyn)$($target.Channel)$($C.Reset)"
+    Write-Host "$script:TagOK File: $($target.Path)"
+    if ($target.Version) { Write-Host "$script:TagOK Version: $($target.Version)" }
 
     if ($Command -eq 'check') { return (Invoke-Check -Target $target) }
 

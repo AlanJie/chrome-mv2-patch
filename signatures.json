@@ -186,7 +186,7 @@
         {
           "name": "MV2DeprecationImpactChecker::IsExtensionAffected (shared predicate; covers the ManifestV2Handler thunk, OnExtensionSystemReady and MaybeReEnableExtension, which call it out-of-line)",
           "kind": "short",
-          "jgRVA": "0x067D9F14",
+          "jgRVA": "0x041900D4",
           "jgOff": 4,
           "expectedMatches": 1,
           "sig": "837E50027F2F554889E5488B8E280200008B413080BE080200"
@@ -194,7 +194,7 @@
         {
           "name": "ManifestV2Handler::ShouldBlockExtensionInstallation",
           "kind": "short",
-          "jgRVA": "0x098D3CC7",
+          "jgRVA": "0x09972677",
           "jgOff": 3,
           "expectedMatches": 1,
           "sig": "83FE027F1F83FA01751083F9050F95C283F90A0F95C020D05D"
@@ -202,7 +202,7 @@
         {
           "name": "ManifestV2Handler::ShouldBlockExtensionEnable",
           "kind": "short",
-          "jgRVA": "0x098D3D0D",
+          "jgRVA": "0x099726BD",
           "jgOff": 3,
           "expectedMatches": 1,
           "sig": "83FA027F298B493083F801751783F9050F95C283F90A0F95C0"
@@ -210,7 +210,7 @@
         {
           "name": "StandardManagementPolicyProvider::UserMayInstall (inlined, near jg; Load-Unpacked gate)",
           "kind": "near",
-          "jgRVA": "0x0A3224A3",
+          "jgRVA": "0x0A3B7893",
           "jgOff": 3,
           "expectedMatches": 1,
           "sig": "83FA020F8FBE0000008B493083F8010F856402000083F9050F84A900"
@@ -218,7 +218,7 @@
         {
           "name": "StandardManagementPolicyProvider::MustRemainDisabled (inlined)",
           "kind": "short",
-          "jgRVA": "0x05E5DB24",
+          "jgRVA": "0x05572994",
           "jgOff": 3,
           "expectedMatches": 1,
           "sig": "83FA027F7A8B493083F80175684531F683F905740583F90A75"

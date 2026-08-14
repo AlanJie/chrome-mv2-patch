@@ -64,11 +64,11 @@ readonly APP_VERSION="1.4.0"
 # ============================================================================
 readonly EMBEDDED_SIGNATURES='
 M|151-linux|elf
-S|MV2DeprecationImpactChecker::IsExtensionAffected (shared predicate)|short|0x067D9F14|4|1|837E50027F2F554889E5488B8E280200008B413080BE080200
-S|ManifestV2Handler::ShouldBlockExtensionInstallation|short|0x098D3CC7|3|1|83FE027F1F83FA01751083F9050F95C283F90A0F95C020D05D
-S|ManifestV2Handler::ShouldBlockExtensionEnable|short|0x098D3D0D|3|1|83FA027F298B493083F801751783F9050F95C283F90A0F95C0
-S|StandardManagementPolicyProvider::UserMayInstall (inlined, near jg)|near|0x0A3224A3|3|1|83FA020F8FBE0000008B493083F8010F856402000083F9050F84A900
-S|StandardManagementPolicyProvider::MustRemainDisabled (inlined)|short|0x05E5DB24|3|1|83FA027F7A8B493083F80175684531F683F905740583F90A75
+S|MV2DeprecationImpactChecker::IsExtensionAffected (shared predicate)|short|0x041900D4|4|1|837E50027F2F554889E5488B8E280200008B413080BE080200
+S|ManifestV2Handler::ShouldBlockExtensionInstallation|short|0x09972677|3|1|83FE027F1F83FA01751083F9050F95C283F90A0F95C020D05D
+S|ManifestV2Handler::ShouldBlockExtensionEnable|short|0x099726BD|3|1|83FA027F298B493083F801751783F9050F95C283F90A0F95C0
+S|StandardManagementPolicyProvider::UserMayInstall (inlined, near jg)|near|0x0A3B7893|3|1|83FA020F8FBE0000008B493083F8010F856402000083F9050F84A900
+S|StandardManagementPolicyProvider::MustRemainDisabled (inlined)|short|0x05572994|3|1|83FA027F7A8B493083F80175684531F683F905740583F90A75
 E
 M|152-linux|elf
 S|manifest_v2_util::IsExtensionAffected (free predicate)|short|0x0985B449|3|1|83FF027F1D83FE087718B90A0100000FA3F1730E83FA050F95
@@ -386,7 +386,7 @@ load_milestones() {
         errf "No usable ELF/Mach-O milestones from ${src_label}."
         return 1
     fi
-    okf "Loaded ${NUM_MILESTONES} milestone(s) from ${src_label}"
+    okf "Loaded ${NUM_MILESTONES} known Chrome version(s)."
     return 0
 }
 
@@ -490,7 +490,7 @@ parse_macho() {
     NUM_SLICES=0
 
     local fsize; fsize=$(file_size "$file")
-    if (( fsize < 32 )); then errf "Not a Mach-O: file too small (${fsize} bytes)."; return 1; fi
+    if (( fsize < 32 )); then errf "That doesn't look like a Chrome app file."; return 1; fi
 
     local be le
     be=$(read_u32_be "$file" 0)
@@ -499,7 +499,7 @@ parse_macho() {
     if (( be == FAT_MAGIC || be == FAT_MAGIC_64 )); then
         local is64=0; (( be == FAT_MAGIC_64 )) && is64=1
         local nfat; nfat=$(read_u32_be "$file" 4)
-        if (( nfat < 1 || nfat > 32 )); then errf "Implausible fat arch count (${nfat})."; return 1; fi
+        if (( nfat < 1 || nfat > 32 )); then errf "That doesn't look like a valid Chrome app file."; return 1; fi
         local entry off i soff ssize
         (( is64 )) && entry=32 || entry=20
         off=8
@@ -518,20 +518,16 @@ parse_macho() {
     elif (( le == MH_MAGIC_64 )); then
         parse_thin_slice "$file" 0 "$fsize" || true
     else
-        errf "Not a Mach-O (fat magic 0x$(printf '%08X' "$be"), thin magic 0x$(printf '%08X' "$le"))."
+        errf "That doesn't look like a Chrome app file."
         return 1
     fi
 
     if (( NUM_SLICES == 0 )); then
-        errf "No supported 64-bit Mach-O slice (x86_64 / arm64) found."
+        errf "This Chrome app isn't a supported type."
         return 1
     fi
 
-    local j desc=""
-    for (( j = 0; j < NUM_SLICES; j++ )); do
-        desc="${desc}${desc:+, }${SLICE_CONTAINER[$j]} (.text 0x$(printf '%X' "${SLICE_TSIZE[$j]}")B)"
-    done
-    okf "Mach-O parsed: ${NUM_SLICES} slice(s): ${desc}"
+    okf "Read the Chrome app."
     return 0
 }
 
@@ -605,13 +601,13 @@ parse_elf() {
     local file="$1" fsize
     _hexcache_load "$file"   # prime the byte cache for the reads below
     fsize=$(file_size "$file")
-    if (( fsize < 64 )); then errf "Not a valid ELF: file too small (${fsize} bytes)."; return 1; fi
+    if (( fsize < 64 )); then errf "That doesn't look like a Chrome file."; return 1; fi
     local magic; magic=$(read_bytes_hex "$file" 0 4)
-    if [[ "$magic" != "7F454C46" ]]; then errf "Not an ELF file (magic: ${magic})."; return 1; fi
+    if [[ "$magic" != "7F454C46" ]]; then errf "That doesn't look like a Chrome file."; return 1; fi
     local ei_class ei_data
     ei_class=$(read_byte "$file" 4); ei_data=$(read_byte "$file" 5)
-    if (( ei_class != 2 )); then errf "Not a 64-bit ELF (EI_CLASS=${ei_class})."; return 1; fi
-    if (( ei_data != 1 )); then errf "Not a little-endian ELF (EI_DATA=${ei_data})."; return 1; fi
+    if (( ei_class != 2 )); then errf "That's not a 64-bit Chrome file."; return 1; fi
+    if (( ei_data != 1 )); then errf "That doesn't look like a valid Chrome file."; return 1; fi
     # e_machine (0x12, u16): 0x3E x86_64 (cmp/jg gates, container "elf") vs 0xB7
     # aarch64 (cmp w,#2 ; b.gt gates, container "elf-arm64"). The tag routes the
     # slice to the right milestone table; the flip engine dispatches on site kind.
@@ -619,7 +615,7 @@ parse_elf() {
     e_machine=$(read_u16_le "$file" $((0x12)))
     if (( e_machine == 0xB7 )); then slice_container="elf-arm64"; fi
     if ! validate_elf_section_table "$file" "$fsize"; then
-        errf "ELF section table or section-name table is out of bounds."; return 1
+        errf "That doesn't look like a valid Chrome file."; return 1
     fi
 
     local i sh_off name_off sec_name
@@ -638,9 +634,9 @@ parse_elf() {
             break
         fi
     done
-    if (( TEXT_SIZE == 0 )); then errf "Could not locate .text section."; return 1; fi
+    if (( TEXT_SIZE == 0 )); then errf "That doesn't look like a valid Chrome file (missing code section)."; return 1; fi
     if ! range_within_file "$TEXT_RAW" "$TEXT_SIZE" "$fsize"; then
-        errf "ELF .text section is out of file bounds."; return 1
+        errf "That doesn't look like a valid Chrome file."; return 1
     fi
 
     # Model the ELF as a single "slice" so the shared engine drives it.
@@ -648,7 +644,7 @@ parse_elf() {
     SLICE_TVADDR=("$TEXT_VADDR"); SLICE_TRAW=("$TEXT_RAW"); SLICE_TSIZE=("$TEXT_SIZE")
     SLICE_UUID=(""); NUM_SLICES=1
 
-    okf "ELF64 parsed (${slice_container}): .text vaddr=0x$(printf '%X' $TEXT_VADDR) offset=0x$(printf '%X' $TEXT_RAW) size=0x$(printf '%X' $TEXT_SIZE) ($(( TEXT_SIZE / 1024 / 1024 )) MiB)"
+    okf "Read the Chrome file."
     return 0
 }
 
@@ -659,7 +655,7 @@ parse_target() {
     case "$kind" in
         elf)   TARGET_CONTAINER="elf";   parse_elf "$file" ;;
         macho) TARGET_CONTAINER="macho"; parse_macho "$file" ;;
-        *)     errf "Unrecognized binary (neither ELF nor Mach-O): ${file}"; return 1 ;;
+        *)     errf "That doesn't look like a Chrome file: ${file}"; return 1 ;;
     esac
 }
 
@@ -776,7 +772,7 @@ find_site_matches() {
         # unsatisfied and the milestone is declined - fail closed. Returning
         # non-zero here would abort the whole run under `set -e`, because the
         # caller (probe_slice_pass) invokes us as a bare, untested statement.
-        warnf "Signature has no safe raw scan anchor: ${name}"; return 0
+        warnf "Couldn't search for one of the changes - skipping it."; return 0
     fi
     local anchor_bin="" ai abyte
     for (( ai = 0; ai < ${#anchor_hex}; ai += 2 )); do
@@ -887,7 +883,7 @@ apply_flips_slice() {
             cur=$(read_byte "$file" "$offset")
             if (( cur == 0xEB )); then already=$(( already + 1 )); continue; fi
             if (( cur != 0x7F )); then
-                warnf "    ${BEST_MS_NAME}: ${name} unexpected 0x$(printf '%X' "$cur") (want 7F) - skipping."
+                warnf "    Skipped one change - it didn't look the way we expected."
                 continue
             fi
             printf '\xEB' | dd of="$file" bs=1 seek="$offset" count=1 conv=notrunc 2>/dev/null
@@ -896,7 +892,7 @@ apply_flips_slice() {
             o0=$(read_byte "$file" "$offset"); o1=$(read_byte "$file" $(( offset + 1 )))
             if (( o0 == 0x90 && o1 == 0xE9 )); then already=$(( already + 1 )); continue; fi
             if ! (( o0 == 0x0F && o1 == 0x8F )); then
-                warnf "    ${BEST_MS_NAME}: ${name} unexpected 0x$(printf '%X' "$o0") 0x$(printf '%X' "$o1") (want 0F 8F) - skipping."
+                warnf "    Skipped one change - it didn't look the way we expected."
                 continue
             fi
             printf '\x90\xE9' | dd of="$file" bs=1 seek="$offset" count=2 conv=notrunc 2>/dev/null
@@ -906,15 +902,14 @@ apply_flips_slice() {
             nib=$(( cur & 0x0F ))
             if (( nib == 0x0E )); then already=$(( already + 1 )); continue; fi
             if (( nib != 0x0C )); then
-                warnf "    ${BEST_MS_NAME}: ${name} b.cond nibble 0x$(printf '%X' "$nib") (want C=GT) - skipping."
+                warnf "    Skipped one change - it didn't look the way we expected."
                 continue
             fi
             newb=$(( (cur & 0xF0) | 0x0E ))
             printf "\\x$(printf '%02X' "$newb")" | dd of="$file" bs=1 seek="$offset" count=1 conv=notrunc 2>/dev/null
             applied=$(( applied + 1 ))
         fi
-        local suffix=""; [[ "${FLIP_RELOCATED[$i]}" == "true" ]] && suffix="  (RELOCATED)"
-        okf "    ${BEST_MS_NAME}: ${name} flipped${suffix}"
+        okf "    Change ${applied} of ${#FLIP_OFFSETS[@]} applied."
     done
     SLICE_FLIPS=$applied; SLICE_ALREADY=$already
     _hexcache_flush   # the dd writes above dirtied the file; drop the stale slice
@@ -953,7 +948,7 @@ classify_flip_states_slice() {
 report_layout_candidates() {
     local file="$1"
     if (( TEXT_SIZE < 8 )); then return; fi
-    infof "Scanning .text for the IsExtensionAffected skeleton (cmp r/m32,2 ; jg short ; ... ; type/location check)..."
+    infof "This Chrome version isn't recognized yet. Looking for clues to help add support..."
     local total=0 shown=0 max_display=20 marker
     printf -v marker '%b' '\x02\x7f'
     local LC_ALL=C
@@ -987,7 +982,7 @@ report_layout_candidates() {
     done < <(LC_ALL=C grep -a -o -b -F -- "$marker" "$file" 2>/dev/null || true)
     local extra=""
     if (( total > shown )); then extra=" ($((total - shown)) not shown)"; fi
-    infof "Skeleton scan found ${total} candidate site(s)${extra}. None were modified - verify each against mv2-reversing.md before hand-patching."
+    infof "Found ${total} possible spot(s)${extra}. Nothing was changed - please share this and your Chrome version with the developer."
 }
 
 # ============================================================================
@@ -1009,10 +1004,10 @@ write_target() {
     cp -- "$source" "$tmp"
     local shash thash chash
     shash=$(file_sha256 "$source"); thash=$(file_sha256 "$tmp")
-    if [[ "$shash" != "$thash" ]]; then rm -f -- "$tmp"; WRITE_TMP=""; errf "Temp-file verification failed for ${target}."; return 1; fi
+    if [[ "$shash" != "$thash" ]]; then rm -f -- "$tmp"; WRITE_TMP=""; errf "Couldn't write the file safely - nothing was changed."; return 1; fi
     if [[ -n "$expected_hash" ]]; then
         chash=$(file_sha256 "$target")
-        if [[ "$chash" != "$expected_hash" ]]; then rm -f -- "$tmp"; WRITE_TMP=""; errf "Target changed after inspection; refusing to overwrite."; return 1; fi
+        if [[ "$chash" != "$expected_hash" ]]; then rm -f -- "$tmp"; WRITE_TMP=""; errf "Chrome changed while we were working - nothing was changed. Try again."; return 1; fi
     fi
     mv -f -- "$tmp" "$target"; WRITE_TMP=""
     _hexcache_flush   # $target was just replaced; any cached slice is now stale
@@ -1087,7 +1082,7 @@ BACKUP_BUILD_ID=""; BACKUP_IDENTITY=""; BACKUP_SIZE=0; BACKUP_HASH=""; BACKUP_LE
 # identity = build-id (elf) or "macho-x64:HEX,macho-arm64:HEX" (macho).
 save_backup_snapshot() {
     local target="$1" backup="$2" source="$3" identity="$4"
-    mkdir -p -- "$(dirname "$backup")" || { errf "Could not create backup dir $(dirname "$backup")."; return 1; }
+    mkdir -p -- "$(dirname "$backup")" || { errf "Couldn't create the backup folder."; return 1; }
     local prev=""; [[ -f "$backup" ]] && prev=$(file_sha256 "$backup")
     write_target "$backup" "$source" "$prev" || return 1
     local meta size hash container
@@ -1153,15 +1148,15 @@ resign_one() {
     local comp="$1"
     codesign --force --sign - --preserve-metadata=entitlements,flags "$comp" 2>/dev/null && return 0
     codesign --force --sign - "$comp" 2>/dev/null && return 0
-    errf "codesign failed on: ${comp}"; return 1
+    errf "Couldn't re-sign part of the app: ${comp}"; return 1
 }
 
 resign_inside_out() {
     local framework_bundle="$1" app_path="$2"   # framework_bundle kept for call-site compat
     if [[ -z "$app_path" || ! -d "$app_path" ]]; then
-        errf "App bundle not found for re-signing: ${app_path}"; return 1
+        errf "Couldn't find the app to re-sign: ${app_path}"; return 1
     fi
-    infof "Ad-hoc re-signing (inside-out, per-component entitlements preserved)..."
+    infof "Re-signing the app so it opens normally..."
     local items=() line path rc=0
     while IFS= read -r line; do items+=("$line"); done < <(
         {
@@ -1223,14 +1218,13 @@ SKIP_REASON=""
 slice_decision() {
     local container="$1" allow_partial="$2"
     SKIP_REASON=""
-    if (( BEST_SATISFIED == 0 )); then SKIP_REASON="no known layout matched"; return 1; fi
-    if ! $BEST_FULL && (( BEST_TIES > 1 )); then SKIP_REASON="ambiguous (${BEST_TIES} milestones tied)"; return 1; fi
+    if (( BEST_SATISFIED == 0 )); then SKIP_REASON="Chrome version not recognized"; return 1; fi
+    if ! $BEST_FULL && (( BEST_TIES > 1 )); then SKIP_REASON="couldn't tell which Chrome version this is"; return 1; fi
     if [[ "$container" != "elf" && "$container" != "elf-arm64" && "$HOST_CONTAINER" != "$container" ]]; then
-        local label="${container#macho-}"; [[ "$label" == "x64" ]] && label="x86_64"
-        SKIP_REASON="the ${label} slice does not run on this $(host_arch_label) Mac"; return 1
+        SKIP_REASON="not the version your Mac runs"; return 1
     fi
     if ! $BEST_FULL && ! $allow_partial; then
-        SKIP_REASON="only ${BEST_SATISFIED}/${BEST_TOTAL} sites; needs --allow-partial"; return 1
+        SKIP_REASON="only ${BEST_SATISFIED} of ${BEST_TOTAL} changes matched; needs --allow-partial"; return 1
     fi
     return 0
 }
@@ -1285,16 +1279,16 @@ resolve_macho_target() {
     APP_PATH=""; FRAMEWORK_BUNDLE=""; TARGET_FILE=""
     if [[ -d "$path" && "$path" == *.app ]]; then
         APP_PATH="$path"
-        resolve_framework_from_app "$path" || { errf "No Chrome framework inside ${path}"; return 1; }
+        resolve_framework_from_app "$path" || { errf "Couldn't find Chrome inside ${path}"; return 1; }
     elif [[ -d "$path" && "$path" == *.framework ]]; then
         FRAMEWORK_BUNDLE="$path"
         local base; base=$(basename "$path" .framework)
         if [[ -f "$path/Versions/Current/$base" ]]; then TARGET_FILE="$path/Versions/Current/$base"
-        else errf "No versioned binary in ${path}"; return 1; fi
+        else errf "Couldn't find Chrome inside ${path}"; return 1; fi
     elif [[ -f "$path" ]]; then
         TARGET_FILE="$path"        # a loose Mach-O (offline scratch copy)
     else
-        errf "Path is not a .app, .framework, or Mach-O file: ${path}"; return 1
+        errf "That's not a Chrome app or file: ${path}"; return 1
     fi
     return 0
 }
@@ -1328,16 +1322,16 @@ quit_chrome() {
     local app="$1" assume_yes="$2"
     (( $(proc_holders_app "$app") == 0 )) && return 0
     if ! $assume_yes && ! $QUIET; then
-        echo -n "${C_BOLD}Chrome ($(basename "$app")) is running; quit it to patch cleanly? [y/N]: ${C_RESET}"
+        echo -n "${C_BOLD}Chrome ($(basename "$app")) is open. Close it to continue? [y/N]: ${C_RESET}"
         local line; read -r line || return 1
-        case "$line" in y|Y) ;; *) infof "Cancelled - nothing changed."; return 1 ;; esac
+        case "$line" in y|Y) ;; *) infof "Cancelled - nothing was changed."; return 1 ;; esac
     fi
     command -v osascript >/dev/null 2>&1 && osascript -e "quit app \"$app\"" 2>/dev/null || true
     local i
     for (( i = 0; i < 20; i++ )); do (( $(proc_holders_app "$app") == 0 )) && return 0; sleep 0.25; done
     command -v pkill >/dev/null 2>&1 && pkill -f "$app/Contents/MacOS/" 2>/dev/null || true
     for (( i = 0; i < 20; i++ )); do (( $(proc_holders_app "$app") == 0 )) && return 0; sleep 0.25; done
-    errf "Chrome processes still hold the framework; close it manually and retry."; return 1
+    errf "Chrome is still open - close it and try again."; return 1
 }
 
 # ============================================================================
@@ -1397,11 +1391,10 @@ kill_chrome_processes() {
 confirm_force_close() {
     local channel="$1" holders="$2"
     echo ""
-    echo "${C_BOLD}${C_YEL}  !! WARNING: Chrome ${channel} is running !!${C_RESET}"
-    echo "     Close it now to patch cleanly. If you continue, its ${holders} process(es)"
-    echo "     will be FORCE CLOSED and any unsaved tabs or downloads are lost."
+    echo "${C_BOLD}${C_YEL}  Chrome ${channel} is open.${C_RESET}"
+    echo "     I need to close it to make the change. Any unsaved tabs will be lost."
     while true; do
-        echo -n "${C_BOLD}Force close Chrome ${channel} and patch? [y/N]: ${C_RESET}"
+        echo -n "${C_BOLD}Close Chrome ${channel} and continue? [y/N]: ${C_RESET}"
         local line; read -r line || return 1
         case "$line" in
             y|Y) return 0 ;;
@@ -1415,17 +1408,17 @@ request_target_close() {
     holders=$(proc_holders "$target")
     (( holders == 0 )) && return 0
     if $assume_yes; then
-        warnf "Chrome is running and will be force closed (--yes)."
+        warnf "Chrome is open and will be closed (--yes)."
     elif $QUIET; then
-        errf "Chrome is running (${holders} process(es))."
-        echo "    Close it, or pass --yes to force close it."
+        errf "Chrome is open."
+        echo "    Close it, or add --yes to close it automatically."
         return 1
     else
         confirm_force_close "$(basename "$(dirname "$target")")" "$holders" || return 1
     fi
     if ! kill_chrome_processes "$target"; then
-        errf "Chrome processes still hold this binary after 5 seconds."
-        echo "    Close this channel manually and re-run; nothing was written."
+        errf "Chrome is still open - close it and try again."
+        echo "    Nothing was changed."
         return 1
     fi
 }
@@ -1454,18 +1447,18 @@ print_linux_install_row() {
     echo -n "  ${C_BOLD}${idx})${C_RESET} ${C_CYN}${LNX_CHANNELS[$i]}${C_RESET}"
     if [[ -n "${LNX_VERSIONS[$i]}" ]]; then echo -n "  ${LNX_VERSIONS[$i]}"; fi
     if ${LNX_RUNNING[$i]}; then
-        echo -n "  ${C_YEL}[RUNNING, ${LNX_HOLDERS[$i]} process(es)]${C_RESET}"
+        echo -n "  ${C_YEL}[open]${C_RESET}"
     else
-        echo -n "  ${C_GRN}[not running]${C_RESET}"
+        echo -n "  ${C_GRN}[closed]${C_RESET}"
     fi
-    if ${LNX_BACKUPS[$i]}; then echo -n " ${C_DIM}(backup present)${C_RESET}"; fi
+    if ${LNX_BACKUPS[$i]}; then echo -n " ${C_DIM}(backup saved)${C_RESET}"; fi
     echo ""
     echo "      ${C_DIM}${LNX_PATHS[$i]}${C_RESET}"
 }
 
 read_custom_path() {
     while true; do
-        echo -n "${C_BOLD}Enter the full path to chrome binary, blank to cancel: ${C_RESET}"
+        echo -n "${C_BOLD}Enter the full path to the Chrome file, or leave blank to cancel: ${C_RESET}"
         local line; read -r line || return 1
         line="${line#"${line%%[![:space:]]*}"}"
         line="${line%"${line##*[![:space:]]}"}"
@@ -1477,7 +1470,7 @@ read_custom_path() {
         fi
         if [[ -z "$line" ]]; then return 1; fi
         if [[ ! -f "$line" ]]; then
-            errf "Not a file: ${line}"; continue
+            errf "That's not a file. Try again."; continue
         fi
         CHOSEN_CUSTOM_PATH="$line"; return 0
     done
@@ -1486,25 +1479,25 @@ read_custom_path() {
 choose_linux_install() {
     local count=${#LNX_CHANNELS[@]}
     if (( count == 0 )); then
-        warnf "No installed Chrome channel was found."
+        warnf "Couldn't find Chrome on this computer."
         echo ""
         if read_custom_path; then TARGET_FILE="$CHOSEN_CUSTOM_PATH"; return 0; fi
         infof "No path entered - nothing was changed."
         return 1
     fi
     if (( count == 1 )); then
-        okf "One Chrome channel found:"; print_linux_install_row 1 0
+        okf "Found one Chrome:"; print_linux_install_row 1 0
     else
-        echo ""; echo "${TAG_INFO} ${count} Chrome release channels found:"
+        echo ""; echo "${TAG_INFO} Found ${count} Chrome versions:"
         local j
         for (( j = 0; j < count; j++ )); do print_linux_install_row $(( j + 1 )) "$j"; done
-        echo ""; echo "${TAG_INFO} Only the channel you pick is modified; the others keep running."
+        echo ""; echo "${TAG_INFO} Only the one you pick is changed; the others are left alone."
     fi
     while true; do
         if (( count == 1 )); then
-            echo -n "${C_BOLD}Patch this channel? [Enter=yes, r=restore, c=custom path, q=quit]: ${C_RESET}"
+            echo -n "${C_BOLD}Patch this Chrome? [Enter=yes, r=restore, c=custom path, q=quit]: ${C_RESET}"
         else
-            echo -n "${C_BOLD}Which channel do you want to patch? [1-${count}, r=restore, c=custom path, q=quit]: ${C_RESET}"
+            echo -n "${C_BOLD}Which Chrome do you want to patch? [1-${count}, r=restore, c=custom path, q=quit]: ${C_RESET}"
         fi
         local line; read -r line || return 1
         if [[ "$line" == "q" || "$line" == "Q" ]]; then return 1; fi
@@ -1515,9 +1508,9 @@ choose_linux_install() {
         if [[ "$line" == "r" || "$line" == "R" ]]; then
             cmd="restore"
             if (( count == 1 )); then CHOSEN_INDEX=0; return 0; fi
-            echo ""; echo "${TAG_INFO} Restore mode selected. Choose which channel to restore from backup:"
+            echo ""; echo "${TAG_INFO} Restore selected. Which Chrome do you want to restore?"
             while true; do
-                echo -n "${C_BOLD}Which channel do you want to restore? [1-${count}, c=custom path, q=cancel]: ${C_RESET}"
+                echo -n "${C_BOLD}Which Chrome do you want to restore? [1-${count}, c=custom path, q=cancel]: ${C_RESET}"
                 local restore_line; read -r restore_line || return 1
                 if [[ "$restore_line" == "q" || "$restore_line" == "Q" ]]; then infof "Restore cancelled."; return 1; fi
                 if [[ "$restore_line" == "c" || "$restore_line" == "C" ]]; then
@@ -1543,15 +1536,15 @@ choose_linux_install() {
 choose_macos_install() {
     local count=${#MAC_APPS[@]} i
     if (( count == 0 )); then
-        warnf "No installed Google Chrome.app was found under /Applications or ~/Applications."
-        echo "    Pass a path explicitly: bash $0 patch \"/path/to/Google Chrome.app\""
+        warnf "Couldn't find Google Chrome on this Mac."
+        echo "    Give the path, e.g. bash $0 patch \"/path/to/Google Chrome.app\""
         return 1
     fi
-    echo ""; echo "${TAG_INFO} ${count} Chrome install(s) found:"
+    echo ""; echo "${TAG_INFO} Found ${count} Chrome install(s):"
     for (( i = 0; i < count; i++ )); do
         echo -n "  ${C_BOLD}$(( i + 1 ))${C_RESET}) ${C_CYN}${MAC_LABELS[$i]}${C_RESET}"
         [[ -n "${MAC_VERSIONS[$i]}" ]] && echo -n "  ${MAC_VERSIONS[$i]}"
-        ${MAC_RUNNING[$i]} && echo -n "  ${C_YEL}[running]${C_RESET}" || echo -n "  ${C_GRN}[not running]${C_RESET}"
+        ${MAC_RUNNING[$i]} && echo -n "  ${C_YEL}[open]${C_RESET}" || echo -n "  ${C_GRN}[closed]${C_RESET}"
         echo ""; echo "      ${C_DIM}${MAC_APPS[$i]}${C_RESET}"
     done
     while true; do
@@ -1570,65 +1563,74 @@ choose_macos_install() {
 do_patch_elf() {
     local target="$1" assume_yes="$2" allow_partial="$3"
     local fsize; fsize=$(file_size "$target")
-    (( fsize > 0 )) || { errf "Error: the target file is empty."; return 1; }
-    okf "Target: ${target} (${fsize} bytes)."
+    (( fsize > 0 )) || { errf "That file is empty."; return 1; }
+    okf "Read Chrome from ${target}."
 
     parse_elf "$target" || return 1
     local target_id target_hash
     target_id=$(get_elf_build_id "$target")
     target_hash=$(file_sha256 "$target")
-    [[ -n "$target_id" ]] || { errf "Could not extract a valid GNU build-id from ${target}."; return 1; }
+    [[ -n "$target_id" ]] || { errf "This doesn't look like a valid Chrome file."; return 1; }
 
-    infof "Probing target for a known Chrome layout (${NUM_MILESTONES} milestone table(s))..."
+    infof "Checking your Chrome version..."
     probe_slice 0 "$target"
     if (( BEST_SATISFIED == 0 )); then
         report_layout_candidates "$target"
-        warnf "No known MV2 layout matched this binary; nothing was modified."
+        warnf "This Chrome version isn't recognized - nothing was changed."
         return 1
     fi
     if ! $BEST_FULL && (( BEST_TIES > 1 )); then
-        warnf "${BEST_TIES} milestones tied at ${BEST_SATISFIED} sites; the layout is ambiguous."
+        warnf "Couldn't tell which Chrome version this is - nothing was changed."
         return 1
     fi
-    classify_flip_states_slice "$target" || { errf "Located jump bytes are in an invalid mixed/corrupt state."; return 1; }
+    classify_flip_states_slice "$target" || { errf "Chrome looks partly changed or damaged - nothing was changed."; return 1; }
 
     local backup="${target}.bak"
     local work_file; work_file=$(mktemp "${TMPDIR:-/tmp}/chrome-mv2-work.XXXXXX"); WORK_FILE="$work_file"
 
     if [[ ! -f "$backup" ]]; then
+        # Already fully patched, but no backup to prove the pre-patch bytes: MV2 is
+        # already on, so report that rather than the scary "not untouched" decline.
+        if $BEST_FULL && (( STATE_STOCK == 0 && STATE_PATCHED > 0 )); then
+            rm -f -- "$work_file"; WORK_FILE=""
+            successf "Chrome is already patched - Manifest V2 is already on (Chrome ${BEST_MS_NAME})."
+            echo "          There's no backup here, so 'restore' isn't available."
+            echo "          Reinstall Chrome if you want a clean, restorable copy."
+            return 0
+        fi
         if { ! $BEST_FULL && ! $allow_partial; } || (( STATE_PATCHED != 0 )); then
-            errf "No clean backup exists and the target is not a complete stock layout."
-            echo "    Restore/reinstall Chrome first; refusing to save modified bytes as the baseline."
+            errf "There's no backup yet, and this doesn't look like an untouched Chrome."
+            echo "    Reinstall Chrome first so we can save a clean backup."
             rm -f -- "$work_file"; WORK_FILE=""; return 1
         fi
-        infof "Creating initial backup copy: ${backup} ..."
+        infof "Saving a backup..."
         save_backup_snapshot "$target" "$backup" "$target" "$target_id" || { rm -f -- "$work_file"; WORK_FILE=""; return 1; }
-        validate_backup_snapshot "$backup" || { errf "Initial backup verification failed."; rm -f -- "$work_file"; WORK_FILE=""; return 1; }
-        okf "Initial backup created and verified."
+        validate_backup_snapshot "$backup" || { errf "The backup couldn't be verified."; rm -f -- "$work_file"; WORK_FILE=""; return 1; }
+        okf "Backup saved."
     else
-        validate_backup_snapshot "$backup" || { errf "Backup or its metadata failed validation; refusing to overwrite it."; rm -f -- "$work_file"; WORK_FILE=""; return 1; }
+        validate_backup_snapshot "$backup" || { errf "The backup couldn't be verified, so I won't overwrite it."; rm -f -- "$work_file"; WORK_FILE=""; return 1; }
         parse_elf "$backup" || { rm -f -- "$work_file"; WORK_FILE=""; return 1; }
         probe_slice 0 "$backup"
-        classify_flip_states_slice "$backup" || { errf "Backup jump state is invalid."; rm -f -- "$work_file"; WORK_FILE=""; return 1; }
+        classify_flip_states_slice "$backup" || { errf "The backup looks damaged."; rm -f -- "$work_file"; WORK_FILE=""; return 1; }
         if { ! $BEST_FULL && ! $allow_partial; } || (( BEST_TIES != 1 || STATE_PATCHED != 0 )); then
-            errf "Backup is not a complete clean stock layout."; rm -f -- "$work_file"; WORK_FILE=""; return 1
+            errf "The backup doesn't look like an untouched Chrome."; rm -f -- "$work_file"; WORK_FILE=""; return 1
         fi
         if [[ "$target_id" != "$BACKUP_BUILD_ID" ]]; then
             parse_elf "$target" || { rm -f -- "$work_file"; WORK_FILE=""; return 1; }
             probe_slice 0 "$target"
             classify_flip_states_slice "$target" || { rm -f -- "$work_file"; WORK_FILE=""; return 1; }
             if ! $BEST_FULL || (( BEST_TIES != 1 || STATE_PATCHED != 0 )); then
-                errf "Chrome changed builds, but the new target is not a complete recognized stock layout."
-                echo "    The existing backup was preserved. Add signatures for this build first."
+                errf "This updated Chrome isn't fully supported yet."
+                echo "    Your backup was kept. Please report this Chrome version."
                 rm -f -- "$work_file"; WORK_FILE=""; return 1
             fi
-            infof "Chrome update detected (build-id changed) - refreshing backup ${backup} ..."
+            infof "Chrome was updated - saving a fresh backup..."
             save_backup_snapshot "$target" "$backup" "$target" "$target_id" || { rm -f -- "$work_file"; WORK_FILE=""; return 1; }
-            validate_backup_snapshot "$backup" || { errf "Updated backup verification failed."; rm -f -- "$work_file"; WORK_FILE=""; return 1; }
-            okf "Backup updated and verified."
+            validate_backup_snapshot "$backup" || { errf "The new backup couldn't be verified."; rm -f -- "$work_file"; WORK_FILE=""; return 1; }
+            okf "Backup updated."
         elif $BACKUP_LEGACY; then
             save_backup_snapshot "$target" "$backup" "$backup" "$BACKUP_BUILD_ID" || { rm -f -- "$work_file"; WORK_FILE=""; return 1; }
-            okf "Legacy backup validated and metadata added."
+            okf "Backup checked and updated."
         fi
     fi
     cp -- "$backup" "$work_file"
@@ -1636,57 +1638,57 @@ do_patch_elf() {
     probe_slice 0 "$work_file"
     if (( BEST_SATISFIED == 0 )); then
         report_layout_candidates "$work_file"
-        warnf "No known MV2 layout matched this binary."
+        warnf "This Chrome version isn't recognized."
         rm -f -- "$work_file"; WORK_FILE=""; return 1
     fi
     if ! $BEST_FULL && (( BEST_TIES > 1 )); then
-        warnf "${BEST_TIES} milestones tied at ${BEST_SATISFIED} sites; declining ambiguous layout."
+        warnf "Couldn't tell which Chrome version this is - nothing was changed."
         rm -f -- "$work_file"; WORK_FILE=""; return 1
     fi
     if ! $BEST_FULL && ! $allow_partial; then
-        warnf "Only ${BEST_SATISFIED}/${BEST_TOTAL} sites matched; partial writes require --allow-partial."
+        warnf "Only ${BEST_SATISFIED} of ${BEST_TOTAL} changes matched; a partial patch needs --allow-partial."
         rm -f -- "$work_file"; WORK_FILE=""; return 1
     fi
 
-    infof "Chrome ${BEST_MS_NAME} MV2 layout (${BEST_SATISFIED}/${BEST_TOTAL} sites, ${#FLIP_OFFSETS[@]} flip(s))."
+    infof "Found Chrome ${BEST_MS_NAME}. Applying ${#FLIP_OFFSETS[@]} change(s)..."
     apply_flips_slice "$work_file"
 
     # Verify the prepared image is fully flipped and unambiguous.
     parse_elf "$work_file" || { rm -f -- "$work_file"; WORK_FILE=""; return 1; }
     probe_slice 0 "$work_file"
-    (( BEST_SATISFIED > 0 && BEST_TIES == 1 )) || { errf "Prepared output failed post-patch verification."; rm -f -- "$work_file"; WORK_FILE=""; return 1; }
-    classify_flip_states_slice "$work_file" || { errf "Prepared output has invalid gate bytes."; rm -f -- "$work_file"; WORK_FILE=""; return 1; }
-    (( STATE_STOCK == 0 && STATE_PATCHED == ${#FLIP_OFFSETS[@]} )) || { errf "Prepared output is not fully flipped."; rm -f -- "$work_file"; WORK_FILE=""; return 1; }
+    (( BEST_SATISFIED > 0 && BEST_TIES == 1 )) || { errf "Something went wrong while preparing the change - nothing was changed."; rm -f -- "$work_file"; WORK_FILE=""; return 1; }
+    classify_flip_states_slice "$work_file" || { errf "Something went wrong while preparing the change - nothing was changed."; rm -f -- "$work_file"; WORK_FILE=""; return 1; }
+    (( STATE_STOCK == 0 && STATE_PATCHED == ${#FLIP_OFFSETS[@]} )) || { errf "Something went wrong while preparing the change - nothing was changed."; rm -f -- "$work_file"; WORK_FILE=""; return 1; }
 
     local prepared_hash; prepared_hash=$(file_sha256 "$work_file")
     if [[ "$prepared_hash" == "$target_hash" ]]; then
         rm -f -- "$work_file"; WORK_FILE=""
-        successf "Target is already fully patched; no write was needed."
+        successf "Already done - no change was needed."
         return 0
     fi
     if [[ "$target_hash" != "$BACKUP_HASH" ]]; then
-        errf "Target contains changes unrelated to this patch; refusing to overwrite them."
-        echo "    Restore/reinstall Chrome or inspect the binary manually before retrying."
+        errf "This Chrome has other changes we didn't make, so we won't overwrite it."
+        echo "    Reinstall Chrome, or check the file yourself, then try again."
         rm -f -- "$work_file"; WORK_FILE=""; return 1
     fi
 
     request_target_close "$target" "$assume_yes" || { rm -f -- "$work_file"; WORK_FILE=""; return 1; }
     if (( $(proc_holders "$target") > 0 )); then
-        errf "Chrome restarted after it was closed; nothing was written."
+        errf "Chrome reopened before we could finish - nothing was changed."
         rm -f -- "$work_file"; WORK_FILE=""; return 1
     fi
     write_target "$target" "$work_file" "$target_hash" || { rm -f -- "$work_file"; WORK_FILE=""; return 1; }
     rm -f -- "$work_file"; WORK_FILE=""
-    if [[ "$(file_sha256 "$target")" != "$prepared_hash" ]]; then errf "Post-write SHA-256 verification failed."; return 1; fi
+    if [[ "$(file_sha256 "$target")" != "$prepared_hash" ]]; then errf "The change didn't save correctly."; return 1; fi
 
     rule
     if $BEST_FULL; then
-        successf "Binary successfully patched!"
-        echo "          Manifest V2 extension support re-enabled (Chrome ${BEST_MS_NAME} layout)."
+        successf "Done. Manifest V2 re-enabled."
+        echo "          Your older extensions will work again (Chrome ${BEST_MS_NAME}). Restart Chrome."
     else
-        echo "${TAG_WARNING} Binary was PARTIALLY patched (Chrome ${BEST_MS_NAME} layout, ${BEST_SATISFIED}/${BEST_TOTAL} gates)."
-        echo "          $((BEST_TOTAL - BEST_SATISFIED)) gate(s) were not located, so MV2 may STILL be blocked."
-        echo "          Please report the exact version. Revert with: sudo bash $0 restore"
+        echo "${TAG_WARNING} Only part of the change was applied (Chrome ${BEST_MS_NAME}, ${BEST_SATISFIED}/${BEST_TOTAL})."
+        echo "          $((BEST_TOTAL - BEST_SATISFIED)) part(s) couldn't be found, so this may not fully work."
+        echo "          Please report your Chrome version. To undo: sudo bash $0 restore"
     fi
     rule
     return 0
@@ -1695,39 +1697,39 @@ do_patch_elf() {
 do_restore_elf() {
     local target="$1" assume_yes="$2" force_restore="$3"
     local backup="${target}.bak"
-    infof "Restore mode requested..."
-    [[ -f "$backup" ]] || { errf "Error: backup file ${backup} does not exist."; return 1; }
-    validate_backup_snapshot "$backup" || { errf "Backup or its metadata failed validation."; return 1; }
+    infof "Restoring the original Chrome..."
+    [[ -f "$backup" ]] || { errf "No backup found, so there's nothing to restore."; return 1; }
+    validate_backup_snapshot "$backup" || { errf "The backup couldn't be verified."; return 1; }
     parse_elf "$backup" || return 1
     probe_slice 0 "$backup"
     classify_flip_states_slice "$backup" || return 1
     if (( BEST_SATISFIED == 0 || BEST_TIES != 1 || STATE_PATCHED != 0 )); then
-        errf "Backup is not a complete clean stock layout."; return 1
+        errf "The backup doesn't look like an untouched Chrome."; return 1
     fi
-    okf "Backup verified: clean stock Chrome ${BEST_MS_NAME} (${BEST_SATISFIED}/${BEST_TOTAL} MV2 gate sites intact)."
+    okf "Backup looks good (Chrome ${BEST_MS_NAME})."
     parse_elf "$target" || return 1
     local target_id target_hash
     target_id=$(get_elf_build_id "$target")
     target_hash=$(file_sha256 "$target")
     if [[ "$target_id" != "$BACKUP_BUILD_ID" ]] && ! $force_restore; then
-        errf "Backup belongs to a different Chrome build; refusing to downgrade the installed binary."
-        echo "    Use --force-restore only when restoring that older build is intentional."
+        errf "This backup is from a different Chrome version, so I won't use it."
+        echo "    Add --force-restore only if you really mean to go back to that version."
         return 1
     fi
-    if [[ "$target_id" != "$BACKUP_BUILD_ID" ]]; then warnf "Forcing restore from a different Chrome build (--force-restore)."; fi
+    if [[ "$target_id" != "$BACKUP_BUILD_ID" ]]; then warnf "Restoring a different Chrome version (--force-restore)."; fi
     if [[ "$target_hash" == "$BACKUP_HASH" ]]; then
-        successf "Target already matches the verified backup; no write was needed."
+        successf "Chrome is already the original - nothing to undo."
         rm -f -- "$backup" "$(backup_meta_path "$backup")"
-        infof "Backup removed; the installed binary is the original stock build."
+        infof "Backup removed - Chrome is back to normal."
         return 0
     fi
     request_target_close "$target" "$assume_yes" || return 1
-    if (( $(proc_holders "$target") > 0 )); then errf "Chrome restarted after it was closed; nothing was written."; return 1; fi
+    if (( $(proc_holders "$target") > 0 )); then errf "Chrome reopened before we could finish - nothing was changed."; return 1; fi
     write_target "$target" "$backup" "$target_hash" || return 1
-    if [[ "$(file_sha256 "$target")" != "$BACKUP_HASH" ]]; then errf "Post-restore SHA-256 verification failed."; return 1; fi
-    successf "Original binary successfully restored from backup!"
+    if [[ "$(file_sha256 "$target")" != "$BACKUP_HASH" ]]; then errf "The restore didn't save correctly."; return 1; fi
+    successf "Done. Your original Chrome is back."
     rm -f -- "$backup" "$(backup_meta_path "$backup")"
-    infof "Backup removed; the installed binary is the original stock build."
+    infof "Backup removed - Chrome is back to normal."
     return 0
 }
 
@@ -1735,30 +1737,27 @@ do_check_elf() {
     local target="$1" build_id size hash
     parse_elf "$target" || return 1
     build_id=$(get_elf_build_id "$target"); size=$(file_size "$target"); hash=$(file_sha256 "$target")
-    okf "ELF identity: build-id=${build_id}, size=${size}, SHA-256=${hash}"
     probe_slice 0 "$target"
     if (( BEST_SATISFIED == 0 )); then
-        warnf "No known MV2 layout matched."
+        warnf "This Chrome version isn't recognized yet."
     elif ! $BEST_FULL && (( BEST_TIES > 1 )); then
-        warnf "${BEST_TIES} milestones tied at ${BEST_SATISFIED} sites; layout is ambiguous."
+        warnf "Couldn't tell which Chrome version this is."
     else
-        classify_flip_states_slice "$target" || { warnf "Located gates contain invalid bytes."; return 1; }
-        local state="patched"
-        (( STATE_STOCK > 0 && STATE_PATCHED == 0 )) && state="stock"
-        (( STATE_STOCK > 0 && STATE_PATCHED > 0 )) && state="mixed"
-        okf "Layout: Chrome ${BEST_MS_NAME}, ${BEST_SATISFIED}/${BEST_TOTAL} sites, state=${state}."
+        classify_flip_states_slice "$target" || { warnf "Chrome looks partly changed or damaged."; return 1; }
+        local state="already patched"
+        (( STATE_STOCK > 0 && STATE_PATCHED == 0 )) && state="not patched yet"
+        (( STATE_STOCK > 0 && STATE_PATCHED > 0 )) && state="partly patched"
+        okf "This is Chrome ${BEST_MS_NAME} - ${state}."
     fi
     local backup="${target}.bak"
     if [[ -f "$backup" ]]; then
         if validate_backup_snapshot "$backup"; then
-            local same=false
-            [[ "$build_id" == "$BACKUP_BUILD_ID" ]] && same=true
-            okf "Backup: verified, same build=${same}, metadata=$(! $BACKUP_LEGACY && echo true || echo false)."
+            okf "A backup is saved."
         else
-            warnf "Backup: invalid."
+            warnf "A backup exists but looks damaged."
         fi
     else
-        infof "Backup: absent."
+        infof "No backup saved yet."
     fi
     $BEST_FULL && (( BEST_TIES == 1 ))
 }
@@ -1771,33 +1770,30 @@ do_check_macho() {
     local target="$1"
     parse_macho "$target" || return 1
     compute_identity "$target"; TARGET_TOKEN=$(identity_token)
-    okf "Mach-O identity (per-slice UUID): ${IDENTITY_UUIDS}"
-    okf "Size=$(file_size "$target"), SHA-256=$(file_sha256 "$target")"
     local idx
     for (( idx = 0; idx < NUM_SLICES; idx++ )); do
         local c="${SLICE_CONTAINER[$idx]}"
         probe_slice "$idx" "$target"
         if (( BEST_SATISFIED == 0 )); then
-            warnf "  ${c}: no known MV2 layout matched."
+            warnf "  ${c#macho-}: this Chrome version isn't recognized yet."
         elif ! $BEST_FULL && (( BEST_TIES > 1 )); then
-            warnf "  ${c}: ${BEST_TIES} milestones tied at ${BEST_SATISFIED}; ambiguous."
+            warnf "  ${c#macho-}: couldn't tell which Chrome version this is."
         else
             if classify_flip_states_slice "$target"; then
-                local state="stock"
-                if (( STATE_PATCHED > 0 && STATE_STOCK == 0 )); then state="patched"
-                elif (( STATE_PATCHED > 0 && STATE_STOCK > 0 )); then state="mixed"; fi
-                okf "  ${c}: Chrome ${BEST_MS_NAME}, ${BEST_SATISFIED}/${BEST_TOTAL} sites, state=${state}."
+                local state="not patched yet"
+                if (( STATE_PATCHED > 0 && STATE_STOCK == 0 )); then state="already patched"
+                elif (( STATE_PATCHED > 0 && STATE_STOCK > 0 )); then state="partly patched"; fi
+                okf "  ${c#macho-}: Chrome ${BEST_MS_NAME} - ${state}."
             else
-                warnf "  ${c}: located gates contain invalid bytes."
+                warnf "  ${c#macho-}: looks partly changed or damaged."
             fi
         fi
     done
     local backup; backup=$(backup_path)
     if [[ -f "$backup" ]]; then
-        if validate_backup_snapshot "$backup"; then okf "Backup: verified (metadata=$(! $BACKUP_LEGACY && echo true || echo false))."
-        else warnf "Backup: invalid."; fi
-        infof "Backup path: ${backup}"
-    else infof "Backup: absent (would be ${backup})."; fi
+        if validate_backup_snapshot "$backup"; then okf "A backup is saved."
+        else warnf "A backup exists but looks damaged."; fi
+    else infof "No backup saved yet."; fi
     return 0
 }
 
@@ -1815,44 +1811,44 @@ remove_macho_backup() {
 
 do_restore_macho() {
     local target="$1" app_path="$2" assume_yes="$3" force_restore="$4"
-    infof "Restore mode requested..."
+    infof "Restoring the original Chrome..."
     parse_macho "$target" >/dev/null || return 1
     compute_identity "$target"; local target_id="$IDENTITY_UUIDS"
     TARGET_TOKEN=$(identity_token)                 # backup dir is keyed by this
     local backup; backup=$(backup_path)
-    [[ -f "$backup" ]] || { errf "Backup ${backup} does not exist."; return 1; }
-    validate_backup_snapshot "$backup" || { errf "Backup or metadata failed validation."; return 1; }
-    okf "Backup verified: clean stock Chrome framework."
+    [[ -f "$backup" ]] || { errf "No backup found, so there's nothing to restore."; return 1; }
+    validate_backup_snapshot "$backup" || { errf "The backup couldn't be verified."; return 1; }
+    okf "Backup looks good."
 
     local target_hash; target_hash=$(file_sha256 "$target")
     if [[ "$target_id" != "$BACKUP_IDENTITY" ]] && ! $force_restore; then
-        errf "Backup belongs to a different Chrome build; refusing to downgrade."
-        echo "    Use --force-restore only if restoring that older build is intentional."; return 1
+        errf "This backup is from a different Chrome version, so I won't use it."
+        echo "    Add --force-restore only if you really mean to go back to that version."; return 1
     fi
     if [[ "$target_hash" == "$BACKUP_HASH" ]]; then
-        successf "Target already matches the backup; nothing to do."
+        successf "Chrome is already the original - nothing to undo."
         remove_macho_backup "$backup"
-        infof "Backup removed; the installed framework is the original stock build."
+        infof "Backup removed - Chrome is back to normal."
         return 0
     fi
 
     if [[ -n "$app_path" ]]; then quit_chrome "$app_path" "$assume_yes" || return 1; fi
     write_target "$target" "$backup" "$target_hash" || return 1
-    if [[ "$(file_sha256 "$target")" != "$BACKUP_HASH" ]]; then errf "Post-restore SHA-256 mismatch."; return 1; fi
+    if [[ "$(file_sha256 "$target")" != "$BACKUP_HASH" ]]; then errf "The restore didn't save correctly."; return 1; fi
     if [[ -n "$app_path" ]] && have_codesign; then
-        resign_inside_out "$FRAMEWORK_BUNDLE" "$app_path" || warnf "Re-seal after restore failed; re-run: bash $0 restore \"$app_path\""
+        resign_inside_out "$FRAMEWORK_BUNDLE" "$app_path" || warnf "Re-signing failed. Try again: bash $0 restore \"$app_path\""
     fi
-    successf "Original framework restored from backup."
+    successf "Done. Your original Chrome is back."
     remove_macho_backup "$backup"
-    infof "Backup removed; the installed framework is the original stock build."
+    infof "Backup removed - Chrome is back to normal."
     return 0
 }
 
 do_patch_macho() {
     local target="$1" app_path="$2" assume_yes="$3" allow_partial="$4"
     local size; size=$(file_size "$target")
-    (( size > 0 )) || { errf "Target file is empty."; return 1; }
-    okf "Target: ${target} (${size} bytes)."
+    (( size > 0 )) || { errf "That file is empty."; return 1; }
+    okf "Read Chrome from ${target}."
     parse_macho "$target" || return 1
     compute_identity "$target"; local target_id="$IDENTITY_UUIDS"
     TARGET_TOKEN=$(identity_token)                 # backup dir is keyed by this
@@ -1865,25 +1861,25 @@ do_patch_macho() {
         probe_slice "$idx" "$target"
         if slice_decision "$c" "$allow_partial"; then
             to_patch+=("$idx"); ic+=("$c"); any=true
-            infof "  ${c}: will patch (Chrome ${BEST_MS_NAME}, ${BEST_SATISFIED}/${BEST_TOTAL} sites)."
+            infof "  ${c#macho-}: found Chrome ${BEST_MS_NAME} - will patch."
         else
-            warnf "  ${c}: skipped (${SKIP_REASON})."
+            warnf "  ${c#macho-}: skipped (${SKIP_REASON})."
             [[ "$c" == "macho-x64" ]] && default_declined=true
         fi
     done
-    if ! $any; then errf "No slice matched a known, permitted MV2 layout; nothing was modified."; return 1; fi
+    if ! $any; then errf "This Chrome version isn't recognized - nothing was changed."; return 1; fi
 
     local backup; backup=$(backup_path)
     if [[ ! -f "$backup" ]]; then
-        infof "Creating initial backup: ${backup}"
+        infof "Saving a backup..."
         save_backup_snapshot "$target" "$backup" "$target" "$target_id" || return 1
-        validate_backup_snapshot "$backup" || { errf "Initial backup verification failed."; return 1; }
+        validate_backup_snapshot "$backup" || { errf "The backup couldn't be verified."; return 1; }
     else
-        validate_backup_snapshot "$backup" || { errf "Backup/metadata failed validation; refusing to overwrite it."; return 1; }
+        validate_backup_snapshot "$backup" || { errf "The backup couldn't be verified, so I won't overwrite it."; return 1; }
         if [[ "$target_id" != "$BACKUP_IDENTITY" ]]; then
-            infof "Chrome update detected (UUID changed) - refreshing backup."
+            infof "Chrome was updated - saving a fresh backup..."
             save_backup_snapshot "$target" "$backup" "$target" "$target_id" || return 1
-            validate_backup_snapshot "$backup" || { errf "Updated backup verification failed."; return 1; }
+            validate_backup_snapshot "$backup" || { errf "The new backup couldn't be verified."; return 1; }
         elif $BACKUP_LEGACY; then
             save_backup_snapshot "$target" "$backup" "$backup" "$BACKUP_IDENTITY" || return 1
         fi
@@ -1902,15 +1898,15 @@ do_patch_macho() {
     parse_macho "$work" >/dev/null || { rm -f -- "$work"; WORK_FILE=""; return 1; }
     for k in "${to_patch[@]}"; do
         probe_slice "$k" "$work"
-        classify_flip_states_slice "$work" || { errf "Prepared output has invalid gate bytes."; rm -f -- "$work"; WORK_FILE=""; return 1; }
-        if (( STATE_STOCK != 0 )); then errf "Prepared ${SLICE_CONTAINER[$k]} slice is not fully flipped."; rm -f -- "$work"; WORK_FILE=""; return 1; fi
+        classify_flip_states_slice "$work" || { errf "Something went wrong while preparing the change - nothing was changed."; rm -f -- "$work"; WORK_FILE=""; return 1; }
+        if (( STATE_STOCK != 0 )); then errf "Something went wrong while preparing the change - nothing was changed."; rm -f -- "$work"; WORK_FILE=""; return 1; fi
     done
 
     local prepared_hash; prepared_hash=$(file_sha256 "$work")
-    if [[ "$prepared_hash" == "$target_hash" ]]; then rm -f -- "$work"; WORK_FILE=""; successf "Target already fully patched for the selected slices."; return 0; fi
+    if [[ "$prepared_hash" == "$target_hash" ]]; then rm -f -- "$work"; WORK_FILE=""; successf "Already done - no change was needed."; return 0; fi
     if [[ "$target_hash" != "$BACKUP_HASH" ]]; then
-        errf "Target has changes unrelated to this patch; refusing to overwrite them."
-        echo "    Reinstall Chrome or inspect the framework before retrying."; rm -f -- "$work"; WORK_FILE=""; return 1
+        errf "This Chrome has other changes we didn't make, so we won't overwrite it."
+        echo "    Reinstall Chrome, or check the file yourself, then try again."; rm -f -- "$work"; WORK_FILE=""; return 1
     fi
 
     if [[ -n "$app_path" ]]; then quit_chrome "$app_path" "$assume_yes" || { rm -f -- "$work"; WORK_FILE=""; return 1; }; fi
@@ -1923,7 +1919,7 @@ do_patch_macho() {
     if [[ -n "$app_path" ]]; then
         if have_codesign; then
             if ! resign_inside_out "$FRAMEWORK_BUNDLE" "$app_path" || ! verify_signature "$app_path"; then
-                errf "Re-sign/verify failed; rolling the framework binary back to stock."
+                errf "Re-signing failed - putting the original Chrome back."
                 write_target "$target" "$backup" "" || true
                 # resign_inside_out signs inside-out, so it may have already re-signed
                 # sibling bundle components before failing. A framework-only rollback
@@ -1931,25 +1927,25 @@ do_patch_macho() {
                 # state. Re-sign+verify the reverted bundle and report honestly.
                 if resign_inside_out "$FRAMEWORK_BUNDLE" "$app_path" >/dev/null 2>&1 \
                    && verify_signature "$app_path" >/dev/null 2>&1; then
-                    infof "Framework reverted to stock and re-signed; the app should launch."
+                    infof "Restored the original Chrome. It should open normally."
                 else
-                    warnf "The bundle may be in an inconsistent signing state and may not launch."
-                    echo "    Run a full restore for a clean stock bundle:  bash $0 restore \"$app_path\""
+                    warnf "Chrome may not open. Run a full restore to be safe."
+                    echo "    To restore: bash $0 restore \"$app_path\""
                 fi
                 return 1
             fi
-            okf "Ad-hoc signature verified (codesign --verify --deep --strict)."
+            okf "Re-signed and verified."
         else
-            errf "codesign not found at /usr/bin/codesign (unexpected - it ships with macOS)."
-            echo "    The framework is patched but UNSIGNED and will not launch on Apple Silicon."
-            echo "    Restore stock with:  bash $0 restore \"$app_path\""
+            errf "Couldn't find 'codesign' (it normally comes with macOS)."
+            echo "    Chrome was changed but isn't signed, so it may not open."
+            echo "    To restore: bash $0 restore \"$app_path\""
             return 1
         fi
     fi
 
     rule
-    successf "Manifest V2 re-enabled for: ${ic[*]}"
-    [[ -n "$app_path" ]] && echo "          Relaunch Chrome. Revert with: bash $0 restore \"$app_path\""
+    successf "Done. Manifest V2 re-enabled."
+    [[ -n "$app_path" ]] && echo "          Restart Chrome. To undo: bash $0 restore \"$app_path\""
     rule
     return 0
 }
@@ -1967,17 +1963,17 @@ resolve_any_target() {
     if [[ -d "$path" ]]; then
         case "$path" in
             *.app|*.framework) TARGET_CONTAINER="macho"; resolve_macho_target "$path" || return 1 ;;
-            *) errf "Directory is not a .app or .framework: ${path}"; return 1 ;;
+            *) errf "That folder isn't a Chrome app: ${path}"; return 1 ;;
         esac
     elif [[ -f "$path" ]]; then
         local kind; kind=$(detect_container_kind "$path")
         case "$kind" in
             elf)   TARGET_CONTAINER="elf"; TARGET_FILE="$path" ;;
             macho) TARGET_CONTAINER="macho"; resolve_macho_target "$path" || return 1 ;;
-            *)     errf "Unrecognized binary (neither ELF nor Mach-O): ${path}"; return 1 ;;
+            *)     errf "That doesn't look like a Chrome file: ${path}"; return 1 ;;
         esac
     else
-        errf "Path is not a file or directory: ${path}"; return 1
+        errf "That path doesn't exist: ${path}"; return 1
     fi
     return 0
 }
@@ -1986,30 +1982,26 @@ print_usage() {
     cat <<EOF
 Usage: bash chrome-mv2.sh [command] [path] [options]
 
-Re-enables Manifest V2 extension support in Google Chrome by flipping the
-inlined IsExtensionAffected manifest-version checks. One script for both Unix
-targets: it patches an ELF chrome (Linux) or the universal Mach-O framework
-inside Google Chrome.app (macOS), detecting the container from the file magic.
-On macOS only the slice matching this Mac's CPU is patched, then the app is
-ad-hoc re-signed so it launches.
+Turns Manifest V2 extension support back on in Google Chrome. Works on both
+Linux (the chrome binary) and macOS (Google Chrome.app). On macOS it also
+re-signs the app so it opens normally.
 
 Commands:
-  patch                  Flip the MV2 gates (default if omitted).
-  restore                Restore the target from its verified .bak.
-  check                  Read-only layout/patch/backup diagnostics.
+  patch                  Turn Manifest V2 back on (default).
+  restore                Undo the change and put the original Chrome back.
+  check                  Show the current status. Changes nothing.
 
 Arguments:
-  path                   Linux: full path to the chrome binary. macOS: a Google
-                         Chrome.app, a *.framework, or the framework Mach-O file.
-                         If omitted, installed Chrome is discovered by host OS.
+  path                   Path to Chrome. On macOS, a Google Chrome.app also works.
+                         If left out, installed Chrome is found automatically.
 
 Options:
-  -y, --yes              Quit/force-close a running Chrome without asking.
-  -q, --quiet            Do not pause for interactive prompts (for scripting).
-      --allow-partial    Developer override: write an incomplete milestone.
-      --force-restore    Restore a backup from a different Chrome build.
-      --signatures PATH  Use this external signature JSON (needs python3).
-  -v, --version          Print the tool version and exit.
+  -y, --yes              Close a running Chrome without asking.
+  -q, --quiet            Don't ask any questions (for scripts).
+      --allow-partial    Developer option: allow an incomplete patch.
+      --force-restore    Restore a backup from a different Chrome version.
+      --signatures PATH  Use an external signatures file (needs python3).
+  -v, --version          Show the version and exit.
   -h, --help             Show this help and exit.
 
 Environment:
@@ -2062,45 +2054,45 @@ main() {
             *) target_path="${positional[0]}" ;;
         esac
     fi
-    (( ${#positional[@]} <= 2 )) || { errf "Too many positional arguments."; print_usage; exit 2; }
+    (( ${#positional[@]} <= 2 )) || { errf "Too many arguments."; print_usage; exit 2; }
 
     load_milestones || exit 1
     banner
 
     local tool
     for tool in od dd grep head mktemp cp mv awk; do
-        command -v "$tool" >/dev/null 2>&1 || { errf "Required tool '${tool}' not found."; exit 1; }
+        command -v "$tool" >/dev/null 2>&1 || { errf "A required tool is missing: '${tool}'."; exit 1; }
     done
     command -v shasum >/dev/null 2>&1 || command -v sha256sum >/dev/null 2>&1 || { errf "Need shasum or sha256sum."; exit 1; }
 
     # Resolve the target. A given path is dispatched by magic; otherwise install
     # discovery is chosen by the host OS.
     if [[ -n "$target_path" ]]; then
-        [[ -e "$target_path" ]] || { errf "Path does not exist: ${target_path}"; exit 1; }
+        [[ -e "$target_path" ]] || { errf "That path doesn't exist: ${target_path}"; exit 1; }
         resolve_any_target "$target_path" || exit 1
     elif [[ "$(uname -s 2>/dev/null || echo)" == "Darwin" ]]; then
-        infof "Scanning for installed Google Chrome..."
+        infof "Looking for Chrome..."
         enumerate_macos_installs
         if $QUIET; then
-            (( ${#MAC_APPS[@]} == 1 )) || { errf "Need exactly one install for --quiet; pass a path."; exit 1; }
+            (( ${#MAC_APPS[@]} == 1 )) || { errf "With --quiet, give the path to the Chrome you want."; exit 1; }
             CHOSEN_INDEX=0
         else
             choose_macos_install || exit 0
         fi
         APP_PATH="${MAC_APPS[$CHOSEN_INDEX]}"; TARGET_CONTAINER="macho"
-        resolve_framework_from_app "$APP_PATH" || { errf "No Chrome framework inside ${APP_PATH}"; exit 1; }
+        resolve_framework_from_app "$APP_PATH" || { errf "Couldn't find Chrome inside ${APP_PATH}"; exit 1; }
     else
-        infof "Scanning for installed Chrome release channels..."
+        infof "Looking for Chrome..."
         enumerate_linux_installs
         if $QUIET; then
             if (( ${#LNX_CHANNELS[@]} == 0 )); then
-                errf "Error: no installed Chrome channel was found."
-                echo "    Pass the path explicitly, e.g. sudo bash $0 patch /path/to/chrome"; exit 1
+                errf "Couldn't find Chrome on this computer."
+                echo "    Give the path, e.g. sudo bash $0 patch /path/to/chrome"; exit 1
             fi
             if (( ${#LNX_CHANNELS[@]} > 1 )); then
-                errf "${#LNX_CHANNELS[@]} channels are installed and --quiet cannot prompt."
+                errf "Found ${#LNX_CHANNELS[@]} Chrome versions, and --quiet can't ask which one."
                 local j; for (( j = 0; j < ${#LNX_CHANNELS[@]}; j++ )); do print_linux_install_row $(( j + 1 )) "$j"; done
-                echo "    Re-run with the path of the channel you want."; exit 1
+                echo "    Re-run with the path of the one you want."; exit 1
             fi
             CHOSEN_INDEX=0
         else
@@ -2111,16 +2103,16 @@ main() {
     fi
     if [[ "$TARGET_CONTAINER" == "macho" ]]; then
         detect_host_container
-        infof "Host CPU: $(host_arch_label); default target slice: ${HOST_CONTAINER#macho-}."
-        okf "Framework binary: ${TARGET_FILE}"
+        infof "Your Mac: $(host_arch_label)."
+        okf "File: ${TARGET_FILE}"
         if [[ -n "$APP_PATH" ]]; then
-            okf "App bundle: ${APP_PATH}"
+            okf "App: ${APP_PATH}"
         elif [[ "$cmd" != "check" ]]; then
-            warnf "No .app resolved: bundle re-signing will be skipped (offline/scratch mode)."
+            warnf "No app found - the re-signing step will be skipped."
         fi
     else
-        okf "Target channel: ${C_CYN}$(basename "$(dirname "$TARGET_FILE")")${C_RESET}"
-        okf "Target file: ${TARGET_FILE}"
+        okf "Chrome: ${C_CYN}$(basename "$(dirname "$TARGET_FILE")")${C_RESET}"
+        okf "File: ${TARGET_FILE}"
     fi
 
     # Check is read-only. Patch/restore need write access to the target and its
@@ -2129,8 +2121,8 @@ main() {
     if [[ "$cmd" != "check" && -z "${MV2_TEST_NO_ELEVATION:-}" ]]; then
         local dir; dir=$(dirname "$TARGET_FILE")
         if [[ ! -w "$TARGET_FILE" || ! -w "$dir" ]]; then
-            errf "Write access is required for ${TARGET_FILE} and its directory."
-            echo "    Re-run with sudo for a system install, or use a writable offline copy."
+            errf "Can't write to Chrome here."
+            echo "    Re-run with sudo, or use a copy you can write to."
             exit 1
         fi
     fi
