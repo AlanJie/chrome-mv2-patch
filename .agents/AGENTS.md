@@ -2,22 +2,22 @@
 
 ## Repository overview
 
-This repository ships three self-contained patch scripts:
+This repository ships two self-contained patch scripts:
 
 - `chrome-mv2.ps1` is the Windows implementation. It patches PE32+ x64 (`pe`),
   PE32 x86 (`pe32`), and PE32+ arm64 (`pe-arm64`, Windows on ARM — the machine
   field `0xAA64` selects it, and it uses the same `bcond` flip as macOS arm64)
   `chrome.dll` files.
-- `chrome-mv2.sh` is the Linux implementation. It patches the x86-64 ELF
-  `chrome` executable.
-- `chrome-mv2-mac.sh` is the macOS implementation. It patches the universal
+- `chrome-mv2.sh` is the cross-platform Unix implementation (Linux **and**
+  macOS in one script). It detects the target container from the file magic and
+  patches either the x86-64 ELF `chrome` executable (`elf`), or the universal
   `Google Chrome Framework` Mach-O — the x86_64 slice (`macho-x64`, reusing the
   `jg` flip) and the arm64 slice (`macho-arm64`, a `B.cond` GT→AL flip); each Mac
   patches only its own CPU's slice — then ad-hoc re-signs the app so it launches.
 
 There is no compiled patcher or build step. Do not add instructions for the
 removed Go application, `cmd/chrome-mv2`, `internal/app`, `build.bat`, or
-platform executables. The PowerShell, Linux Bash, and macOS Bash scripts own all
+platform executables. The PowerShell and cross-platform Bash scripts own all
 runtime behavior: target discovery, signature loading, layout matching,
 patching, backup and restore safety, elevation/signing, diagnostics, and output.
 
@@ -51,10 +51,12 @@ previously crashed Chrome or hidden extensions. See `mv2-reversing.md` section
 Keep platform behavior in its owning script:
 
 - Windows/PE logic: `chrome-mv2.ps1`
-- Linux/ELF logic: `chrome-mv2.sh`
-- macOS/Mach-O logic: `chrome-mv2-mac.sh` (fat parsing, per-slice patching,
-  `LC_UUID` identity, inside-out ad-hoc `codesign` re-seal). Must stay bash-3.2
-  compatible (stock macOS) and needs no `python3` on the default path.
+- Linux/ELF **and** macOS/Mach-O logic: `chrome-mv2.sh` (one cross-platform
+  script; the container is dispatched by file magic). The Mach-O path does fat
+  parsing, per-slice patching, `LC_UUID` identity, and inside-out ad-hoc
+  `codesign` re-seal; the ELF path uses GNU build-id identity and `/proc`-based
+  process handling. The whole script must stay bash-3.2 compatible (stock macOS)
+  and needs no `python3` on the default path.
 - Cross-platform signature derivation only: `scripts/*.py`
 
 The runtime scripts intentionally implement the same safety contract:
@@ -72,7 +74,8 @@ The runtime scripts intentionally implement the same safety contract:
 
 Do not assume implementation details are interchangeable. PowerShell parses PE,
 strips the Authenticode Security directory, and recomputes the PE checksum.
-Bash parses ELF, preserves ownership/mode, and atomically replaces the executable.
+Bash parses ELF or Mach-O, preserves ownership/mode, atomically replaces the
+binary, and (macOS only) ad-hoc re-signs the bundle inside-out.
 
 ## Signature sources
 
@@ -82,11 +85,10 @@ platform-specific embedded copies:
 
 - `$EmbeddedSignatures` in `chrome-mv2.ps1` contains the Windows `pe`, `pe32`,
   and `pe-arm64` milestones.
-- `EMBEDDED_SIGNATURES` in `chrome-mv2.sh` contains the Linux `elf` milestones.
-- `EMBEDDED_SIGNATURES` in `chrome-mv2-mac.sh` contains the macOS `macho-x64`
-  and `macho-arm64` milestones, **pre-tokenized** (pipe-delimited records) so the
-  default path needs no `python3`/JSON parser. Each runtime script skips
-  milestones whose container it does not own.
+- `EMBEDDED_SIGNATURES` in `chrome-mv2.sh` contains the Linux `elf` and the macOS
+  `macho-x64`/`macho-arm64` milestones together, **pre-tokenized** (pipe-delimited
+  records) so the default path needs no `python3`/JSON parser. Each runtime
+  script skips milestones whose container it does not own.
 
 Runtime precedence is an explicitly supplied signature file, then a
 `signatures.json` beside the script, then the embedded table. A file in the
@@ -122,8 +124,7 @@ Porting checklist:
 2. Resolve or dump symbols to name/filter candidate gates.
 3. Run `derive_milestone.py --symbols ... --name ... --json`.
 4. Add the entry to `signatures.json` and the correct embedded script table
-   (`chrome-mv2.ps1` pe/pe32/pe-arm64, `chrome-mv2.sh` elf, `chrome-mv2-mac.sh`
-   macho-x64/macho-arm64).
+   (`chrome-mv2.ps1` pe/pe32/pe-arm64, `chrome-mv2.sh` elf + macho-x64/macho-arm64).
 5. Run `derive_milestone.py <binary> --verify signatures.json` and require
    `ALL SITES VERIFIED: True`.
 6. Run the script regression suite.
@@ -172,7 +173,6 @@ $errors
 
 ```bash
 bash -n chrome-mv2.sh
-bash -n chrome-mv2-mac.sh
 ```
 
 For a real stock artifact, also run:
@@ -189,7 +189,7 @@ Use the read-only runtime diagnostics when appropriate:
 
 ```bash
 ./chrome-mv2.sh check /path/to/chrome --quiet
-./chrome-mv2-mac.sh check "/Applications/Google Chrome.app" --quiet
+./chrome-mv2.sh check "/Applications/Google Chrome.app" --quiet
 ```
 
 Never weaken a decline, backup, identity, bounds, or post-write check merely to

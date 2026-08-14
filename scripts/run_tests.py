@@ -32,13 +32,12 @@ def main():
 
     # Black-box patcher tests (shell out to the runtime scripts).
     step("Linux ELF (chrome-mv2.sh)", py + [str(HERE / "test_linux.py")])
-    step("macOS Mach-O (chrome-mv2-mac.sh)", py + [str(HERE / "test_macos.py")])
+    step("macOS Mach-O (chrome-mv2.sh)", py + [str(HERE / "test_macos.py")])
     step("Windows PE (chrome-mv2.ps1)", py + [str(HERE / "test_windows.py")])
 
-    # Syntax checks for the shell patchers.
+    # Syntax check for the shell patcher (one cross-platform script).
     if shutil.which("bash"):
         step("bash -n chrome-mv2.sh", ["bash", "-n", T.posix(REPO / "chrome-mv2.sh")])
-        step("bash -n chrome-mv2-mac.sh", ["bash", "-n", T.posix(REPO / "chrome-mv2-mac.sh")])
     else:
         print("\n(bash not found; skipping shell syntax checks)")
 

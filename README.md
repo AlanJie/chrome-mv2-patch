@@ -4,12 +4,17 @@ Re-enables Manifest V2 extensions in Chrome by patching a few bytes. See [`mv2-r
 
 ## Supported Versions
 
-- ✅ Windows x64, x86
-- ✅ Windows ARM
-- ✅ Linux x64
-- ✅ macOS x64
-- ✅ macOS ARM
-- ❌ Linux ARM (not yet supported)
+### Operating Systems
+
+- ✅ Windows x64, x86, ARM
+- ✅ Linux x64, ARM
+- ✅ macOS x64, ARM
+
+### Browsers
+
+- ✅ Chrome 151, 152
+- ❌ Chromium (soon)
+- ❌ Edge (soon)
 
 ## Usage
 
@@ -21,16 +26,10 @@ Run in Terminal:
 powershell "irm github.com/Sketchystan1/chrome-mv2-patch/raw/master/chrome-mv2.ps1|iex"
 ```
 
-### Linux
+### Linux, macOS
 
 ```bash
 curl -sL github.com/Sketchystan1/chrome-mv2-patch/raw/master/chrome-mv2.sh | sudo bash
-```
-
-### macOS
-
-```bash
-curl -sL github.com/Sketchystan1/chrome-mv2-patch/raw/master/chrome-mv2-mac.sh | sudo bash
 ```
 
 ## Testing

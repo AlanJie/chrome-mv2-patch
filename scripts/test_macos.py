@@ -1,4 +1,4 @@
-"""macOS Mach-O regression tests for chrome-mv2-mac.sh, driven as a black box.
+"""macOS Mach-O regression tests for chrome-mv2.sh, driven as a black box.
 
 Builds a synthetic universal (fat) fixture in Python and exercises patch /
 restore / check, host-aware slice selection (each Mac patches only its own CPU's
@@ -15,7 +15,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import _testutil as T
 
-SCRIPT = str(T.REPO / "chrome-mv2-mac.sh")
+SCRIPT = str(T.REPO / "chrome-mv2.sh")
 # Default scenarios run as an Intel (x86_64) host: the x64 slice is the one that
 # runs, so it is the default patch target - matching the pre-host-detection tests.
 ENV = {"MV2_TEST_NO_ELEVATION": "1", "MV2_TEST_HOST_ARCH": "x86_64"}

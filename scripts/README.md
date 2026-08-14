@@ -1,8 +1,8 @@
 # scripts — MV2 gate derivation toolkit
 
 Cross-platform, dependency-free tooling to fetch symbols for, derive, and verify
-the Chrome MV2 gate signatures used by `../chrome-mv2.ps1`, `../chrome-mv2.sh`,
-and `../chrome-mv2-mac.sh`. The canonical editable table is `../signatures.json`.
+the Chrome MV2 gate signatures used by `../chrome-mv2.ps1` (Windows) and
+`../chrome-mv2.sh` (Linux + macOS). The canonical editable table is `../signatures.json`.
 Works for any future Chrome version on x86, x86-64, and arm64:
 64-bit PE `chrome.dll` (container `pe`), 32-bit PE `chrome.dll` (container
 `pe32`), 64-bit **arm64** PE `chrome.dll` on Windows-on-ARM (container
@@ -85,8 +85,8 @@ python scripts/derive_milestone.py <stock chrome.dll|chrome>  --verify
 4. **Add** the emitted entry to the `milestones` array in
    `../signatures.json`, then copy the platform entry into the matching embedded
    table: `$EmbeddedSignatures` in `../chrome-mv2.ps1` for `pe`/`pe32`/`pe-arm64`,
-   `EMBEDDED_SIGNATURES` in `../chrome-mv2.sh` for `elf`, or the pre-tokenized
-   `EMBEDDED_SIGNATURES` in `../chrome-mv2-mac.sh` for `macho-x64`/`macho-arm64`.
+   or the pre-tokenized `EMBEDDED_SIGNATURES` in `../chrome-mv2.sh` for `elf`
+   (Linux) and `macho-x64`/`macho-arm64` (macOS).
    The scripts use an explicit signature path first, then `signatures.json`
    beside the script, then their embedded table. Keep the JSON and embedded copy
    synchronized.
@@ -121,6 +121,6 @@ PDB (`symbols_from_pdb.py` reads the PE32+ `ImageBase` regardless of machine).
 
 The masking and match-count rules mirror both runtime scripts:
 `Find-AffectedJgSites` / `Invoke-PatchMilestones` in `chrome-mv2.ps1` and
-`find_site_matches` / `probe_milestones` in `chrome-mv2.sh`. A table that
+`find_site_matches` / `probe_slice` in `chrome-mv2.sh`. A table that
 verifies here must still be synchronized into the appropriate embedded table
 and exercised through the script tests.

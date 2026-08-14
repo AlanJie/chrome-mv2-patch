@@ -1,44 +1,43 @@
 #!/usr/bin/env bash
 # ============================================================================
-# Google Chrome Manifest V2 Patcher — standalone bash script for Linux
+# Google Chrome Manifest V2 Patcher - cross-platform bash script (Linux + macOS)
 #
-# Self-contained Linux implementation for ELF targets.
-# Re-enables Manifest V2 extension support in Google Chrome by flipping the
-# inlined IsExtensionAffected manifest-version checks.
+# One self-contained script for BOTH Unix targets. It re-enables Manifest V2
+# extension support by flipping the inlined IsExtensionAffected manifest-version
+# checks, dispatching on the target binary's container:
 #
-# Uses the shared milestone format and the repository's match/decline semantics.
+#   - ELF (Linux): the `chrome` binary. x86 cmp/jg flip.
+#       JG_SHORT  0x7F disp8       -> 0xEB disp8        (jmp short, same disp8)
+#       JG_NEAR   0x0F 0x8F disp32 -> 0x90 0xE9 disp32  (nop ; jmp near, same disp32)
+#   - Mach-O (macOS): the universal (fat) "Google Chrome Framework" inside
+#       Google Chrome.app. Only the slice matching this Mac's CPU is patched.
+#       x86_64 uses the same short/near flip; arm64 (Apple Silicon) has no
+#       cmp/jg - the mv>=3 early-out is a cmp w,#2 ; b.gt, and the flip rewrites
+#       ONLY the branch condition GT(0xC) -> AL(0xE), one byte, preserving imm19.
 #
-# SELF-CONTAINED: the Linux signature tables are EMBEDDED in this file
-# ($EMBEDDED_SIGNATURES below), so the script needs no signatures.json and no
-# other file to run. A signatures.json installed next to the script takes
-# precedence; another file can be selected explicitly with --signatures.
+# The container is detected from the file magic (ELF vs Mach-O), so the ELF and
+# Mach-O flows run wherever bash does; only default install discovery is chosen
+# by the host OS. It declines rather than guesses on any layout mismatch.
 #
-# BACKUP SAFETY: uses pure-bash ELF build-id parser to detect Chrome updates.
-# Build-id survives patching, so the script can distinguish:
-#   - Same build-id = already patched → work from backup (prevents corruption)
-#   - Different build-id = Chrome updated → refresh backup to new version
-# This ensures the backup always contains clean stock bytes, never patched bytes.
-#
-# HOW IT PATCHES: for each gate, first probe the RVA recorded in the table -
-# cheap, and exact for the build the table was derived from. On a miss, scan
-# the whole .text section for the gate's byte signature; that is what relocates
-# a gate cleanly across point releases. A site counts as located only when its
-# signature matches EXACTLY expectedMatches times: a different count means the
-# layout moved, so the site is declined rather than guessed at. The milestone
-# with the most located sites wins; one that locates none is declined outright.
-# Then flip the gates and write the patched binary.
+# CODE SIGNING (macOS only): any byte edit invalidates the Mach-O signature; on
+# Apple Silicon an invalid/absent signature is killed on launch. After flipping
+# a real .app this ad-hoc re-signs INSIDE-OUT, signing every nested bundle and
+# Mach-O individually (deepest first, .app last) with
+# --preserve-metadata=entitlements,flags so each keeps its own entitlements -
+# crucially the Renderer helper's com.apple.security.cs.allow-jit (codesign
+# --deep would strip it). The .bak lives OUTSIDE the bundle, in the app-data dir
+# keyed by the build UUID; ELF backups are "<file>.bak" keyed by GNU build-id.
 #
 # CARDINAL RULE: never delete or blank a call and never invent control flow -
 # only flip the direction of an existing branch to its EXISTING target.
 #
-#   JG_SHORT  0x7F disp8       -> 0xEB disp8        (jmp short, same disp8)
-#   JG_NEAR   0x0F 0x8F disp32 -> 0x90 0xE9 disp32  (nop ; jmp near, same disp32)
-#
 # Usage:
-#   sudo bash chrome-mv2.sh [patch|restore] [path] [--yes] [--quiet]
+#   Linux:  sudo bash chrome-mv2.sh [patch|restore|check] [path] [--yes] [--quiet]
+#   macOS:  bash chrome-mv2.sh [patch|restore|check] [path] [--yes] [--quiet]
 #
-# Requirements: bash 4.3+, python3, dd, od, grep, head, mktemp, mv, chmod,
-#               sha256sum, sync (no jq/xxd/vim needed)
+# Requirements: bash 3.2+ (stock macOS), python3 ONLY for --signatures JSON,
+#   od, dd, grep, head, mktemp, cp, mv, awk, sync, plus sha256sum (Linux) or
+#   shasum (macOS); codesign (built into macOS) for a launchable .app patch.
 # ============================================================================
 
 set -euo pipefail
@@ -46,40 +45,80 @@ set -euo pipefail
 readonly APP_VERSION="1.3.0"
 
 # ============================================================================
-# Embedded ELF signature tables (151-linux & 152-linux).
-# Self-contained: the Linux signature tables are EMBEDDED in this file, so the
-# script needs no signatures.json to run. A signatures.json installed next to
-# the script takes precedence; another file requires --signatures.
+# Embedded signature tables (pre-tokenized so the default path needs no python3
+# or JSON parser - stock macOS ships neither a usable python3 nor jq).
 #
-# Format: pipe-delimited fields per site, semicolon-delimited sites per
-# milestone.  Fields: name|kind|jgRVA|jgOff|expectedMatches|sig
+# Records, one per line, pipe-delimited:
+#   M|<milestone name>|<container>
+#   S|<site name>|<kind>|<jgRVA>|<jgOff>|<expectedMatches>|<sig hex>
+# container: elf | macho-x64 | macho-arm64
+# kind: short (7F->EB) | near (0F8F->90E9) | bcond (arm64 B.cond GT->AL)
+# jgRVA: hex RVA of the jg/b.cond opcode in the reference build (fast-path probe)
+# jgOff: byte index of the jump opcode within sig
+# sig: hex bytes, jump opcode included at jgOff
 #
-# kind: "short" = 7F disp8 → EB disp8;  "near" = 0F 8F disp32 → 90 E9 disp32
-# jgRVA: hex RVA of the jg opcode in the reference build (fast-path probe)
-# jgOff: byte index of jg opcode within sig
-# sig: hex bytes, jg opcode included at jgOff
+# Keep in sync with signatures.json (the canonical table). See mv2-reversing.md.
 # ============================================================================
-
-# Embedded signature tables
 readonly EMBEDDED_SIGNATURES='
-{
-  "milestones": [
-    {"name":"151-linux","container":"elf","sites":[{"name":"MV2DeprecationImpactChecker::IsExtensionAffected (shared predicate)","kind":"short","jgRVA":"0x067D9F14","jgOff":4,"expectedMatches":1,"sig":"837E50027F2F554889E5488B8E280200008B413080BE080200"},{"name":"ManifestV2Handler::ShouldBlockExtensionInstallation","kind":"short","jgRVA":"0x098D3CC7","jgOff":3,"expectedMatches":1,"sig":"83FE027F1F83FA01751083F9050F95C283F90A0F95C020D05D"},{"name":"ManifestV2Handler::ShouldBlockExtensionEnable","kind":"short","jgRVA":"0x098D3D0D","jgOff":3,"expectedMatches":1,"sig":"83FA027F298B493083F801751783F9050F95C283F90A0F95C0"},{"name":"StandardManagementPolicyProvider::UserMayInstall (inlined, near jg)","kind":"near","jgRVA":"0x0A3224A3","jgOff":3,"expectedMatches":1,"sig":"83FA020F8FBE0000008B493083F8010F856402000083F9050F84A900"},{"name":"StandardManagementPolicyProvider::MustRemainDisabled (inlined)","kind":"short","jgRVA":"0x05E5DB24","jgOff":3,"expectedMatches":1,"sig":"83FA027F7A8B493083F80175684531F683F905740583F90A75"}]},
-    {"name":"152-linux","container":"elf","sites":[{"name":"manifest_v2_util::IsExtensionAffected (free predicate)","kind":"short","jgRVA":"0x0985B449","jgOff":3,"expectedMatches":1,"sig":"83FF027F1D83FE087718B90A0100000FA3F1730E83FA050F95"},{"name":"ManifestV2Handler::IsExtensionAffected / ShouldBlockExtensionEnable (shared body)","kind":"short","jgRVA":"0x0985B0F4","jgOff":4,"expectedMatches":1,"sig":"837E50027F2F554889E5488B8E280200008B413080BE080200"},{"name":"ManifestV2Handler::MaybeReEnableExtension (inlined)","kind":"short","jgRVA":"0x0985B238","jgOff":4,"expectedMatches":1,"sig":"837B50027F30488B8B280200008B413080BB08020000007508"},{"name":"StandardManagementPolicyProvider::UserMayInstall (inlined, near jg)","kind":"near","jgRVA":"0x0A256BAA","jgOff":4,"expectedMatches":1,"sig":"837B50020F8FD1000000488B8B280200008B413080BB080200000075"},{"name":"StandardManagementPolicyProvider::MustRemainDisabled (inlined, near jg)","kind":"near","jgRVA":"0x0599A69A","jgOff":4,"expectedMatches":1,"sig":"837E50020F8F8E000000498B8E280200008B41304180BE0802000000"}]}
-  ]
-}
+M|151-linux|elf
+S|MV2DeprecationImpactChecker::IsExtensionAffected (shared predicate)|short|0x067D9F14|4|1|837E50027F2F554889E5488B8E280200008B413080BE080200
+S|ManifestV2Handler::ShouldBlockExtensionInstallation|short|0x098D3CC7|3|1|83FE027F1F83FA01751083F9050F95C283F90A0F95C020D05D
+S|ManifestV2Handler::ShouldBlockExtensionEnable|short|0x098D3D0D|3|1|83FA027F298B493083F801751783F9050F95C283F90A0F95C0
+S|StandardManagementPolicyProvider::UserMayInstall (inlined, near jg)|near|0x0A3224A3|3|1|83FA020F8FBE0000008B493083F8010F856402000083F9050F84A900
+S|StandardManagementPolicyProvider::MustRemainDisabled (inlined)|short|0x05E5DB24|3|1|83FA027F7A8B493083F80175684531F683F905740583F90A75
+E
+M|152-linux|elf
+S|manifest_v2_util::IsExtensionAffected (free predicate)|short|0x0985B449|3|1|83FF027F1D83FE087718B90A0100000FA3F1730E83FA050F95
+S|ManifestV2Handler::IsExtensionAffected / ShouldBlockExtensionEnable (shared body)|short|0x0985B0F4|4|1|837E50027F2F554889E5488B8E280200008B413080BE080200
+S|ManifestV2Handler::MaybeReEnableExtension (inlined)|short|0x0985B238|4|1|837B50027F30488B8B280200008B413080BB08020000007508
+S|StandardManagementPolicyProvider::UserMayInstall (inlined, near jg)|near|0x0A256BAA|4|1|837B50020F8FD1000000488B8B280200008B413080BB080200000075
+S|StandardManagementPolicyProvider::MustRemainDisabled (inlined, near jg)|near|0x0599A69A|4|1|837E50020F8F8E000000498B8E280200008B41304180BE0802000000
+E
+M|151-macos-x64|macho-x64
+S|StandardManagementPolicyProvider::MustRemainDisabled|short|0x01B652F7|3|1|83FA027F5B8B493083F80175494531F683F905740583F90A75
+S|ManifestV2Handler::OnExtensionSystemReady|short|0x030822AA|4|1|837950027F2D488B91280200008B423080B90802000000750C
+S|ManifestV2Handler::ShouldBlockExtensionEnable|short|0x04727A9D|3|1|83FA027F298B493083F801751783F9050F95C283F90A0F95C0
+S|ManifestV2Handler::IsExtensionAffected|short|0x071364A4|4|1|837E50027F2F554889E5488B8E280200008B413080BE080200
+S|ManifestV2Handler::ShouldBlockExtensionInstallation|short|0x071364F7|3|1|83FE027F1F83FA01751083F9050F95C283F90A0F95C020D05D
+S|ManifestV2Handler::MaybeReEnableExtension|short|0x07136608|4|1|837B50027F30488B8B280200008B413080BB08020000007508
+S|StandardManagementPolicyProvider::UserMayInstall|near|0x07B4CFF9|3|1|83FA020F8FA40000008B493083F8010F850F02000083F9050F848F00
+E
+M|151-macos-arm64|macho-arm64
+S|ManifestV2Handler::OnExtensionSystemReady|bcond|0x0178A5E8|4|1|1F090071AC0100542A1541F9483140B929214839C9000037496940B93F050071
+S|StandardManagementPolicyProvider::MustRemainDisabled|bcond|0x021EFD80|4|1|5F0900716C040054293140B91F05007181030054140080523F15007160000054
+S|ManifestV2Handler::ShouldBlockExtensionEnable|bcond|0x03ED7910|4|1|5F090071CC010054293140B91F050071E10000543F15007124194A7AE0079F1A
+S|ManifestV2Handler::IsExtensionAffected|bcond|0x0642852C|4|1|1F090071CC010054291441F9283140B92A204839CA000037296940B93F050071
+S|ManifestV2Handler::ShouldBlockExtensionInstallation|bcond|0x06428570|4|1|3F0800716C0100545F040071A10000547F14007164184A7AE0079F1AC0035FD6
+S|ManifestV2Handler::MaybeReEnableExtension|bcond|0x064286A8|4|1|1F090071AC010054691641F9283140B96A224839CA000037296940B93F050071
+S|StandardManagementPolicyProvider::UserMayInstall|bcond|0x06DB8584|4|1|5F090071EC000054293140B91F050071210F00543F15007124194A7AC1060054
+E
+M|152-macos-x64|macho-x64
+S|StandardManagementPolicyProvider::MustRemainDisabled|short|0x01BA0A91|4|1|837E50027F6F498B8E280200008B41304180BE080200000075
+S|ManifestV2Handler::OnExtensionSystemReady|short|0x0312B1FA|4|1|837950027F2D488B91280200008B423080B90802000000750C
+S|ManifestV2Handler::IsExtensionAffected|short|0x048BB6E4|4|1|837E50027F2F554889E5488B8E280200008B413080BE080200
+S|ManifestV2Handler::ShouldBlockExtensionInstallation|short|0x075489B8|4|1|837B50027F30488B8B280200008B413080BB08020000007508
+S|ManifestV2Handler::ShouldBlockExtensionInstallation (2)|short|0x07548BB9|3|1|83FF027F1D83FE087718B90A0100000FA3F1730E83FA050F95
+S|StandardManagementPolicyProvider::UserMayInstall|near|0x07F56A10|4|1|837B50020F8FB7000000488B8B280200008B413080BB080200000075
+E
+M|152-macos-arm64|macho-arm64
+S|StandardManagementPolicyProvider::MustRemainDisabled|bcond|0x02218740|4|1|1F090071EC040054891641F9283140B98A2248398A000037296940B93F050071
+S|ManifestV2Handler::OnExtensionSystemReady|bcond|0x0320635C|4|1|1F090071AC0100542A1541F9483140B929214839C9000037496940B93F050071
+S|ManifestV2Handler::IsExtensionAffected|bcond|0x03FFBD84|4|1|1F090071CC010054291441F9283140B92A204839CA000037296940B93F050071
+S|ManifestV2Handler::ShouldBlockExtensionInstallation / StandardManagementPolicyProvider::UserMayInstall (shared body)|bcond|0x066F0E38|4|2|1F090071AC010054691641F9283140B96A224839CA000037296940B93F050071
+E
 '
 
-# Runtime variables populated by load_milestones (from external JSON or embedded)
+# Runtime tables (parallel indexed arrays; bash-3.2 safe - no assoc arrays or
+# namerefs). ALL_SITES holds every site prefixed with its milestone index so a
+# milestone's sites are recovered by filtering, avoiding dynamic array names.
 MILESTONE_NAMES=()
 MILESTONE_CONTAINERS=()
-declare -a MILESTONE_SITES  # Array of arrays (one per milestone)
+ALL_SITES=()          # "idx|name|kind|jgRVA|jgOff|expectedMatches|sig"
 NUM_MILESTONES=0
 
 # ============================================================================
 # Console colour + tags
 # ============================================================================
-
 C_RESET="" C_RED="" C_GRN="" C_YEL="" C_CYN="" C_DIM="" C_BOLD=""
 TAG_OK="" TAG_ERR="" TAG_INFO="" TAG_WARN="" TAG_SUCCESS="" TAG_WARNING=""
 
@@ -88,13 +127,10 @@ init_colors() {
     if [[ -t 1 ]]; then vt=true; fi
     if [[ -n "${FORCE_COLOR:-}" ]]; then vt=true; fi
     if [[ -n "${NO_COLOR:-}" ]]; then vt=false; fi
-
     if $vt; then
         C_RESET=$'\e[0m'  C_RED=$'\e[91m'  C_GRN=$'\e[92m'
-        C_YEL=$'\e[93m'   C_CYN=$'\e[96m'  C_DIM=$'\e[90m'
-        C_BOLD=$'\e[1m'
+        C_YEL=$'\e[93m'   C_CYN=$'\e[96m'  C_DIM=$'\e[90m'  C_BOLD=$'\e[1m'
     fi
-
     TAG_OK="${C_GRN}[+]${C_RESET}"
     TAG_ERR="${C_RED}[-]${C_RESET}"
     TAG_INFO="${C_CYN}[*]${C_RESET}"
@@ -112,237 +148,336 @@ rule()     { echo "${C_CYN}=====================================================
 
 banner() {
     rule
-    echo "${C_BOLD}        Google Chrome Manifest V2 Patcher (bash)            ${C_RESET}"
+    echo "${C_BOLD}      Google Chrome Manifest V2 Patcher (bash, Unix)       ${C_RESET}"
     echo "${C_DIM}                    v${APP_VERSION}                       ${C_RESET}"
     rule
 }
 
 # ============================================================================
-# Signature loading - load from external signatures.json or embedded tables
+# Binary read helpers - LE/BE integers and hex from a file at an offset, via od.
 # ============================================================================
+read_u16_le() { local b; b=$(od -A n -t x1 -j "$2" -N 2 "$1" | tr -d ' \n'); echo $(( 16#${b:2:2}${b:0:2} )); }
+read_u32_le() { local b; b=$(od -A n -t x1 -j "$2" -N 4 "$1" | tr -d ' \n'); echo $(( 16#${b:6:2}${b:4:2}${b:2:2}${b:0:2} )); }
+read_u32_be() { local b; b=$(od -A n -t x1 -j "$2" -N 4 "$1" | tr -d ' \n'); echo $(( 16#${b:0:2}${b:2:2}${b:4:2}${b:6:2} )); }
+read_u64_le() { local b; b=$(od -A n -t x1 -j "$2" -N 8 "$1" | tr -d ' \n'); echo $(( 16#${b:14:2}${b:12:2}${b:10:2}${b:8:2}${b:6:2}${b:4:2}${b:2:2}${b:0:2} )); }
+read_u64_be() { local b; b=$(od -A n -t x1 -j "$2" -N 8 "$1" | tr -d ' \n'); echo $(( 16#${b:0:2}${b:2:2}${b:4:2}${b:6:2}${b:8:2}${b:10:2}${b:12:2}${b:14:2} )); }
+read_bytes_hex() { od -A n -v -t x1 -j "$2" -N "$3" "$1" | tr -d ' \n' | tr 'a-f' 'A-F'; }
+read_byte() { local h; h=$(od -A n -t x1 -j "$2" -N 1 "$1" | tr -d ' \n'); echo $(( 16#$h )); }
 
-readonly SIGNATURES_FILE="signatures.json"
-SIGNATURES_OVERRIDE=""
-
-# An explicit --signatures path wins. Otherwise only a file installed beside
-# the script is trusted; never load an admin's current-directory file silently.
-get_signatures_path() {
-    if [[ -n "$SIGNATURES_OVERRIDE" ]]; then
-        if [[ ! -f "$SIGNATURES_OVERRIDE" ]]; then
-            return 2
-        fi
-        readlink -f "$SIGNATURES_OVERRIDE" 2>/dev/null || printf '%s\n' "$SIGNATURES_OVERRIDE"
-        return 0
-    fi
-
-    local script_dir
-    script_dir=$(dirname "$(readlink -f "${BASH_SOURCE[0]}" 2>/dev/null || echo "$0")")
-    
-    # Check next to script
-    if [[ -f "${script_dir}/${SIGNATURES_FILE}" ]]; then
-        echo "${script_dir}/${SIGNATURES_FILE}"
-        return 0
-    fi
-    
-    # Not found
-    return 1
-}
-
-parse_signature_json() {
-    python3 -c '
-import json, re, sys
-
-def clean_text(value, label):
-    if not isinstance(value, str) or not value.strip() or any(c in value for c in "\r\n\t|"):
-        raise ValueError(label + " is empty or contains a reserved character")
-    return value
-
-doc = json.load(sys.stdin)
-milestones = doc.get("milestones")
-if not isinstance(milestones, list) or not milestones:
-    raise ValueError("signature document contains no milestones")
-seen_ms = set()
-for ms in milestones:
-    name = clean_text(ms.get("name"), "milestone name")
-    if name in seen_ms:
-        raise ValueError("duplicate milestone " + name)
-    seen_ms.add(name)
-    container = ms.get("container")
-    if container not in ("elf", "pe", "pe32", "macho-x64", "macho-arm64"):
-        raise ValueError("milestone %s has unsupported container %r" % (name, container))
-    # This script patches only the Linux ELF. A shared signatures.json may also
-    # carry the Windows (pe/pe32) and macOS (macho-x64/macho-arm64) tables, so
-    # skip any non-ELF milestone rather than validate a kind this engine does not
-    # implement (the arm64 "bcond" flip lives in chrome-mv2-mac.sh).
-    if container != "elf":
-        continue
-    sites = ms.get("sites")
-    if not isinstance(sites, list) or not sites:
-        raise ValueError("milestone %s contains no sites" % name)
-    print("M\t%s\t%s" % (name, container))
-    seen_sites = set()
-    for site in sites:
-        sname = clean_text(site.get("name"), "site name")
-        if sname in seen_sites:
-            raise ValueError("milestone %s has duplicate site %s" % (name, sname))
-        seen_sites.add(sname)
-        kind = site.get("kind")
-        if kind not in ("short", "near"):
-            raise ValueError("milestone %s site %s has invalid kind" % (name, sname))
-        rva = site.get("jgRVA")
-        if not isinstance(rva, str) or not re.fullmatch(r"0[xX][0-9A-Fa-f]+", rva):
-            raise ValueError("milestone %s site %s has invalid jgRVA" % (name, sname))
-        jgoff = site.get("jgOff")
-        expected = site.get("expectedMatches")
-        sig = site.get("sig")
-        if not isinstance(jgoff, int) or isinstance(jgoff, bool) or jgoff < 0:
-            raise ValueError("milestone %s site %s has invalid jgOff" % (name, sname))
-        if not isinstance(expected, int) or isinstance(expected, bool) or expected < 1:
-            raise ValueError("milestone %s site %s has invalid expectedMatches" % (name, sname))
-        if not isinstance(sig, str) or not sig or len(sig) % 2 or not re.fullmatch(r"[0-9A-Fa-f]+", sig):
-            raise ValueError("milestone %s site %s has invalid sig" % (name, sname))
-        raw = bytes.fromhex(sig)
-        need = 2 if kind == "short" else 6
-        if jgoff + need > len(raw):
-            raise ValueError("milestone %s site %s jump extends past sig" % (name, sname))
-        expected_op = b"\x7f" if kind == "short" else b"\x0f\x8f"
-        if raw[jgoff:jgoff + len(expected_op)] != expected_op:
-            raise ValueError("milestone %s site %s jgOff does not point at stock opcode" % (name, sname))
-        print("S\t%s\t%s\t%s\t%d\t%d\t%s" % (sname, kind, rva, jgoff, expected, sig.upper()))
-    print("E")
-' 2>&1
-}
-
-# Parse JSON and populate MILESTONE_* arrays without jq or another JSON tool.
-load_milestones() {
-    local json_data=""
-    local src_label=""
-    
-    # Try external file first
-    local sig_path
-    local sig_status=0
-    if sig_path=$(get_signatures_path); then
-        if [[ ! -r "$sig_path" ]]; then
-            errf "Signature file is not readable: ${sig_path}"
-            return 1
-        fi
-        json_data=$(cat "$sig_path")
-        src_label="$sig_path"
-    else
-        sig_status=$?
-        if (( sig_status == 2 )); then
-            errf "Signature file does not exist: ${SIGNATURES_OVERRIDE}"
-            return 1
-        fi
-    fi
-    
-    # Fall back to embedded
-    if [[ -z "$json_data" ]]; then
-        json_data="$EMBEDDED_SIGNATURES"
-        src_label="embedded tables"
-    fi
-
-    MILESTONE_NAMES=()
-    MILESTONE_CONTAINERS=()
-    NUM_MILESTONES=0
-
-    local parsed_file
-    parsed_file=$(mktemp /tmp/chrome-mv2-signatures.XXXXXX)
-    SIGNATURE_PARSE_FILE="$parsed_file"
-    local parse_output
-    # Strip CR: python emits \r\n on some hosts (e.g. Git Bash on Windows), and a
-    # trailing \r on the last tab-field would corrupt the sig. A no-op on Linux.
-    if ! parse_output=$(printf '%s' "$json_data" | parse_signature_json | tr -d '\r'); then
-        errf "Failed to parse signature data from ${src_label}:"
-        printf '    %s\n' "$parse_output"
-        rm -f -- "$parsed_file"
-        return 1
-    fi
-    printf '%s\n' "$parse_output" > "$parsed_file"
-
-    local milestone_idx=-1 record f1 f2 f3 f4 f5 f6 site_specs=()
-    while IFS=$'\t' read -r record f1 f2 f3 f4 f5 f6; do
-        case "$record" in
-            M)
-                ((milestone_idx++)) || true
-                MILESTONE_NAMES+=("$f1")
-                MILESTONE_CONTAINERS+=("$f2")
-                site_specs=()
-                ;;
-            S)
-                site_specs+=("${f1}|${f2}|${f3}|${f4}|${f5}|${f6}")
-                ;;
-            E)
-                local sites_var="MILESTONE_${milestone_idx}_SITES"
-                declare -g -a "$sites_var"
-                local -n sites_ref="$sites_var"
-                sites_ref=("${site_specs[@]}")
-                ;;
-        esac
-    done < "$parsed_file"
-    rm -f -- "$parsed_file"
-    SIGNATURE_PARSE_FILE=""
-
-    NUM_MILESTONES=$(( milestone_idx + 1 ))
-    
-    if (( NUM_MILESTONES == 0 )); then
-        errf "Failed to parse signature data from ${src_label}"
-        return 1
-    fi
-    
-    okf "Loaded ${NUM_MILESTONES} milestone(s) from ${src_label}"
-    return 0
-}
-
-# ============================================================================
-# Binary read helpers — read LE integers from a file at a given offset.
-# Uses od to read raw bytes and assemble them in little-endian order.
-# ============================================================================
-
-# read_u16_le <file> <offset> → prints decimal value
-read_u16_le() {
-    local file="$1" offset="$2"
-    local bytes
-    bytes=$(od -A n -t x1 -j "$offset" -N 2 "$file" | tr -d ' \n')
-    echo $(( 16#${bytes:2:2}${bytes:0:2} ))
-}
-
-# read_u32_le <file> <offset> → prints decimal value
-read_u32_le() {
-    local file="$1" offset="$2"
-    local bytes
-    bytes=$(od -A n -t x1 -j "$offset" -N 4 "$file" | tr -d ' \n')
-    echo $(( 16#${bytes:6:2}${bytes:4:2}${bytes:2:2}${bytes:0:2} ))
-}
-
-# read_u64_le <file> <offset> → prints decimal value
-read_u64_le() {
-    local file="$1" offset="$2"
-    local bytes
-    bytes=$(od -A n -t x1 -j "$offset" -N 8 "$file" | tr -d ' \n')
-    # bash arithmetic can handle 64-bit on 64-bit systems
-    echo $(( 16#${bytes:14:2}${bytes:12:2}${bytes:10:2}${bytes:8:2}${bytes:6:2}${bytes:4:2}${bytes:2:2}${bytes:0:2} ))
-}
-
-# read_bytes_hex <file> <offset> <count> → prints uppercase hex string (no spaces)
-# od is coreutils/POSIX and -j seeks directly, so no xxd and no per-byte dd.
-read_bytes_hex() {
-    local file="$1" offset="$2" count="$3"
-    od -A n -v -t x1 -j "$offset" -N "$count" "$file" | tr -d ' \n' | tr 'a-f' 'A-F'
-}
-
-# read_byte <file> <offset> → prints decimal value of one byte
-read_byte() {
-    local file="$1" offset="$2"
-    local hex
-    hex=$(od -A n -t x1 -j "$offset" -N 1 "$file" | tr -d ' \n')
-    echo $(( 16#$hex ))
-}
+file_size() { stat -f%z "$1" 2>/dev/null || stat -c%s "$1" 2>/dev/null; }
+file_sha256() { shasum -a 256 -- "$1" 2>/dev/null | awk '{print $1}' || sha256sum -- "$1" | awk '{print $1}'; }
 
 range_within_file() {
     local offset="$1" count="$2" size="$3"
     (( offset >= 0 && count >= 0 && offset <= size && count <= size - offset ))
 }
+
+# Container of a file from its magic: "elf", "macho" (thin or fat), or "".
+detect_container_kind() {
+    local m; m=$(od -A n -t x1 -N 4 -- "$1" 2>/dev/null | tr -d ' \n' | tr 'A-F' 'a-f')
+    case "$m" in
+        7f454c46) echo "elf" ;;
+        cffaedfe|cefaedfe|feedfacf|feedface|cafebabe|cafebabf|bebafeca|bfbafeca) echo "macho" ;;
+        *) echo "" ;;
+    esac
+}
+
+# True if $1 begins with a Mach-O (thin or fat) magic. Used to skip non-code
+# files when enumerating re-sign targets, so codesign is never handed a blob.
+is_macho() { [[ "$(detect_container_kind "$1")" == "macho" ]]; }
+
+# ============================================================================
+# Signature loading. Default: the pre-tokenized EMBEDDED_SIGNATURES (no python3
+# or JSON parser needed). An explicit --signatures FILE, or a signatures.json
+# beside the script, is JSON and is tokenized via python3 into the same records.
+# ============================================================================
+readonly SIGNATURES_FILE="signatures.json"
+SIGNATURES_OVERRIDE=""
+
+get_signatures_path() {
+    if [[ -n "$SIGNATURES_OVERRIDE" ]]; then
+        if [[ ! -f "$SIGNATURES_OVERRIDE" ]]; then return 2; fi
+        echo "$SIGNATURES_OVERRIDE"; return 0
+    fi
+    local script_dir
+    script_dir=$(cd "$(dirname "$0")" 2>/dev/null && pwd)
+    if [[ -f "${script_dir}/${SIGNATURES_FILE}" ]]; then
+        echo "${script_dir}/${SIGNATURES_FILE}"; return 0
+    fi
+    return 1
+}
+
+# JSON -> pipe-tokenized records (M|.. / S|..). Keeps only the containers THIS
+# script patches (elf + macho-x64/arm64), skipping the shared table's pe/pe32/
+# pe-arm64 Windows milestones. Validates kinds and the stock opcode at jgOff.
+# Requires python3.
+json_to_tokens() {
+    python3 -c '
+import json, re, sys
+def clean(v, label):
+    if not isinstance(v, str) or not v.strip() or any(c in v for c in "\r\n\t|"):
+        raise ValueError(label + " empty or has a reserved character")
+    return v
+doc = json.load(sys.stdin)
+ms = doc.get("milestones")
+if not isinstance(ms, list) or not ms:
+    raise ValueError("no milestones")
+seen = set()
+for m in ms:
+    name = clean(m.get("name"), "milestone name")
+    if name in seen: raise ValueError("duplicate milestone " + name)
+    seen.add(name)
+    container = m.get("container")
+    if container not in ("elf", "macho-x64", "macho-arm64"):
+        continue  # this script patches ELF + Mach-O; skip pe/pe32/pe-arm64
+    sites = m.get("sites")
+    if not isinstance(sites, list) or not sites:
+        raise ValueError("milestone %s has no sites" % name)
+    print("M|%s|%s" % (name, container))
+    sn = set()
+    for s in sites:
+        snm = clean(s.get("name"), "site name")
+        if snm in sn: raise ValueError("dup site %s in %s" % (snm, name))
+        sn.add(snm)
+        kind = s.get("kind")
+        if kind not in ("short", "near", "bcond"):
+            raise ValueError("bad kind in %s/%s" % (name, snm))
+        if kind == "bcond" and container == "elf":
+            raise ValueError("elf milestone %s has an arm64 bcond site %s" % (name, snm))
+        rva = s.get("jgRVA")
+        if not isinstance(rva, str) or not re.fullmatch(r"0[xX][0-9A-Fa-f]+", rva):
+            raise ValueError("bad jgRVA in %s/%s" % (name, snm))
+        off = s.get("jgOff"); exp = s.get("expectedMatches"); sig = s.get("sig")
+        if not isinstance(off, int) or isinstance(off, bool) or off < 0:
+            raise ValueError("bad jgOff in %s/%s" % (name, snm))
+        if not isinstance(exp, int) or isinstance(exp, bool) or exp < 1:
+            raise ValueError("bad expectedMatches in %s/%s" % (name, snm))
+        if not isinstance(sig, str) or not sig or len(sig) % 2 or not re.fullmatch(r"[0-9A-Fa-f]+", sig):
+            raise ValueError("bad sig in %s/%s" % (name, snm))
+        raw = bytes.fromhex(sig)
+        need = {"short": 2, "near": 6, "bcond": 4}[kind]
+        if off + need > len(raw):
+            raise ValueError("jump past sig in %s/%s" % (name, snm))
+        if kind == "short" and raw[off] != 0x7F:
+            raise ValueError("jgOff not 7F in %s/%s" % (name, snm))
+        if kind == "near" and raw[off:off+2] != b"\x0f\x8f":
+            raise ValueError("jgOff not 0F8F in %s/%s" % (name, snm))
+        if kind == "bcond":
+            w = int.from_bytes(raw[off:off+4], "little")
+            if (w & 0xFF000010) != 0x54000000 or (w & 0xF) != 0x0C:
+                raise ValueError("jgOff not a stock b.gt (GT) in %s/%s" % (name, snm))
+        print("S|%s|%s|%s|%d|%d|%s" % (snm, kind, rva, off, exp, sig.upper()))
+    print("E")
+' 2>&1
+}
+
+populate_from_tokens() {
+    MILESTONE_NAMES=(); MILESTONE_CONTAINERS=(); ALL_SITES=(); NUM_MILESTONES=0
+    local idx=-1 rec f1 f2 f3 f4 f5 f6
+    while IFS='|' read -r rec f1 f2 f3 f4 f5 f6; do
+        # Strip any trailing CR from every field: a JSON stream tokenized by a
+        # Windows python emits CRLF, and a stray \r would corrupt a container or
+        # sig comparison. A no-op on the LF embedded tables / on Unix hosts.
+        rec="${rec%$'\r'}"; f1="${f1%$'\r'}"; f2="${f2%$'\r'}"
+        f3="${f3%$'\r'}"; f4="${f4%$'\r'}"; f5="${f5%$'\r'}"; f6="${f6%$'\r'}"
+        case "$rec" in
+            M)
+                idx=$(( idx + 1 ))
+                MILESTONE_NAMES+=("$f1")
+                MILESTONE_CONTAINERS+=("$f2")
+                ;;
+            S)
+                # store "idx|name|kind|jgRVA|jgOff|expected|sig"
+                ALL_SITES+=("${idx}|${f1}|${f2}|${f3}|${f4}|${f5}|${f6}")
+                ;;
+        esac
+    done
+    NUM_MILESTONES=$(( idx + 1 ))
+    (( NUM_MILESTONES > 0 ))
+}
+
+load_milestones() {
+    local sig_path sig_status=0 tokens src_label
+    if sig_path=$(get_signatures_path); then
+        if [[ ! -r "$sig_path" ]]; then errf "Signature file is not readable: ${sig_path}"; return 1; fi
+        if ! command -v python3 >/dev/null 2>&1; then
+            errf "An external signatures.json needs python3, which was not found."
+            echo "    Remove ${sig_path} to use the built-in tables, or install python3."
+            return 1
+        fi
+        if ! tokens=$(json_to_tokens < "$sig_path"); then
+            errf "Failed to parse ${sig_path}:"; printf '    %s\n' "$tokens"; return 1
+        fi
+        src_label="$sig_path"
+    else
+        sig_status=$?
+        if (( sig_status == 2 )); then
+            errf "Signature file does not exist: ${SIGNATURES_OVERRIDE}"; return 1
+        fi
+        tokens="$EMBEDDED_SIGNATURES"
+        src_label="embedded tables"
+    fi
+
+    # Feed tokens via a here-string so populate runs in THIS shell (a pipe would
+    # run it in a subshell and lose the arrays).
+    if ! populate_from_tokens <<< "$tokens"; then
+        errf "No usable ELF/Mach-O milestones from ${src_label}."
+        return 1
+    fi
+    okf "Loaded ${NUM_MILESTONES} milestone(s) from ${src_label}"
+    return 0
+}
+
+# Sites of milestone index $1 -> "name|kind|jgRVA|jgOff|expected|sig" per line.
+sites_of() {
+    local want="$1" spec
+    for spec in "${ALL_SITES[@]}"; do
+        if [[ "${spec%%|*}" == "$want" ]]; then echo "${spec#*|}"; fi
+    done
+}
+
+# ============================================================================
+# Binary parsers. Both containers populate the SAME per-"slice" parallel arrays
+# so the matching engine is container-agnostic:
+#   - Mach-O: one SLICE_* entry per CPU slice (x86_64 / arm64).
+#   - ELF: a single SLICE_* entry with container "elf".
+# section_64.offset is ALREADY the slice-relative file offset for Mach-O (NO
+# vmaddr delta - the opposite of ELF, whose sh_offset is an absolute file off).
+# ============================================================================
+MH_MAGIC_64=4277009103          # 0xFEEDFACF (thin 64-bit, little-endian on disk)
+FAT_MAGIC=3405691582            # 0xCAFEBABE (fat, big-endian, 32-bit fat_arch)
+FAT_MAGIC_64=3405691583         # 0xCAFEBABF (fat, big-endian, 64-bit fat_arch)
+CPU_X86_64=16777223             # 0x01000007
+CPU_ARM64=16777228              # 0x0100000C
+LC_SEGMENT_64=25                # 0x19
+LC_UUID=27                      # 0x1B
+
+SLICE_CONTAINER=()
+SLICE_BASE=()
+SLICE_SIZE=()
+SLICE_TVADDR=()
+SLICE_TRAW=()
+SLICE_TSIZE=()
+SLICE_UUID=()
+NUM_SLICES=0
+TARGET_CONTAINER=""             # "elf" | "macho", set by parse_target
+
+# Parse one thin Mach-O slice at file offset $2; append to SLICE_* on success.
+parse_thin_slice() {
+    local file="$1" base="$2" declared_size="${3:-0}"
+    local fsize; fsize=$(file_size "$file")
+    if ! range_within_file "$base" 32 "$fsize"; then return 1; fi
+    local magic; magic=$(read_u32_le "$file" "$base")
+    if (( magic != MH_MAGIC_64 )); then return 1; fi   # skip 32-bit / foreign slice
+
+    local cputype ncmds container
+    cputype=$(read_u32_le "$file" $(( base + 4 )))
+    ncmds=$(read_u32_le "$file" $(( base + 16 )))
+    if (( cputype == CPU_X86_64 )); then container="macho-x64"
+    elif (( cputype == CPU_ARM64 )); then container="macho-arm64"
+    else return 1; fi
+
+    local p=$(( base + 32 )) i cmd cmdsize
+    local t_addr="" t_off="" t_size="" uuid=""
+    for (( i = 0; i < ncmds; i++ )); do
+        if ! range_within_file "$p" 8 "$fsize"; then return 1; fi
+        cmd=$(read_u32_le "$file" "$p")
+        cmdsize=$(read_u32_le "$file" $(( p + 4 )))
+        if (( cmdsize < 8 )) || ! range_within_file "$p" "$cmdsize" "$fsize"; then return 1; fi
+        if (( cmd == LC_SEGMENT_64 )); then
+            local segname7; segname7=$(read_bytes_hex "$file" $(( p + 8 )) 7)
+            if [[ "$segname7" == "5F5F5445585400" ]]; then   # "__TEXT\0"
+                local nsects; nsects=$(read_u32_le "$file" $(( p + 64 )))
+                local sec=$(( p + 72 )) s sname7
+                for (( s = 0; s < nsects; s++ )); do
+                    sname7=$(read_bytes_hex "$file" "$sec" 7)
+                    if [[ "$sname7" == "5F5F7465787400" ]]; then   # "__text\0"
+                        t_addr=$(read_u64_le "$file" $(( sec + 32 )))
+                        t_size=$(read_u64_le "$file" $(( sec + 40 )))
+                        t_off=$(read_u32_le "$file" $(( sec + 48 )))
+                    fi
+                    sec=$(( sec + 80 ))
+                done
+            fi
+        elif (( cmd == LC_UUID )); then
+            uuid=$(read_bytes_hex "$file" $(( p + 8 )) 16)
+        fi
+        p=$(( p + cmdsize ))
+    done
+
+    if [[ -z "$t_addr" ]]; then return 1; fi
+    local raw=$(( base + t_off ))
+    if ! range_within_file "$raw" "$t_size" "$fsize"; then return 1; fi
+
+    SLICE_CONTAINER+=("$container")
+    SLICE_BASE+=("$base")
+    SLICE_SIZE+=("$declared_size")
+    SLICE_TVADDR+=("$t_addr")
+    SLICE_TRAW+=("$raw")
+    SLICE_TSIZE+=("$t_size")
+    SLICE_UUID+=("$uuid")
+    NUM_SLICES=$(( NUM_SLICES + 1 ))
+    return 0
+}
+
+parse_macho() {
+    local file="$1"
+    SLICE_CONTAINER=(); SLICE_BASE=(); SLICE_SIZE=()
+    SLICE_TVADDR=(); SLICE_TRAW=(); SLICE_TSIZE=(); SLICE_UUID=()
+    NUM_SLICES=0
+
+    local fsize; fsize=$(file_size "$file")
+    if (( fsize < 32 )); then errf "Not a Mach-O: file too small (${fsize} bytes)."; return 1; fi
+
+    local be le
+    be=$(read_u32_be "$file" 0)
+    le=$(read_u32_le "$file" 0)
+
+    if (( be == FAT_MAGIC || be == FAT_MAGIC_64 )); then
+        local is64=0; (( be == FAT_MAGIC_64 )) && is64=1
+        local nfat; nfat=$(read_u32_be "$file" 4)
+        if (( nfat < 1 || nfat > 32 )); then errf "Implausible fat arch count (${nfat})."; return 1; fi
+        local entry off i soff ssize
+        (( is64 )) && entry=32 || entry=20
+        off=8
+        for (( i = 0; i < nfat; i++ )); do
+            if ! range_within_file "$off" "$entry" "$fsize"; then break; fi
+            if (( is64 )); then
+                soff=$(read_u64_be "$file" $(( off + 8 )))
+                ssize=$(read_u64_be "$file" $(( off + 16 )))
+            else
+                soff=$(read_u32_be "$file" $(( off + 8 )))
+                ssize=$(read_u32_be "$file" $(( off + 12 )))
+            fi
+            off=$(( off + entry ))
+            parse_thin_slice "$file" "$soff" "$ssize" || true   # skip slices we do not handle
+        done
+    elif (( le == MH_MAGIC_64 )); then
+        parse_thin_slice "$file" 0 "$fsize" || true
+    else
+        errf "Not a Mach-O (fat magic 0x$(printf '%08X' "$be"), thin magic 0x$(printf '%08X' "$le"))."
+        return 1
+    fi
+
+    if (( NUM_SLICES == 0 )); then
+        errf "No supported 64-bit Mach-O slice (x86_64 / arm64) found."
+        return 1
+    fi
+
+    local j desc=""
+    for (( j = 0; j < NUM_SLICES; j++ )); do
+        desc="${desc}${desc:+, }${SLICE_CONTAINER[$j]} (.text 0x$(printf '%X' "${SLICE_TSIZE[$j]}")B)"
+    done
+    okf "Mach-O parsed: ${NUM_SLICES} slice(s): ${desc}"
+    return 0
+}
+
+# ---- ELF64 -----------------------------------------------------------------
+# parse_elf locates .text and also synthesizes a single SLICE_* entry (container
+# "elf") so the shared slice engine can probe/flip it. get_elf_build_id reads
+# the GNU build-id (the ELF backup identity, stable across the flip).
+ELF_SHOFF=0 ELF_SHENTSIZE=0 ELF_SHNUM=0 ELF_SHSTRNDX=0 ELF_STROFF=0 ELF_STRSIZE=0
+TEXT_VADDR=0 TEXT_RAW=0 TEXT_SIZE=0
 
 validate_elf_section_table() {
     local file="$1" fsize="$2"
@@ -350,169 +485,76 @@ validate_elf_section_table() {
     ELF_SHENTSIZE=$(read_u16_le "$file" $((0x3A)))
     ELF_SHNUM=$(read_u16_le "$file" $((0x3C)))
     ELF_SHSTRNDX=$(read_u16_le "$file" $((0x3E)))
-
-    # Chrome uses normal ELF64 section counts. Decline the extended-index forms
-    # instead of interpreting their extra indirection incorrectly.
+    # Chrome uses normal ELF64 section counts. Decline the extended-index forms.
     if (( ELF_SHOFF < 64 || ELF_SHOFF > fsize || ELF_SHNUM == 0 || ELF_SHSTRNDX == 0xFFFF )); then return 1; fi
     if (( ELF_SHENTSIZE < 64 || ELF_SHSTRNDX >= ELF_SHNUM )); then return 1; fi
     if (( ELF_SHNUM > (fsize - ELF_SHOFF) / ELF_SHENTSIZE )); then return 1; fi
-
     local strhdr_off=$(( ELF_SHOFF + ELF_SHSTRNDX * ELF_SHENTSIZE ))
     ELF_STROFF=$(read_u64_le "$file" $(( strhdr_off + 0x18 )))
     ELF_STRSIZE=$(read_u64_le "$file" $(( strhdr_off + 0x20 )))
     range_within_file "$ELF_STROFF" "$ELF_STRSIZE" "$fsize"
 }
 
-ELF_SHOFF=0 ELF_SHENTSIZE=0 ELF_SHNUM=0 ELF_SHSTRNDX=0 ELF_STROFF=0 ELF_STRSIZE=0
-
-# ============================================================================
-# ELF64 parser — locate .text section (vaddr, file offset, size).
-# Returns via global variables: TEXT_VADDR, TEXT_RAW, TEXT_SIZE
-# ============================================================================
-
-TEXT_VADDR=0
-TEXT_RAW=0
-TEXT_SIZE=0
-
-# ============================================================================
-# ELF build-id extractor — reads GNU build-id from .note.gnu.build-id section.
-# Returns build-id as hex string, or empty string if not found.
-# ============================================================================
-
 get_elf_build_id() {
-    local file="$1"
-    local fsize
-    fsize=$(stat -c%s "$file" 2>/dev/null || stat -f%z "$file" 2>/dev/null)
-
-    if (( fsize < 64 )); then
-        echo ""
-        return 1
-    fi
-
-    # Verify ELF magic and 64-bit little-endian
-    local magic
-    magic=$(read_bytes_hex "$file" 0 4)
-    if [[ "$magic" != "7F454C46" ]]; then
-        echo ""
-        return 1
-    fi
-
+    local file="$1" fsize
+    fsize=$(file_size "$file")
+    if (( fsize < 64 )); then echo ""; return 1; fi
+    local magic; magic=$(read_bytes_hex "$file" 0 4)
+    if [[ "$magic" != "7F454C46" ]]; then echo ""; return 1; fi
     local ei_class ei_data
-    ei_class=$(read_byte "$file" 4)
-    ei_data=$(read_byte "$file" 5)
-    if (( ei_class != 2 || ei_data != 1 )); then
-        echo ""
-        return 1
-    fi
+    ei_class=$(read_byte "$file" 4); ei_data=$(read_byte "$file" 5)
+    if (( ei_class != 2 || ei_data != 1 )); then echo ""; return 1; fi
+    if ! validate_elf_section_table "$file" "$fsize"; then echo ""; return 1; fi
 
-    if ! validate_elf_section_table "$file" "$fsize"; then
-        echo ""
-        return 1
-    fi
-
-    # Find .note.gnu.build-id section
     local i sh_off name_off sec_name sec_off sec_size
     for (( i = 0; i < ELF_SHNUM; i++ )); do
         sh_off=$(( ELF_SHOFF + i * ELF_SHENTSIZE ))
         name_off=$(read_u32_le "$file" "$sh_off")
         (( name_off < ELF_STRSIZE )) || continue
-
-        # Read section name (NUL-terminated string)
         sec_name=$(dd if="$file" bs=1 skip=$(( ELF_STROFF + name_off )) count=32 2>/dev/null | tr '\0' '\n' | head -1)
-
         if [[ "$sec_name" == ".note.gnu.build-id" ]]; then
             sec_off=$(read_u64_le "$file" $(( sh_off + 0x18 )))
             sec_size=$(read_u64_le "$file" $(( sh_off + 0x20 )))
-
-            if (( sec_size < 16 )) || ! range_within_file "$sec_off" "$sec_size" "$fsize"; then
-                echo ""
-                return 1
-            fi
-
-            # Parse ELF note structure:
-            # struct Elf64_Nhdr { uint32 namesz; uint32 descsz; uint32 type; }
-            # followed by: name (namesz bytes, padded to 4), desc (descsz bytes)
+            if (( sec_size < 16 )) || ! range_within_file "$sec_off" "$sec_size" "$fsize"; then echo ""; return 1; fi
             local namesz descsz note_type
             namesz=$(read_u32_le "$file" "$sec_off")
             descsz=$(read_u32_le "$file" $(( sec_off + 4 )))
             note_type=$(read_u32_le "$file" $(( sec_off + 8 )))
-
-            # NT_GNU_BUILD_ID = 3, with the canonical "GNU\0" owner name.
             if (( note_type == 3 && namesz == 4 && descsz > 0 && descsz <= 64 )); then
-                local note_name
-                note_name=$(read_bytes_hex "$file" $(( sec_off + 12 )) 4)
+                local note_name; note_name=$(read_bytes_hex "$file" $(( sec_off + 12 )) 4)
                 [[ "$note_name" == "474E5500" ]] || break
-                # name starts at offset 12, desc starts after name (padded to 4-byte boundary)
-                local name_padded
-                name_padded=$(( (namesz + 3) / 4 * 4 ))
-                local desc_off
-                desc_off=$(( sec_off + 12 + name_padded ))
-                if ! range_within_file "$desc_off" "$descsz" "$fsize" || (( desc_off + descsz > sec_off + sec_size )); then
-                    echo ""
-                    return 1
-                fi
-
-                # Read build-id (desc field) as hex
-                local build_id
-                build_id=$(read_bytes_hex "$file" "$desc_off" "$descsz")
-                echo "$build_id"
-                return 0
+                local name_padded=$(( (namesz + 3) / 4 * 4 ))
+                local desc_off=$(( sec_off + 12 + name_padded ))
+                if ! range_within_file "$desc_off" "$descsz" "$fsize" || (( desc_off + descsz > sec_off + sec_size )); then echo ""; return 1; fi
+                read_bytes_hex "$file" "$desc_off" "$descsz"; return 0
             fi
             break
         fi
     done
-
-    echo ""
-    return 1
+    echo ""; return 1
 }
 
 parse_elf() {
-    local file="$1"
-    local fsize
-    fsize=$(stat -c%s "$file" 2>/dev/null || stat -f%z "$file" 2>/dev/null)
-
-    if (( fsize < 64 )); then
-        errf "Not a valid ELF: file too small (${fsize} bytes)."
-        return 1
-    fi
-
-    # Check ELF magic: 7F 45 4C 46
-    local magic
-    magic=$(read_bytes_hex "$file" 0 4)
-    if [[ "$magic" != "7F454C46" ]]; then
-        errf "Not an ELF file (magic: ${magic})."
-        return 1
-    fi
-
-    # Check 64-bit (class = 2) and little-endian (data = 1)
+    local file="$1" fsize
+    fsize=$(file_size "$file")
+    if (( fsize < 64 )); then errf "Not a valid ELF: file too small (${fsize} bytes)."; return 1; fi
+    local magic; magic=$(read_bytes_hex "$file" 0 4)
+    if [[ "$magic" != "7F454C46" ]]; then errf "Not an ELF file (magic: ${magic})."; return 1; fi
     local ei_class ei_data
-    ei_class=$(read_byte "$file" 4)
-    ei_data=$(read_byte "$file" 5)
-    if (( ei_class != 2 )); then
-        errf "Not a 64-bit ELF (EI_CLASS=${ei_class})."
-        return 1
-    fi
-    if (( ei_data != 1 )); then
-        errf "Not a little-endian ELF (EI_DATA=${ei_data})."
-        return 1
-    fi
-
+    ei_class=$(read_byte "$file" 4); ei_data=$(read_byte "$file" 5)
+    if (( ei_class != 2 )); then errf "Not a 64-bit ELF (EI_CLASS=${ei_class})."; return 1; fi
+    if (( ei_data != 1 )); then errf "Not a little-endian ELF (EI_DATA=${ei_data})."; return 1; fi
     if ! validate_elf_section_table "$file" "$fsize"; then
-        errf "ELF section table or section-name table is out of bounds."
-        return 1
+        errf "ELF section table or section-name table is out of bounds."; return 1
     fi
 
-    # Iterate sections to find .text
     local i sh_off name_off sec_name
     TEXT_VADDR=0; TEXT_RAW=0; TEXT_SIZE=0
     for (( i = 0; i < ELF_SHNUM; i++ )); do
         sh_off=$(( ELF_SHOFF + i * ELF_SHENTSIZE ))
         name_off=$(read_u32_le "$file" "$sh_off")
         (( name_off < ELF_STRSIZE )) || continue
-
-        # Read section name from .shstrtab (NUL-terminated)
         sec_name=$(dd if="$file" bs=1 skip=$(( ELF_STROFF + name_off )) count=16 2>/dev/null | tr '\0' '\n' | head -1)
-
         if [[ "$sec_name" == ".text" ]]; then
             TEXT_VADDR=$(read_u64_le "$file" $(( sh_off + 0x10 )))
             TEXT_RAW=$(read_u64_le "$file" $(( sh_off + 0x18 )))
@@ -520,637 +562,705 @@ parse_elf() {
             break
         fi
     done
-
-    if (( TEXT_SIZE == 0 )); then
-        errf "Could not locate .text section."
-        return 1
-    fi
+    if (( TEXT_SIZE == 0 )); then errf "Could not locate .text section."; return 1; fi
     if ! range_within_file "$TEXT_RAW" "$TEXT_SIZE" "$fsize"; then
-        errf "ELF .text section is out of file bounds."
-        return 1
+        errf "ELF .text section is out of file bounds."; return 1
     fi
+
+    # Model the ELF as a single "slice" so the shared engine drives it.
+    SLICE_CONTAINER=("elf"); SLICE_BASE=(0); SLICE_SIZE=("$fsize")
+    SLICE_TVADDR=("$TEXT_VADDR"); SLICE_TRAW=("$TEXT_RAW"); SLICE_TSIZE=("$TEXT_SIZE")
+    SLICE_UUID=(""); NUM_SLICES=1
 
     okf "ELF64 parsed: .text vaddr=0x$(printf '%X' $TEXT_VADDR) offset=0x$(printf '%X' $TEXT_RAW) size=0x$(printf '%X' $TEXT_SIZE) ($(( TEXT_SIZE / 1024 / 1024 )) MiB)"
     return 0
 }
 
-# ============================================================================
-# Signature matching engine
-#
-# For each site, first try the fast path (probe the known RVA), then use one
-# raw-byte fixed-anchor scan shared by every unresolved signature.  A site is
-# accepted only when the match count equals expectedMatches exactly.
-# ============================================================================
-
-# The raw backend is available on the grep implementations shipped by the
-# mainstream Linux distributions.  It is deliberately feature-tested instead
-# of assuming GNU grep or requiring another package.
-init_scan_backend() {
-    # -f with multiple binary patterns is the feature the fast path needs.
-    # A newline terminates a grep pattern, so an anchor itself must not contain
-    # newline (enforced by build_binary_anchor).
-    local probe_patterns
-    probe_patterns=$(mktemp /tmp/chrome-mv2-probe.XXXXXX)
-    printf 'x\ny\n' > "$probe_patterns"
-    local ok=false
-    if printf 'xy' | LC_ALL=C grep -a -o -b -F -f "$probe_patterns" >/dev/null 2>&1; then ok=true; fi
-    rm -f -- "$probe_patterns"
-    if ! $ok; then
-        errf "This grep does not support the required raw fixed-string options (-a -o -b -F -f)."
-        echo "    Installations from mainstream Linux distributions include a compatible grep."
-        return 1
-    fi
+# Dispatch by file magic; sets TARGET_CONTAINER and fills SLICE_*.
+parse_target() {
+    local file="$1" kind
+    kind=$(detect_container_kind "$file")
+    case "$kind" in
+        elf)   TARGET_CONTAINER="elf";   parse_elf "$file" ;;
+        macho) TARGET_CONTAINER="macho"; parse_macho "$file" ;;
+        *)     errf "Unrecognized binary (neither ELF nor Mach-O): ${file}"; return 1 ;;
+    esac
 }
 
-    # Build the longest exact anchor that can safely be passed as a shell/grep
-    # match. NUL cannot be stored in a Bash variable, while newline and colon
-    # terminate or split grep's byte-offset output record, so split exact runs
-    # around all three bytes.
-BINARY_ANCHOR_HEX=""
-BINARY_ANCHOR_OFF=0
-build_binary_anchor() {
-    local sig="${1,,}" kind="$2" jg_off="$3"
-    local sig_bytes=$(( ${#sig} / 2 )) mask_len=2
-    [[ "$kind" == "near" ]] && mask_len=6
-    local mask_end=$(( jg_off + mask_len ))
-
-    BINARY_ANCHOR_HEX=""
-    BINARY_ANCHOR_OFF=0
-    local best_len=0 best_start=0 start end byte run_len
-    for (( start = 0; start < sig_bytes; start++ )); do
-        run_len=0
-        for (( end = start; end < sig_bytes; end++ )); do
-            if (( end >= jg_off && end < mask_end )); then break; fi
-            byte="${sig:$(( end * 2 )):2}"
-            if [[ "$byte" == "00" || "$byte" == "0a" || "$byte" == "3a" ]]; then break; fi
-            (( run_len += 1 )) || true
-        done
-        if (( run_len > best_len )); then
-            best_len=$run_len
-            best_start=$start
-        fi
-    done
-
-    # A tiny anchor creates too many candidates and defeats the purpose of the
-    # raw backend. Signature tables must provide at least one safe 4-byte run.
-    if (( best_len >= 4 )); then
-        BINARY_ANCHOR_HEX="${sig:$(( best_start * 2 )):$(( best_len * 2 ))}"
-        BINARY_ANCHOR_OFF=$best_start
-    fi
-}
-
-# sig_matches_at <file> <file_offset> <sig_hex> <kind> <jg_off> → 0 if matches
+# ============================================================================
+# Signature matching engine. Exact on every byte except the masked jump:
+#   short : jg_off in {7F,EB}; jg_off+1 (disp8) wild
+#   near  : jg_off,+1 the pair {0F 8F | 90 E9}; +2..+5 (disp32) wild
+#   bcond : the 4-byte LE word at jg_off - opcode 0x54 + bit4=0 fixed, cond in
+#           {0xC stock, 0xE patched}, imm19 wild (bit-level, not byte-level)
+# ============================================================================
 sig_matches_at() {
     local file="$1" file_offset="$2" sig_hex="$3" kind="$4" jg_off="$5"
     local sig_len=$(( ${#sig_hex} / 2 ))
-    local actual
-    actual=$(read_bytes_hex "$file" "$file_offset" "$sig_len")
+    local actual; actual=$(read_bytes_hex "$file" "$file_offset" "$sig_len")
+    local sig_upper; sig_upper=$(echo "$sig_hex" | tr 'a-f' 'A-F')
 
-    local sig_upper="${sig_hex^^}"
+    if [[ "$kind" == "bcond" ]]; then
+        # validate the whole branch word first (little-endian)
+        local b0 b1 b2 b3 word cond
+        b0=$(( 16#${actual:$(( jg_off*2 )):2} ))
+        b1=$(( 16#${actual:$(( (jg_off+1)*2 )):2} ))
+        b2=$(( 16#${actual:$(( (jg_off+2)*2 )):2} ))
+        b3=$(( 16#${actual:$(( (jg_off+3)*2 )):2} ))
+        word=$(( b0 | (b1<<8) | (b2<<16) | (b3<<24) ))
+        if (( (word & 0xFF000010) != 0x54000000 )); then return 1; fi
+        cond=$(( word & 0xF ))
+        if (( cond != 0x0C && cond != 0x0E )); then return 1; fi
+    fi
 
-    # Compare byte by byte, masking the jg opcode and displacement
-    local i byte_idx
+    local i byte_idx sig_byte act_byte act_pair
     for (( i = 0; i < ${#sig_upper}; i += 2 )); do
         byte_idx=$(( i / 2 ))
-        local sig_byte="${sig_upper:$i:2}"
-        local act_byte="${actual:$i:2}"
-
+        sig_byte="${sig_upper:$i:2}"
+        act_byte="${actual:$i:2}"
         if [[ "$kind" == "short" ]]; then
             if (( byte_idx == jg_off )); then
-                # jg opcode: accept 7F (stock) or EB (flipped)
                 if [[ "$act_byte" != "7F" && "$act_byte" != "EB" ]]; then return 1; fi
                 continue
-            elif (( byte_idx == jg_off + 1 )); then
-                # disp8: wildcard
-                continue
-            fi
-        else  # near
+            elif (( byte_idx == jg_off + 1 )); then continue; fi
+        elif [[ "$kind" == "near" ]]; then
             if (( byte_idx == jg_off )); then
-                # The two opcode bytes are a pair: accept only stock 0F 8F or
-                # already-flipped 90 E9, never a mixed pair.
-                local act_pair="${actual:$i:4}"
+                act_pair="${actual:$i:4}"
                 if [[ "$act_pair" != "0F8F" && "$act_pair" != "90E9" ]]; then return 1; fi
                 continue
-            elif (( byte_idx == jg_off + 1 )); then
-                continue
-            elif (( byte_idx >= jg_off + 2 && byte_idx <= jg_off + 5 )); then
-                # disp32: wildcard
-                continue
-            fi
+            elif (( byte_idx >= jg_off + 1 && byte_idx <= jg_off + 5 )); then continue; fi
+        else  # bcond: the 4 word bytes are handled above
+            if (( byte_idx >= jg_off && byte_idx <= jg_off + 3 )); then continue; fi
         fi
-
-        # Exact match required
         if [[ "$sig_byte" != "$act_byte" ]]; then return 1; fi
     done
     return 0
 }
 
-# Results from the one-pass raw scan, keyed by kind|jgOff|signature.  The scan
-# is lazy: an exact recorded-RVA build never pays for it.
-declare -A GLOBAL_SCAN_DONE=()
-declare -A GLOBAL_SCAN_MATCHES=()
-GLOBAL_SCAN_SOURCE=""
-GLOBAL_SCAN_TEXT_RAW=-1
-GLOBAL_SCAN_TEXT_SIZE=-1
-SCAN_PATTERNS_FILE=""
-SIGNATURE_PARSE_FILE=""
-WORK_FILE=""
-WRITE_TMP=""
-META_TMP=""
-
-prepare_global_raw_scan() {
-    local file="$1"
-    if [[ "$GLOBAL_SCAN_SOURCE" == "$file" && $GLOBAL_SCAN_TEXT_RAW -eq $TEXT_RAW && $GLOBAL_SCAN_TEXT_SIZE -eq $TEXT_SIZE ]]; then
-        return 0
-    fi
-
-    GLOBAL_SCAN_DONE=()
-    GLOBAL_SCAN_MATCHES=()
-    GLOBAL_SCAN_SOURCE="$file"
-    GLOBAL_SCAN_TEXT_RAW=$TEXT_RAW
-    GLOBAL_SCAN_TEXT_SIZE=$TEXT_SIZE
-
-    # Bash read applies the current locale while decoding grep's raw-byte
-    # output.  Invalid UTF-8 bytes can otherwise make it stop after the first
-    # match.  Keep both grep and the reader in the byte-oriented C locale.
-    local LC_ALL=C
-
-    local patterns_file
-    patterns_file=$(mktemp /tmp/chrome-mv2-patterns.XXXXXX)
-    SCAN_PATTERNS_FILE="$patterns_file"
-
-    local -A anchor_seen=()
-    local -A anchor_to_keys=()
-    local -A key_anchor_off=()
-    local mi site_spec name kind jg_rva_hex jg_off expected_matches sig_hex
-    local key anchor_hex anchor_bin ai abyte
-
-    for (( mi = 0; mi < NUM_MILESTONES; mi++ )); do
-        [[ "${MILESTONE_CONTAINERS[$mi]}" == "elf" ]] || continue
-        local sites_var="MILESTONE_${mi}_SITES[@]"
-        local sites=("${!sites_var}")
-        for site_spec in "${sites[@]}"; do
-            IFS='|' read -r name kind jg_rva_hex jg_off expected_matches sig_hex <<< "$site_spec"
-            sig_hex="${sig_hex^^}"
-            key="${kind}|${jg_off}|${sig_hex}"
-            [[ -n "${GLOBAL_SCAN_DONE[$key]+x}" ]] && continue
-
-            build_binary_anchor "$sig_hex" "$kind" "$jg_off"
-            anchor_hex="$BINARY_ANCHOR_HEX"
-            if [[ -z "$anchor_hex" ]]; then
-                errf "Signature has no safe raw scan anchor: ${name}"
-                rm -f -- "$patterns_file"
-                SCAN_PATTERNS_FILE=""
-                return 1
-            fi
-
-            anchor_bin=""
-            for (( ai = 0; ai < ${#anchor_hex}; ai += 2 )); do
-                abyte="${anchor_hex:ai:2}"
-                printf -v abyte '%b' "\\x${abyte}"
-                anchor_bin+="$abyte"
-            done
-
-            GLOBAL_SCAN_DONE["$key"]=1
-            GLOBAL_SCAN_MATCHES["$key"]=""
-            key_anchor_off["$key"]=$BINARY_ANCHOR_OFF
-            if [[ -z "${anchor_seen[$anchor_bin]+x}" ]]; then
-                anchor_seen["$anchor_bin"]=1
-                printf '%s\n' "$anchor_bin" >> "$patterns_file"
-            fi
-            if [[ -n "${anchor_to_keys[$anchor_bin]-}" ]]; then
-                anchor_to_keys["$anchor_bin"]+=" $key"
-            else
-                anchor_to_keys["$anchor_bin"]="$key"
-            fi
+# Longest fixed (unmasked, grep-safe) run in the signature -> a raw anchor.
+BINARY_ANCHOR_HEX=""; BINARY_ANCHOR_OFF=0
+build_binary_anchor() {
+    local sig; sig=$(echo "$1" | tr 'A-F' 'a-f')
+    local kind="$2" jg_off="$3"
+    local sig_bytes=$(( ${#sig} / 2 )) mask_len
+    case "$kind" in short) mask_len=2 ;; near) mask_len=6 ;; bcond) mask_len=4 ;; esac
+    local mask_end=$(( jg_off + mask_len ))
+    BINARY_ANCHOR_HEX=""; BINARY_ANCHOR_OFF=0
+    local best_len=0 best_start=0 start end byte run_len
+    for (( start = 0; start < sig_bytes; start++ )); do
+        run_len=0
+        for (( end = start; end < sig_bytes; end++ )); do
+            if (( end >= jg_off && end < mask_end )); then break; fi
+            byte="${sig:$(( end*2 )):2}"
+            if [[ "$byte" == "00" || "$byte" == "0a" || "$byte" == "3a" ]]; then break; fi
+            run_len=$(( run_len + 1 ))
         done
+        if (( run_len > best_len )); then best_len=$run_len; best_start=$start; fi
     done
-
-    if [[ ! -s "$patterns_file" ]]; then
-        rm -f -- "$patterns_file"
-        SCAN_PATTERNS_FILE=""
-        return 0
+    if (( best_len >= 4 )); then
+        BINARY_ANCHOR_HEX="${sig:$(( best_start*2 )):$(( best_len*2 ))}"
+        BINARY_ANCHOR_OFF=$best_start
     fi
-
-    infof "Scanning raw signature candidates in one fixed-string pass..."
-    local anchor_pos keys sig_start sig_end jg_file_offset existing
-    while IFS=: read -r anchor_pos anchor_bin; do
-        [[ "$anchor_pos" =~ ^[0-9]+$ ]] || continue
-        keys="${anchor_to_keys[$anchor_bin]-}"
-        [[ -n "$keys" ]] || continue
-        for key in $keys; do
-            IFS='|' read -r kind jg_off sig_hex <<< "$key"
-            sig_start=$(( anchor_pos - key_anchor_off[$key] ))
-            sig_end=$(( sig_start + ${#sig_hex} / 2 ))
-            if (( sig_start < TEXT_RAW || sig_end > TEXT_RAW + TEXT_SIZE )); then continue; fi
-            if sig_matches_at "$file" "$sig_start" "$sig_hex" "$kind" "$jg_off"; then
-                jg_file_offset=$(( sig_start + jg_off ))
-                existing=" ${GLOBAL_SCAN_MATCHES[$key]-} "
-                if [[ "$existing" != *" $jg_file_offset "* ]]; then
-                    if [[ -n "${GLOBAL_SCAN_MATCHES[$key]}" ]]; then
-                        GLOBAL_SCAN_MATCHES["$key"]+=" $jg_file_offset"
-                    else
-                        GLOBAL_SCAN_MATCHES["$key"]="$jg_file_offset"
-                    fi
-                fi
-            fi
-        done
-    done < <(LC_ALL=C grep -a -o -b -F -f "$patterns_file" -- "$file" 2>/dev/null || true)
-
-    rm -f -- "$patterns_file"
-    SCAN_PATTERNS_FILE=""
 }
 
-# find_site_matches <file> <site_spec> → sets FOUND_OFFSETS array and RELOCATED flag
-# site_spec is "name|kind|jgRVA|jgOff|expectedMatches|sig"
-FOUND_OFFSETS=()
-RELOCATED=false
-FAST_PROBE_ONLY=false
-
+# find_site_matches <file> <base> <traw> <tvaddr> <tsize> <spec> -> FOUND_OFFSETS, RELOCATED
+# spec is "name|kind|jgRVA|jgOff|expectedMatches|sig". FOUND_OFFSETS holds
+# ABSOLUTE file offsets of the jump opcode within this slice. Fast path probes
+# the recorded RVA; a miss falls back to one raw fixed-string grep for the site.
+FOUND_OFFSETS=(); RELOCATED=false; FAST_PROBE_ONLY=false
 find_site_matches() {
-    local file="$1"
-    local name kind jg_rva_hex jg_off expected_matches sig_hex
-    IFS='|' read -r name kind jg_rva_hex jg_off expected_matches sig_hex <<< "$2"
+    local file="$1" base="$2" traw="$3" tvaddr="$4" tsize="$5" spec="$6"
+    local name kind jg_rva_hex jg_off expected sig_hex
+    IFS='|' read -r name kind jg_rva_hex jg_off expected sig_hex <<< "$spec"
+    local jg_rva=$(( jg_rva_hex )) sig_len=$(( ${#sig_hex} / 2 ))
+    FOUND_OFFSETS=(); RELOCATED=false
 
-    local jg_rva=$(( jg_rva_hex ))
-    local sig_len=$(( ${#sig_hex} / 2 ))
-
-    FOUND_OFFSETS=()
-    RELOCATED=false
-
-    # Fast path: probe the known RVA (only when expectedMatches == 1)
-    if (( expected_matches == 1 && jg_rva >= TEXT_VADDR )); then
-        local rva_in_text=$(( jg_rva - TEXT_VADDR ))
-        if (( rva_in_text < TEXT_SIZE )); then
-            local jg_raw=$(( TEXT_RAW + rva_in_text ))
+    # Fast path: probe the recorded RVA (only when expectedMatches == 1).
+    if (( expected == 1 && jg_rva >= tvaddr )); then
+        local rva_in_text=$(( jg_rva - tvaddr ))
+        if (( rva_in_text < tsize )); then
+            local jg_raw=$(( traw + rva_in_text ))
             local sig_start=$(( jg_raw - jg_off ))
-            if (( sig_start >= TEXT_RAW && sig_start + sig_len <= TEXT_RAW + TEXT_SIZE )) && sig_matches_at "$file" "$sig_start" "$sig_hex" "$kind" "$jg_off"; then
-                FOUND_OFFSETS=("$jg_raw")
-                RELOCATED=false
-                return 0
+            if (( sig_start >= traw && sig_start + sig_len <= traw + tsize )) \
+               && sig_matches_at "$file" "$sig_start" "$sig_hex" "$kind" "$jg_off"; then
+                FOUND_OFFSETS=("$jg_raw"); RELOCATED=false; return 0
             fi
         fi
     fi
+    if $FAST_PROBE_ONLY; then return 0; fi
 
-    if $FAST_PROBE_ONLY; then
-        return 0
+    # Slow path: one raw fixed-string grep for this site's anchor, verified with
+    # the full masked matcher. Tables are tiny, so a per-site scan is cheap and
+    # only runs when the fast path missed (i.e. Chrome relocated the gate).
+    build_binary_anchor "$sig_hex" "$kind" "$jg_off"
+    local anchor_hex="$BINARY_ANCHOR_HEX"
+    if [[ -z "$anchor_hex" ]]; then
+        errf "Signature has no safe raw scan anchor: ${name}"; return 1
     fi
+    local anchor_bin="" ai abyte
+    for (( ai = 0; ai < ${#anchor_hex}; ai += 2 )); do
+        abyte="${anchor_hex:ai:2}"
+        printf -v abyte '%b' "\\x${abyte}"
+        anchor_bin+="$abyte"
+    done
 
-    # Slow path: one global raw fixed-string pass is shared by every unresolved
-    # site and milestone.  The full masked verifier remains authoritative.
-    local matches=()
-    local scan_key="${kind}|${jg_off}|${sig_hex^^}"
-    prepare_global_raw_scan "$file" || return 1
-    if [[ -n "${GLOBAL_SCAN_MATCHES[$scan_key]-}" ]]; then
-        read -r -a matches <<< "${GLOBAL_SCAN_MATCHES[$scan_key]}"
-        if (( ${#matches[@]} > expected_matches + 1 )); then
-            matches=("${matches[@]:0:$(( expected_matches + 1 ))}")
+    local matches=() anchor_pos sig_start jg_file_offset
+    while IFS=: read -r anchor_pos _rest; do
+        [[ "$anchor_pos" =~ ^[0-9]+$ ]] || continue
+        sig_start=$(( anchor_pos - BINARY_ANCHOR_OFF ))
+        if (( sig_start < traw || sig_start + sig_len > traw + tsize )); then continue; fi
+        if sig_matches_at "$file" "$sig_start" "$sig_hex" "$kind" "$jg_off"; then
+            jg_file_offset=$(( sig_start + jg_off ))
+            local seen=false m
+            for m in "${matches[@]:-}"; do [[ "$m" == "$jg_file_offset" ]] && seen=true; done
+            $seen || matches+=("$jg_file_offset")
+            if (( ${#matches[@]} > expected + 1 )); then break; fi
         fi
-    fi
+    done < <(LC_ALL=C grep -a -o -b -F -- "$anchor_bin" "$file" 2>/dev/null || true)
 
     if (( ${#matches[@]} > 0 )); then
-        FOUND_OFFSETS=("${matches[@]}")
-        RELOCATED=true
+        FOUND_OFFSETS=("${matches[@]}"); RELOCATED=true
     fi
     return 0
 }
 
 # ============================================================================
-# Milestone probing — find the best-matching milestone
+# Per-slice milestone probing - pick the best unambiguous milestone for ONE
+# slice, bounded to that slice's own container/.text. An ELF target is a single
+# slice with container "elf"; a fat Mach-O has one slice per CPU.
 # ============================================================================
-
-# Results set by probe_milestones:
-BEST_MS_INDEX=-1
-BEST_MS_NAME=""
-BEST_SATISFIED=0
-BEST_TOTAL=0
-BEST_FULL=false
-BEST_TIES=0
-# Arrays for the best milestone's flips:
-FLIP_NAMES=()
-FLIP_KINDS=()
-FLIP_OFFSETS=()
-FLIP_RELOCATED=()
+BEST_MS_NAME=""; BEST_SATISFIED=0; BEST_TOTAL=0; BEST_FULL=false; BEST_TIES=0
+FLIP_NAMES=(); FLIP_KINDS=(); FLIP_OFFSETS=(); FLIP_RELOCATED=()
 
 reset_probe_results() {
-    BEST_MS_INDEX=-1
-    BEST_MS_NAME=""
-    BEST_SATISFIED=0
-    BEST_TOTAL=0
-    BEST_FULL=false
-    BEST_TIES=0
-    FLIP_NAMES=()
-    FLIP_KINDS=()
-    FLIP_OFFSETS=()
-    FLIP_RELOCATED=()
+    BEST_MS_NAME=""; BEST_SATISFIED=0; BEST_TOTAL=0; BEST_FULL=false; BEST_TIES=0
+    FLIP_NAMES=(); FLIP_KINDS=(); FLIP_OFFSETS=(); FLIP_RELOCATED=()
 }
 
-probe_milestones_pass() {
-    local file="$1"
-
+probe_slice_pass() {
+    local file="$1" base="$2" traw="$3" tvaddr="$4" tsize="$5" container="$6"
     local mi
     for (( mi = 0; mi < NUM_MILESTONES; mi++ )); do
-        local ms_container="${MILESTONE_CONTAINERS[$mi]}"
-        # Only probe ELF milestones
-        if [[ "$ms_container" != "elf" ]]; then continue; fi
-
+        [[ "${MILESTONE_CONTAINERS[$mi]}" == "$container" ]] || continue
         local ms_name="${MILESTONE_NAMES[$mi]}"
-        local sites_var="MILESTONE_${mi}_SITES[@]"
-        local sites=("${!sites_var}")
-        local satisfied=0
-        local flip_names_tmp=() flip_kinds_tmp=() flip_offsets_tmp=() flip_relocated_tmp=()
-
-        local site_spec
-        for site_spec in "${sites[@]}"; do
-            local s_name s_kind s_jgrva s_jgoff s_expected s_sig
-            IFS='|' read -r s_name s_kind s_jgrva s_jgoff s_expected s_sig <<< "$site_spec"
-
-            find_site_matches "$file" "$site_spec"
-
+        local satisfied=0 total=0
+        local fn=() fk=() fo=() fr=()
+        local spec s_name s_kind s_jgrva s_jgoff s_expected s_sig off
+        while IFS= read -r spec; do
+            [[ -n "$spec" ]] || continue
+            total=$(( total + 1 ))
+            IFS='|' read -r s_name s_kind s_jgrva s_jgoff s_expected s_sig <<< "$spec"
+            find_site_matches "$file" "$base" "$traw" "$tvaddr" "$tsize" "$spec"
             if (( ${#FOUND_OFFSETS[@]} == s_expected )); then
-                (( satisfied++ )) || true
-                local off
+                satisfied=$(( satisfied + 1 ))
                 for off in "${FOUND_OFFSETS[@]}"; do
-                    flip_names_tmp+=("$s_name")
-                    flip_kinds_tmp+=("$s_kind")
-                    flip_offsets_tmp+=("$off")
-                    flip_relocated_tmp+=("$RELOCATED")
+                    fn+=("$s_name"); fk+=("$s_kind"); fo+=("$off"); fr+=("$RELOCATED")
                 done
             fi
-        done
+        done < <(sites_of "$mi")
 
         if (( satisfied > BEST_SATISFIED )); then
-            BEST_MS_INDEX=$mi
-            BEST_MS_NAME="$ms_name"
-            BEST_SATISFIED=$satisfied
-            BEST_TOTAL=${#sites[@]}
-            FLIP_NAMES=("${flip_names_tmp[@]}")
-            FLIP_KINDS=("${flip_kinds_tmp[@]}")
-            FLIP_OFFSETS=("${flip_offsets_tmp[@]}")
-            FLIP_RELOCATED=("${flip_relocated_tmp[@]}")
+            BEST_MS_NAME="$ms_name"; BEST_SATISFIED=$satisfied; BEST_TOTAL=$total
+            FLIP_NAMES=("${fn[@]:-}"); FLIP_KINDS=("${fk[@]:-}")
+            FLIP_OFFSETS=("${fo[@]:-}"); FLIP_RELOCATED=("${fr[@]:-}")
             BEST_TIES=1
-
-            # Short-circuit: if this milestone satisfied every site, no other
-            # milestone can beat it — skip the rest (avoids the expensive hex
-            # dump for the remaining milestones).
-            if (( satisfied == ${#sites[@]} )); then break; fi
+            (( satisfied == total )) && break
         elif (( satisfied == BEST_SATISFIED && satisfied > 0 )); then
-            (( BEST_TIES++ )) || true
+            BEST_TIES=$(( BEST_TIES + 1 ))
         fi
     done
-
-    if (( BEST_SATISFIED == BEST_TOTAL && BEST_TOTAL > 0 )); then
-        BEST_FULL=true
-    else
-        BEST_FULL=false
-    fi
+    if (( BEST_SATISFIED == BEST_TOTAL && BEST_TOTAL > 0 )); then BEST_FULL=true; else BEST_FULL=false; fi
 }
 
-probe_milestones() {
-    local file="$1"
-
-    # First probe every milestone only at its recorded RVAs.  This prevents an
-    # older table from triggering a full scan before a newer exact-build table
-    # has had a chance to win immediately.
+probe_slice() {
+    local idx="$1" file="$2"
+    local base="${SLICE_BASE[$idx]}" traw="${SLICE_TRAW[$idx]}"
+    local tvaddr="${SLICE_TVADDR[$idx]}" tsize="${SLICE_TSIZE[$idx]}"
+    local container="${SLICE_CONTAINER[$idx]}"
     reset_probe_results
     FAST_PROBE_ONLY=true
-    probe_milestones_pass "$file"
+    probe_slice_pass "$file" "$base" "$traw" "$tvaddr" "$tsize" "$container"
     FAST_PROBE_ONLY=false
-    if $BEST_FULL; then
-        return 0
-    fi
-
-    # At least one site moved (or has expectedMatches > 1).  Run the normal
-    # pass; its first miss lazily performs one shared raw scan for all tables.
+    if $BEST_FULL; then return 0; fi
     reset_probe_results
-    probe_milestones_pass "$file"
+    probe_slice_pass "$file" "$base" "$traw" "$tvaddr" "$tsize" "$container"
+    return 0
 }
 
 # ============================================================================
-# Flip engine — apply the jg → jmp flips
+# Flip engine (operates on the FLIP_* set filled by probe_slice, in a work file).
+#   short : 0x7F      -> 0xEB
+#   near  : 0F 8F     -> 90 E9
+#   bcond : B.cond word byte0 low nibble GT(0xC) -> AL(0xE); ONLY that nibble
+#           changes (b0 = (b0 & 0xF0) | 0x0E), preserving opcode and imm19.
 # ============================================================================
-
-PATCH_STATUS=0   # 0=declined, 1=flips applied, 2=all already applied
-PATCH_FLIPS=0
-PATCH_STOCK=0
-PATCH_ALREADY=0
-WRITTEN_RVAS=()
-WRITTEN_BYTES=()
-
-apply_flips() {
-    local file="$1"
-    local applied=0 already=0
-    local i
-
-    PATCH_STATUS=0
-    PATCH_FLIPS=0
-    PATCH_STOCK=0
-    PATCH_ALREADY=0
-    WRITTEN_RVAS=()
-    WRITTEN_BYTES=()
-
-    infof "Chrome ${BEST_MS_NAME} MV2 layout detected (${BEST_SATISFIED}/${BEST_TOTAL} inlined IsExtensionAffected sites, ${#FLIP_OFFSETS[@]} jg flip(s))."
-
+SLICE_FLIPS=0; SLICE_ALREADY=0
+apply_flips_slice() {
+    local file="$1" applied=0 already=0 i name kind offset cur o0 o1 nib newb
+    SLICE_FLIPS=0; SLICE_ALREADY=0
     for (( i = 0; i < ${#FLIP_OFFSETS[@]}; i++ )); do
-        local name="${FLIP_NAMES[$i]}"
-        local kind="${FLIP_KINDS[$i]}"
-        local offset="${FLIP_OFFSETS[$i]}"
-        local relocated="${FLIP_RELOCATED[$i]}"
-        local rva=$(( TEXT_VADDR + (offset - TEXT_RAW) ))
-        local rva_hex
-        rva_hex=$(printf '0x%X' "$rva")
-
+        name="${FLIP_NAMES[$i]}"; kind="${FLIP_KINDS[$i]}"; offset="${FLIP_OFFSETS[$i]}"
         if [[ "$kind" == "short" ]]; then
-            local cur
             cur=$(read_byte "$file" "$offset")
-
-            if (( cur == 0xEB )); then
-                echo "    [i] ${BEST_MS_NAME}: ${name} jg->jmp at RVA ${rva_hex} already applied (no change)."
-                (( already++ )) || true
-                (( PATCH_ALREADY++ )) || true
-                WRITTEN_RVAS+=("$rva")
-                WRITTEN_BYTES+=("EB")
-                continue
-            fi
+            if (( cur == 0xEB )); then already=$(( already + 1 )); continue; fi
             if (( cur != 0x7F )); then
-                echo "    ${TAG_WARN} ${BEST_MS_NAME}: ${name} unexpected byte 0x$(printf '%X' $cur) at RVA ${rva_hex} (expected 0x7F) - skipping this site."
+                warnf "    ${BEST_MS_NAME}: ${name} unexpected 0x$(printf '%X' "$cur") (want 7F) - skipping."
                 continue
             fi
-
-            # Write the flip: 0x7F → 0xEB
             printf '\xEB' | dd of="$file" bs=1 seek="$offset" count=1 conv=notrunc 2>/dev/null
-            (( applied++ )) || true
-            (( PATCH_STOCK++ )) || true
-            (( PATCH_FLIPS++ )) || true
-            WRITTEN_RVAS+=("$rva")
-            WRITTEN_BYTES+=("EB")
-
-        else  # near: 0F 8F → 90 E9
-            local o0 o1
-            o0=$(read_byte "$file" "$offset")
-            o1=$(read_byte "$file" $(( offset + 1 )))
-
-            if (( o0 == 0x90 && o1 == 0xE9 )); then
-                echo "    [i] ${BEST_MS_NAME}: ${name} jg->jmp at RVA ${rva_hex} already applied (no change)."
-                (( already++ )) || true
-                (( PATCH_ALREADY++ )) || true
-                WRITTEN_RVAS+=("$rva")
-                WRITTEN_BYTES+=("90E9")
-                continue
-            fi
+            applied=$(( applied + 1 ))
+        elif [[ "$kind" == "near" ]]; then
+            o0=$(read_byte "$file" "$offset"); o1=$(read_byte "$file" $(( offset + 1 )))
+            if (( o0 == 0x90 && o1 == 0xE9 )); then already=$(( already + 1 )); continue; fi
             if ! (( o0 == 0x0F && o1 == 0x8F )); then
-                echo "    ${TAG_WARN} ${BEST_MS_NAME}: ${name} unexpected bytes 0x$(printf '%X' $o0) 0x$(printf '%X' $o1) at RVA ${rva_hex} (expected 0F 8F) - skipping this site."
+                warnf "    ${BEST_MS_NAME}: ${name} unexpected 0x$(printf '%X' "$o0") 0x$(printf '%X' "$o1") (want 0F 8F) - skipping."
                 continue
             fi
-
-            # Write the flip: 0F 8F → 90 E9
             printf '\x90\xE9' | dd of="$file" bs=1 seek="$offset" count=2 conv=notrunc 2>/dev/null
-            (( applied++ )) || true
-            (( PATCH_STOCK++ )) || true
-            (( PATCH_FLIPS++ )) || true
-            WRITTEN_RVAS+=("$rva")
-            WRITTEN_BYTES+=("90E9")
+            applied=$(( applied + 1 ))
+        else  # bcond
+            cur=$(read_byte "$file" "$offset")   # little-endian byte0 holds the condition
+            nib=$(( cur & 0x0F ))
+            if (( nib == 0x0E )); then already=$(( already + 1 )); continue; fi
+            if (( nib != 0x0C )); then
+                warnf "    ${BEST_MS_NAME}: ${name} b.cond nibble 0x$(printf '%X' "$nib") (want C=GT) - skipping."
+                continue
+            fi
+            newb=$(( (cur & 0xF0) | 0x0E ))
+            printf "\\x$(printf '%02X' "$newb")" | dd of="$file" bs=1 seek="$offset" count=1 conv=notrunc 2>/dev/null
+            applied=$(( applied + 1 ))
         fi
-
-        local suffix=""
-        if [[ "$relocated" == "true" ]]; then
-            suffix="  (RELOCATED - point-release layout)"
-        fi
-        echo "    ${TAG_OK} ${BEST_MS_NAME}: ${name} jg->jmp at RVA ${rva_hex}${suffix}"
+        local suffix=""; [[ "${FLIP_RELOCATED[$i]}" == "true" ]] && suffix="  (RELOCATED)"
+        okf "    ${BEST_MS_NAME}: ${name} flipped${suffix}"
     done
-
-    (( PATCH_FLIPS += already )) || true
-
-    if ! $BEST_FULL; then
-        echo "    ${TAG_WARN} Chrome ${BEST_MS_NAME}: $(( BEST_TOTAL - BEST_SATISFIED )) site(s) not found - this Chrome build may have shifted them."
-        echo "          MV2 re-enable is PARTIAL and may still be blocked; please report the version."
-    fi
-
-    if (( applied > 0 )); then
-        PATCH_STATUS=1
-    else
-        PATCH_STATUS=2
-    fi
+    SLICE_FLIPS=$applied; SLICE_ALREADY=$already
 }
 
-STATE_STOCK=0
-STATE_PATCHED=0
-classify_flip_states() {
-    local file="$1"
-    STATE_STOCK=0
-    STATE_PATCHED=0
-    local i kind offset o0 o1
+STATE_STOCK=0; STATE_PATCHED=0
+classify_flip_states_slice() {
+    local file="$1" i kind offset o0 o1 nib
+    STATE_STOCK=0; STATE_PATCHED=0
     for (( i = 0; i < ${#FLIP_OFFSETS[@]}; i++ )); do
-        kind="${FLIP_KINDS[$i]}"
-        offset="${FLIP_OFFSETS[$i]}"
+        kind="${FLIP_KINDS[$i]}"; offset="${FLIP_OFFSETS[$i]}"
         o0=$(read_byte "$file" "$offset")
         if [[ "$kind" == "short" ]]; then
-            if (( o0 == 0x7F )); then (( STATE_STOCK++ )) || true
-            elif (( o0 == 0xEB )); then (( STATE_PATCHED++ )) || true
-            else return 1
-            fi
-        else
+            if (( o0 == 0x7F )); then STATE_STOCK=$(( STATE_STOCK + 1 ))
+            elif (( o0 == 0xEB )); then STATE_PATCHED=$(( STATE_PATCHED + 1 ))
+            else return 1; fi
+        elif [[ "$kind" == "near" ]]; then
             o1=$(read_byte "$file" $(( offset + 1 )))
-            if (( o0 == 0x0F && o1 == 0x8F )); then (( STATE_STOCK++ )) || true
-            elif (( o0 == 0x90 && o1 == 0xE9 )); then (( STATE_PATCHED++ )) || true
-            else return 1
-            fi
+            if (( o0 == 0x0F && o1 == 0x8F )); then STATE_STOCK=$(( STATE_STOCK + 1 ))
+            elif (( o0 == 0x90 && o1 == 0xE9 )); then STATE_PATCHED=$(( STATE_PATCHED + 1 ))
+            else return 1; fi
+        else
+            nib=$(( o0 & 0x0F ))
+            if (( nib == 0x0C )); then STATE_STOCK=$(( STATE_STOCK + 1 ))
+            elif (( nib == 0x0E )); then STATE_PATCHED=$(( STATE_PATCHED + 1 ))
+            else return 1; fi
         fi
     done
 }
 
-verify_patched_output() {
-    local file="$1"
-    probe_milestones "$file" || return 1
-    (( BEST_SATISFIED > 0 && BEST_TIES == 1 )) || return 1
-    classify_flip_states "$file" || return 1
-    (( STATE_STOCK == 0 && STATE_PATCHED == ${#FLIP_OFFSETS[@]} ))
-}
-
 # ============================================================================
-# Report-only candidate scanner — structural scan for cmp r/m32,2 ; jg
+# Report-only candidate scanner (ELF) - structural scan for cmp r/m32,2 ; jg.
+# Purely informational on a no-match; never modifies anything.
 # ============================================================================
-
 report_layout_candidates() {
     local file="$1"
     if (( TEXT_SIZE < 8 )); then return; fi
-
     infof "Scanning .text for the IsExtensionAffected skeleton (cmp r/m32,2 ; jg short ; ... ; type/location check)..."
-
-    local total=0 shown=0
-    local max_display=20
-    local marker
+    local total=0 shown=0 max_display=20 marker
     printf -v marker '%b' '\x02\x7f'
-
-    # Search raw bytes for the immediate/opcode pair 02 7F, then validate the
-    # cmp encoding before it and the type/location check after it.
     local LC_ALL=C
     while IFS=: read -r marker_pos _match; do
         [[ "$marker_pos" =~ ^[0-9]+$ ]] || continue
         if (( marker_pos < TEXT_RAW + 2 || marker_pos + 2 > TEXT_RAW + TEXT_SIZE )); then continue; fi
-
         local valid=false cmp_back=0 ctx
         ctx=$(read_bytes_hex "$file" $(( marker_pos - 2 )) 2)
-        # reg form: 83 F8..FF 02 7F
-        if [[ "$ctx" =~ ^83F[89A-F]$ ]]; then
-            valid=true
-            cmp_back=2
-        fi
-        # disp8 form: 83 78..7F disp8 02 7F
+        if [[ "$ctx" =~ ^83F[89A-F]$ ]]; then valid=true; cmp_back=2; fi
         if ! $valid && (( marker_pos >= TEXT_RAW + 3 )); then
             ctx=$(read_bytes_hex "$file" $(( marker_pos - 3 )) 3)
-            if [[ "$ctx" =~ ^837[89A-F][[:xdigit:]]{2}$ ]]; then
-                valid=true
-                cmp_back=3
-            fi
+            if [[ "$ctx" =~ ^837[89A-F][[:xdigit:]]{2}$ ]]; then valid=true; cmp_back=3; fi
         fi
-
         if ! $valid; then continue; fi
-
-        # Follow-up check within ~40 bytes after the jg
-        local follow_start=$(( marker_pos + 2 ))
-        local follow_count=40
+        local follow_start=$(( marker_pos + 2 )) follow_count=40
         if (( follow_start + follow_count > TEXT_RAW + TEXT_SIZE )); then
             follow_count=$(( TEXT_RAW + TEXT_SIZE - follow_start ))
         fi
         local follow_region=""
-        if (( follow_count > 0 )); then
-            follow_region=$(read_bytes_hex "$file" "$follow_start" "$follow_count")
-        fi
-
+        if (( follow_count > 0 )); then follow_region=$(read_bytes_hex "$file" "$follow_start" "$follow_count"); fi
         local has_follow=false
-        # cmp reg, 1 or cmp reg, 5
         if [[ "$follow_region" =~ 83F[89A-F]0[15] ]]; then has_follow=true; fi
-        # cmp byte [reg+disp32], 0
         if ! $has_follow && [[ "$follow_region" =~ 80B[89A-F][[:xdigit:]]{8}00 ]]; then has_follow=true; fi
-
         if ! $has_follow; then continue; fi
-
-        (( total++ )) || true
+        total=$(( total + 1 ))
         if (( shown < max_display )); then
             local rva=$(( TEXT_VADDR + marker_pos - TEXT_RAW - cmp_back ))
             printf "    [candidate] RVA 0x%X\n" "$rva"
-            (( shown++ )) || true
+            shown=$(( shown + 1 ))
         fi
     done < <(LC_ALL=C grep -a -o -b -F -- "$marker" "$file" 2>/dev/null || true)
-
     local extra=""
     if (( total > shown )); then extra=" ($((total - shown)) not shown)"; fi
     infof "Skeleton scan found ${total} candidate site(s)${extra}. None were modified - verify each against mv2-reversing.md before hand-patching."
 }
 
 # ============================================================================
-# Linux platform glue
+# Atomic write + backup. write_target does a dir-local atomic replace, verifying
+# the copied bytes and (optionally) re-checking the target hash to close the
+# inspect/write race. Backups and their .meta are container-specific:
+#   - ELF   : "<file>.bak" beside the file, keyed by GNU build-id.
+#   - Mach-O: for a real .app, in Application Support/<brand>/<uuid>/ (a stray
+#             file inside a signed bundle breaks its seal and a Keystone update
+#             wipes it); for a loose offline Mach-O, "<file>.bak" beside it.
 # ============================================================================
+WORK_FILE=""; WRITE_TMP=""; META_TMP=""; QUIET=false
 
-# Chrome install channels on Linux
+write_target() {
+    local target="$1" source="$2" expected_hash="${3:-}"
+    local dir; dir=$(dirname "$target")
+    local tmp; tmp=$(mktemp "${dir}/.chrome-mv2-XXXXXX"); WRITE_TMP="$tmp"
+    if [[ -e "$target" ]]; then cp -p -- "$target" "$tmp"; fi
+    cp -- "$source" "$tmp"
+    local shash thash chash
+    shash=$(file_sha256 "$source"); thash=$(file_sha256 "$tmp")
+    if [[ "$shash" != "$thash" ]]; then rm -f -- "$tmp"; WRITE_TMP=""; errf "Temp-file verification failed for ${target}."; return 1; fi
+    if [[ -n "$expected_hash" ]]; then
+        chash=$(file_sha256 "$target")
+        if [[ "$chash" != "$expected_hash" ]]; then rm -f -- "$tmp"; WRITE_TMP=""; errf "Target changed after inspection; refusing to overwrite."; return 1; fi
+    fi
+    mv -f -- "$tmp" "$target"; WRITE_TMP=""
+    sync 2>/dev/null || true
+}
+
+backup_meta_path() { printf '%s.meta\n' "$1"; }
+
+# ---- Mach-O identity + backup location -------------------------------------
+BACKUP_BRAND="chrome-mv2-patch"
+TARGET_TOKEN=""
+IDENTITY_UUIDS=""
+APP_PATH=""; FRAMEWORK_BUNDLE=""; TARGET_FILE=""
+
+support_base() {
+    if [[ -w "/Library/Application Support" ]]; then printf '/Library/Application Support\n'
+    else printf '%s/Library/Application Support\n' "${HOME:-/tmp}"; fi
+}
+
+format_uuid() {
+    local h="$1"
+    if [[ ${#h} -eq 32 ]]; then
+        printf '%s-%s-%s-%s-%s\n' "${h:0:8}" "${h:8:4}" "${h:12:4}" "${h:16:4}" "${h:20:12}"
+    else printf '%s\n' "$h"; fi
+}
+
+# The macho backup key: the LC_UUID of the slice that runs on THIS Mac.
+identity_token() {
+    local pair uuid="" IFS=,
+    for pair in $IDENTITY_UUIDS; do
+        case "$pair" in "$HOST_CONTAINER":*) uuid="${pair#*:}"; break ;; esac
+    done
+    [[ -n "$uuid" ]] || uuid="${IDENTITY_UUIDS##*:}"
+    uuid=$(printf '%s' "$uuid" | tr -cd '0-9A-Fa-f')
+    if [[ -z "$uuid" ]]; then
+        uuid=$(printf '%s' "$IDENTITY_UUIDS" | { shasum -a 256 2>/dev/null || sha256sum; } | awk '{print $1}')
+        uuid="${uuid:0:32}"
+    fi
+    format_uuid "$uuid"
+}
+
+compute_identity() {
+    # requires parse_macho() to have populated SLICE_* for $1
+    local file="$1" i pairs=""
+    for (( i = 0; i < NUM_SLICES; i++ )); do
+        pairs="${pairs}${pairs:+,}${SLICE_CONTAINER[$i]}:${SLICE_UUID[$i]}"
+    done
+    IDENTITY_UUIDS="$pairs"
+}
+
+# backup_dir/backup_path dispatch on the target container. ELF and loose Mach-O
+# keep "<file>.bak" beside the file; a real .app keeps it under Application
+# Support keyed by the framework build UUID.
+backup_dir() {
+    if [[ "$TARGET_CONTAINER" == "macho" && -n "$APP_PATH" ]]; then
+        printf '%s/%s/%s\n' "$(support_base)" "$BACKUP_BRAND" "$TARGET_TOKEN"
+    else
+        printf '%s\n' "$(dirname "$TARGET_FILE")"
+    fi
+}
+backup_path() {
+    if [[ "$TARGET_CONTAINER" == "macho" && -n "$APP_PATH" ]]; then
+        printf '%s/%s.bak\n' "$(backup_dir)" "$(basename "$TARGET_FILE")"
+    else
+        printf '%s.bak\n' "$TARGET_FILE"
+    fi
+}
+
+BACKUP_BUILD_ID=""; BACKUP_IDENTITY=""; BACKUP_SIZE=0; BACKUP_HASH=""; BACKUP_LEGACY=false
+
+# save_backup_snapshot <target> <backup> <source> <identity>
+# identity = build-id (elf) or "macho-x64:HEX,macho-arm64:HEX" (macho).
+save_backup_snapshot() {
+    local target="$1" backup="$2" source="$3" identity="$4"
+    mkdir -p -- "$(dirname "$backup")" || { errf "Could not create backup dir $(dirname "$backup")."; return 1; }
+    local prev=""; [[ -f "$backup" ]] && prev=$(file_sha256 "$backup")
+    write_target "$backup" "$source" "$prev" || return 1
+    local meta size hash container
+    meta=$(backup_meta_path "$backup"); size=$(file_size "$backup"); hash=$(file_sha256 "$backup")
+    if [[ "$TARGET_CONTAINER" == "elf" ]]; then container="elf"; else container="macho"; fi
+    META_TMP="${meta}.tmp"
+    if [[ "$container" == "elf" ]]; then
+        printf 'schema=1\ncontainer=elf\nbuild_id=%s\nsize=%s\nsha256=%s\n' "$identity" "$size" "$hash" > "$META_TMP"
+    else
+        printf 'schema=1\ncontainer=macho\nidentity=%s\nsize=%s\nsha256=%s\n' "$identity" "$size" "$hash" > "$META_TMP"
+    fi
+    mv -f -- "$META_TMP" "$meta"; META_TMP=""
+}
+
+validate_backup_snapshot() {
+    local backup="$1" meta
+    [[ -f "$backup" ]] || return 1
+    BACKUP_BUILD_ID=""; BACKUP_IDENTITY=""
+    if [[ "$TARGET_CONTAINER" == "elf" ]]; then
+        parse_elf "$backup" >/dev/null || return 1
+        BACKUP_BUILD_ID=$(get_elf_build_id "$backup")
+        [[ -n "$BACKUP_BUILD_ID" ]] || return 1
+    else
+        parse_macho "$backup" >/dev/null || return 1
+        compute_identity "$backup"; BACKUP_IDENTITY="$IDENTITY_UUIDS"
+        [[ -n "$BACKUP_IDENTITY" ]] || return 1
+    fi
+    BACKUP_SIZE=$(file_size "$backup"); BACKUP_HASH=$(file_sha256 "$backup")
+
+    meta=$(backup_meta_path "$backup"); BACKUP_LEGACY=false
+    if [[ ! -f "$meta" ]]; then BACKUP_LEGACY=true; return 0; fi
+    local schema="" container="" build_id="" identity="" size="" sha256="" key value extra
+    while IFS='=' read -r key value extra; do
+        [[ -z "$extra" ]] || return 1
+        case "$key" in
+            schema) schema="$value" ;; container) container="$value" ;;
+            build_id) build_id="$value" ;; identity) identity="$value" ;;
+            size) size="$value" ;; sha256) sha256="$value" ;;
+            *) return 1 ;;
+        esac
+    done < "$meta"
+    if [[ "$TARGET_CONTAINER" == "elf" ]]; then
+        [[ "$schema" == 1 && "$container" == elf && "$build_id" == "$BACKUP_BUILD_ID" \
+           && "$size" == "$BACKUP_SIZE" && "$sha256" == "$BACKUP_HASH" ]]
+    else
+        [[ "$schema" == 1 && "$container" == macho && "$identity" == "$BACKUP_IDENTITY" \
+           && "$size" == "$BACKUP_SIZE" && "$sha256" == "$BACKUP_HASH" ]]
+    fi
+}
+
+# ============================================================================
+# Code signing (macOS only). Any edit invalidates the Mach-O signature; on Apple
+# Silicon the kernel refuses to launch an invalid/absent signature. We must NOT
+# use `codesign --deep` (it drops each component's entitlements, stripping the
+# Renderer helper's com.apple.security.cs.allow-jit -> renderer crashes). Instead
+# we walk the bundle INSIDE-OUT and sign every nested bundle + Mach-O with
+# --preserve-metadata=entitlements,flags; `requirements` is dropped so codesign
+# regenerates an ad-hoc designated requirement.
+# ============================================================================
+have_codesign() { command -v codesign >/dev/null 2>&1; }
+
+resign_one() {
+    local comp="$1"
+    codesign --force --sign - --preserve-metadata=entitlements,flags "$comp" 2>/dev/null && return 0
+    codesign --force --sign - "$comp" 2>/dev/null && return 0
+    errf "codesign failed on: ${comp}"; return 1
+}
+
+resign_inside_out() {
+    local framework_bundle="$1" app_path="$2"   # framework_bundle kept for call-site compat
+    if [[ -z "$app_path" || ! -d "$app_path" ]]; then
+        errf "App bundle not found for re-signing: ${app_path}"; return 1
+    fi
+    infof "Ad-hoc re-signing (inside-out, per-component entitlements preserved)..."
+    local items=() line path rc=0
+    while IFS= read -r line; do items+=("$line"); done < <(
+        {
+            find "$app_path" -type d \( -name '*.app' -o -name '*.framework' -o -name '*.xpc' \) -print
+            find "$app_path" -type f \( -name '*.dylib' -o -name '*.so' \
+                 -o -path '*/MacOS/*' -o -path '*/Helpers/*' -o -path '*/Libraries/*' \) -print
+        } 2>/dev/null | awk -F/ '{ print NF"\t"$0 }' | sort -rn -k1,1
+    )
+    for line in "${items[@]}"; do
+        path="${line#*$'\t'}"
+        [[ "$path" == "$app_path" ]] && continue                 # outer app signed last
+        if [[ -f "$path" ]] && ! is_macho "$path"; then continue; fi   # skip data blobs
+        resign_one "$path" || rc=1
+    done
+    resign_one "$app_path" || rc=1                                 # top of the tree, last
+    return $rc
+}
+
+verify_signature() {
+    local app_path="$1"
+    if [[ -n "$app_path" && -d "$app_path" ]]; then
+        codesign --verify --deep --strict "$app_path" 2>/dev/null
+        return $?
+    fi
+    return 0
+}
+
+# ============================================================================
+# Host CPU (Mach-O only). The universal framework carries two slices but only
+# ONE runs on this Mac; patching the other would edit code that never executes.
+# ============================================================================
+HOST_CONTAINER=""
+detect_host_container() {
+    case "${MV2_TEST_HOST_ARCH:-}" in
+        arm64|aarch64)  HOST_CONTAINER="macho-arm64"; return ;;
+        x86_64|amd64|x64) HOST_CONTAINER="macho-x64"; return ;;
+    esac
+    if command -v sysctl >/dev/null 2>&1 \
+       && [[ "$(sysctl -n hw.optional.arm64 2>/dev/null)" == "1" ]]; then
+        HOST_CONTAINER="macho-arm64"; return
+    fi
+    case "$(uname -m 2>/dev/null || echo)" in
+        arm64|aarch64) HOST_CONTAINER="macho-arm64" ;;
+        *)             HOST_CONTAINER="macho-x64" ;;
+    esac
+}
+
+host_arch_label() {
+    case "$HOST_CONTAINER" in
+        macho-arm64) echo "Apple Silicon (arm64)" ;;
+        *)           echo "Intel (x86_64)" ;;
+    esac
+}
+
+# Should this slice be patched? Sets SKIP_REASON on decline. ELF is single-arch
+# and always eligible; a Mach-O slice is eligible only if it matches this Mac.
+SKIP_REASON=""
+slice_decision() {
+    local container="$1" allow_partial="$2"
+    SKIP_REASON=""
+    if (( BEST_SATISFIED == 0 )); then SKIP_REASON="no known layout matched"; return 1; fi
+    if ! $BEST_FULL && (( BEST_TIES > 1 )); then SKIP_REASON="ambiguous (${BEST_TIES} milestones tied)"; return 1; fi
+    if [[ "$container" != "elf" && "$HOST_CONTAINER" != "$container" ]]; then
+        local label="${container#macho-}"; [[ "$label" == "x64" ]] && label="x86_64"
+        SKIP_REASON="the ${label} slice does not run on this $(host_arch_label) Mac"; return 1
+    fi
+    if ! $BEST_FULL && ! $allow_partial; then
+        SKIP_REASON="only ${BEST_SATISFIED}/${BEST_TOTAL} sites; needs --allow-partial"; return 1
+    fi
+    return 0
+}
+
+# ============================================================================
+# macOS platform glue - .app discovery, framework resolution, process handling.
+# ============================================================================
+app_version() {
+    local app="$1" plist="$1/Contents/Info.plist"
+    [[ -f "$plist" ]] || { echo ""; return; }
+    if command -v defaults >/dev/null 2>&1; then
+        defaults read "${app}/Contents/Info" CFBundleShortVersionString 2>/dev/null && return
+    fi
+    if command -v plutil >/dev/null 2>&1; then
+        plutil -extract CFBundleShortVersionString raw -o - "$plist" 2>/dev/null && return
+    fi
+    echo ""
+}
+
+# From a .app dir, set FRAMEWORK_BUNDLE + TARGET_FILE (the real versioned Mach-O).
+resolve_framework_from_app() {
+    local app="$1" fw=""
+    local d
+    for d in "$app"/Contents/Frameworks/*Framework.framework; do
+        [[ -d "$d" ]] && { fw="$d"; break; }
+    done
+    [[ -n "$fw" ]] || return 1
+    FRAMEWORK_BUNDLE="$fw"
+    local base; base=$(basename "$fw" .framework)
+    local versions="$fw/Versions" v vdir=""
+    if [[ -d "$versions" ]]; then
+        for v in "$versions"/*; do
+            [[ -d "$v" && ! -L "$v" ]] || continue
+            [[ "$(basename "$v")" == "Current" ]] && continue
+            vdir="$v"   # last real version dir; installs keep exactly one
+        done
+    fi
+    if [[ -n "$vdir" && -f "$vdir/$base" ]]; then
+        TARGET_FILE="$vdir/$base"
+    elif [[ -f "$versions/Current/$base" ]]; then
+        TARGET_FILE="$versions/Current/$base"
+    else
+        return 1
+    fi
+    return 0
+}
+
+# Normalize a macOS path (.app / .framework / loose Mach-O) into APP_PATH /
+# FRAMEWORK_BUNDLE / TARGET_FILE.
+resolve_macho_target() {
+    local path="$1"
+    APP_PATH=""; FRAMEWORK_BUNDLE=""; TARGET_FILE=""
+    if [[ -d "$path" && "$path" == *.app ]]; then
+        APP_PATH="$path"
+        resolve_framework_from_app "$path" || { errf "No Chrome framework inside ${path}"; return 1; }
+    elif [[ -d "$path" && "$path" == *.framework ]]; then
+        FRAMEWORK_BUNDLE="$path"
+        local base; base=$(basename "$path" .framework)
+        if [[ -f "$path/Versions/Current/$base" ]]; then TARGET_FILE="$path/Versions/Current/$base"
+        else errf "No versioned binary in ${path}"; return 1; fi
+    elif [[ -f "$path" ]]; then
+        TARGET_FILE="$path"        # a loose Mach-O (offline scratch copy)
+    else
+        errf "Path is not a .app, .framework, or Mach-O file: ${path}"; return 1
+    fi
+    return 0
+}
+
+CHROME_APPS=("Google Chrome.app" "Google Chrome Beta.app" "Google Chrome Dev.app" "Google Chrome Canary.app")
+CHROME_LABELS=("Stable" "Beta" "Dev" "Canary")
+MAC_LABELS=(); MAC_APPS=(); MAC_VERSIONS=(); MAC_RUNNING=()
+
+enumerate_macos_installs() {
+    MAC_LABELS=(); MAC_APPS=(); MAC_VERSIONS=(); MAC_RUNNING=()
+    local roots=("/Applications" "$HOME/Applications") root i app ver running
+    for root in "${roots[@]}"; do
+        for (( i = 0; i < ${#CHROME_APPS[@]}; i++ )); do
+            app="$root/${CHROME_APPS[$i]}"
+            [[ -d "$app" ]] || continue
+            ver=$(app_version "$app")
+            running=false
+            if command -v pgrep >/dev/null 2>&1 && pgrep -f "$app/Contents/MacOS/" >/dev/null 2>&1; then running=true; fi
+            MAC_LABELS+=("${CHROME_LABELS[$i]}"); MAC_APPS+=("$app")
+            MAC_VERSIONS+=("$ver"); MAC_RUNNING+=("$running")
+        done
+    done
+}
+
+proc_holders_app() {
+    local app="$1"
+    if command -v pgrep >/dev/null 2>&1; then pgrep -f "$app/Contents/MacOS/" 2>/dev/null | wc -l | tr -d ' '; else echo 0; fi
+}
+
+quit_chrome() {
+    local app="$1" assume_yes="$2"
+    (( $(proc_holders_app "$app") == 0 )) && return 0
+    if ! $assume_yes && ! $QUIET; then
+        echo -n "${C_BOLD}Chrome ($(basename "$app")) is running; quit it to patch cleanly? [y/N]: ${C_RESET}"
+        local line; read -r line || return 1
+        case "$line" in y|Y) ;; *) infof "Cancelled - nothing changed."; return 1 ;; esac
+    fi
+    command -v osascript >/dev/null 2>&1 && osascript -e "quit app \"$app\"" 2>/dev/null || true
+    local i
+    for (( i = 0; i < 20; i++ )); do (( $(proc_holders_app "$app") == 0 )) && return 0; sleep 0.25; done
+    command -v pkill >/dev/null 2>&1 && pkill -f "$app/Contents/MacOS/" 2>/dev/null || true
+    for (( i = 0; i < 20; i++ )); do (( $(proc_holders_app "$app") == 0 )) && return 0; sleep 0.25; done
+    errf "Chrome processes still hold the framework; close it manually and retry."; return 1
+}
+
+# ============================================================================
+# Linux platform glue - channel discovery, version, process handling (/proc).
+# ============================================================================
 LINUX_CHANNELS=("Stable" "Beta" "Dev")
 LINUX_DIRS=("/opt/google/chrome" "/opt/google/chrome-beta" "/opt/google/chrome-unstable")
 
-# Get Chrome version without executing a root-owned browser binary.
 chrome_version() {
-    local bin="$1"
-    local pkg=""
+    local bin="$1" pkg=""
     case "$bin" in
         /opt/google/chrome/chrome) pkg="google-chrome-stable" ;;
         /opt/google/chrome-beta/chrome) pkg="google-chrome-beta" ;;
@@ -1163,43 +1273,32 @@ chrome_version() {
     fi
 }
 
-# Count processes holding the binary open
 proc_holders() {
-    local bin="$1"
-    local want
+    local bin="$1" want
     want=$(readlink -f "$bin" 2>/dev/null || echo "$bin")
-    local count=0
-    local pid_dir
+    local count=0 pid_dir target
     for pid_dir in /proc/[0-9]*/exe; do
-        local target
         target=$(readlink "$pid_dir" 2>/dev/null || true)
         if [[ -z "$target" ]]; then continue; fi
-        # A replaced binary shows up as "<path> (deleted)"
         if [[ "$target" == "$want" || "$target" == "$bin" || "$target" == "${want} (deleted)" || "$target" == "${bin} (deleted)" ]]; then
-            (( count++ )) || true
+            count=$(( count + 1 ))
         fi
     done
     echo "$count"
 }
 
-# Kill processes holding the binary
 kill_chrome_processes() {
-    local bin="$1"
-    local want
+    local bin="$1" want
     want=$(readlink -f "$bin" 2>/dev/null || echo "$bin")
-    local pid_dir
+    local pid_dir target pid
     for pid_dir in /proc/[0-9]*/exe; do
-        local target pid
         target=$(readlink "$pid_dir" 2>/dev/null || true)
         if [[ -z "$target" ]]; then continue; fi
         if [[ "$target" == "$want" || "$target" == "$bin" || "$target" == "${want} (deleted)" || "$target" == "${bin} (deleted)" ]]; then
-            pid="${pid_dir#/proc/}"
-            pid="${pid%%/*}"
+            pid="${pid_dir#/proc/}"; pid="${pid%%/*}"
             kill -TERM "$pid" 2>/dev/null || true
         fi
     done
-
-    # Wait up to 5 seconds for them to die
     local i
     for (( i = 0; i < 20; i++ )); do
         if (( $(proc_holders "$bin") == 0 )); then return 0; fi
@@ -1208,290 +1307,15 @@ kill_chrome_processes() {
     return 1
 }
 
-# Atomic write: preserve the target's metadata, verify bytes, re-check the target
-# hash to close the inspect/write race, then rename in the same directory.
-write_target() {
-    local target="$1" source="$2" expected_hash="${3:-}"
-    local dir
-    dir=$(dirname "$target")
-
-    local tmp
-    tmp=$(mktemp "${dir}/.chrome-mv2-XXXXXX")
-    WRITE_TMP="$tmp"
-    if [[ -e "$target" ]]; then
-        cp -a -- "$target" "$tmp"
-    else
-        cp -a -- "$source" "$tmp"
-    fi
-    cp -- "$source" "$tmp"
-
-    local source_hash tmp_hash current_hash
-    source_hash=$(sha256sum -- "$source" | awk '{print $1}')
-    tmp_hash=$(sha256sum -- "$tmp" | awk '{print $1}')
-    if [[ "$source_hash" != "$tmp_hash" ]]; then
-        rm -f -- "$tmp"
-        errf "Temporary-file verification failed for ${target}."
-        return 1
-    fi
-    if [[ -n "$expected_hash" ]]; then
-        current_hash=$(sha256sum -- "$target" | awk '{print $1}')
-        if [[ "$current_hash" != "$expected_hash" ]]; then
-            rm -f -- "$tmp"
-            errf "Target changed after inspection; refusing to overwrite it."
-            return 1
-        fi
-    fi
-    sync "$tmp"
-    mv -f -- "$tmp" "$target"
-    WRITE_TMP=""
-    sync "$dir" 2>/dev/null || sync
-}
-
-backup_meta_path() { printf '%s.meta\n' "$1"; }
-
-save_backup_snapshot() {
-    local target="$1" backup="$2" source="$3" build_id="$4"
-    local target_hash=""
-    [[ -f "$backup" ]] && target_hash=$(sha256sum -- "$backup" | awk '{print $1}')
-    write_target "$backup" "$source" "$target_hash" || return 1
-
-    local meta meta_tmp size hash
-    meta=$(backup_meta_path "$backup")
-    meta_tmp=$(mktemp "$(dirname "$meta")/.chrome-mv2-meta-XXXXXX")
-    META_TMP="$meta_tmp"
-    size=$(stat -c%s "$backup")
-    hash=$(sha256sum -- "$backup" | awk '{print $1}')
-    printf 'schema=1\ncontainer=elf\nbuild_id=%s\nsize=%s\nsha256=%s\n' "$build_id" "$size" "$hash" > "$meta_tmp"
-    write_target "$meta" "$meta_tmp" "" || { rm -f -- "$meta_tmp"; return 1; }
-    rm -f -- "$meta_tmp"
-    META_TMP=""
-}
-
-BACKUP_BUILD_ID="" BACKUP_SIZE=0 BACKUP_HASH="" BACKUP_LEGACY=false
-validate_backup_snapshot() {
-    local backup="$1" meta
-    [[ -f "$backup" ]] || return 1
-    parse_elf "$backup" >/dev/null || return 1
-    BACKUP_BUILD_ID=$(get_elf_build_id "$backup")
-    BACKUP_SIZE=$(stat -c%s "$backup")
-    BACKUP_HASH=$(sha256sum -- "$backup" | awk '{print $1}')
-    [[ -n "$BACKUP_BUILD_ID" ]] || return 1
-
-    meta=$(backup_meta_path "$backup")
-    BACKUP_LEGACY=false
-    if [[ ! -f "$meta" ]]; then BACKUP_LEGACY=true; return 0; fi
-
-    local schema="" container="" build_id="" size="" sha256="" key value extra
-    while IFS='=' read -r key value extra; do
-        [[ -z "$extra" ]] || return 1
-        case "$key" in
-            schema) schema="$value" ;;
-            container) container="$value" ;;
-            build_id) build_id="$value" ;;
-            size) size="$value" ;;
-            sha256) sha256="$value" ;;
-            *) return 1 ;;
-        esac
-    done < "$meta"
-    [[ "$schema" == 1 && "$container" == elf && "$build_id" == "$BACKUP_BUILD_ID" &&
-       "$size" == "$BACKUP_SIZE" && "$sha256" == "$BACKUP_HASH" ]]
-}
-
-# ============================================================================
-# Install discovery
-# ============================================================================
-
-INSTALLS_CHANNELS=()
-INSTALLS_PATHS=()
-INSTALLS_VERSIONS=()
-INSTALLS_RUNNING=()
-INSTALLS_HOLDERS=()
-INSTALLS_BACKUPS=()
-
-enumerate_installs() {
-    INSTALLS_CHANNELS=()
-    INSTALLS_PATHS=()
-    INSTALLS_VERSIONS=()
-    INSTALLS_RUNNING=()
-    INSTALLS_HOLDERS=()
-    INSTALLS_BACKUPS=()
-
-    local i
-    for (( i = 0; i < ${#LINUX_CHANNELS[@]}; i++ )); do
-        local bin="${LINUX_DIRS[$i]}/chrome"
-        if [[ ! -f "$bin" ]]; then continue; fi
-
-        local ver holders has_backup running
-        ver=$(chrome_version "$bin")
-        holders=$(proc_holders "$bin")
-        if (( holders > 0 )); then running=true; else running=false; fi
-        if [[ -f "${bin}.bak" ]]; then has_backup=true; else has_backup=false; fi
-
-        INSTALLS_CHANNELS+=("${LINUX_CHANNELS[$i]}")
-        INSTALLS_PATHS+=("$bin")
-        INSTALLS_VERSIONS+=("$ver")
-        INSTALLS_RUNNING+=("$running")
-        INSTALLS_HOLDERS+=("$holders")
-        INSTALLS_BACKUPS+=("$has_backup")
-    done
-}
-
-print_install_row() {
-    local idx="$1" i="$2"
-    echo -n "  ${C_BOLD}${idx})${C_RESET} ${C_CYN}${INSTALLS_CHANNELS[$i]}${C_RESET}"
-    if [[ -n "${INSTALLS_VERSIONS[$i]}" ]]; then
-        echo -n "  ${INSTALLS_VERSIONS[$i]}"
-    fi
-    if ${INSTALLS_RUNNING[$i]}; then
-        echo -n "  ${C_YEL}[RUNNING, ${INSTALLS_HOLDERS[$i]} process(es)]${C_RESET}"
-    else
-        echo -n "  ${C_GRN}[not running]${C_RESET}"
-    fi
-    if ${INSTALLS_BACKUPS[$i]}; then
-        echo -n " ${C_DIM}(backup present)${C_RESET}"
-    fi
-    echo ""
-    echo "      ${C_DIM}${INSTALLS_PATHS[$i]}${C_RESET}"
-}
-
-# ============================================================================
-# Interactive UI
-# ============================================================================
-
-read_custom_path() {
-    while true; do
-        echo -n "${C_BOLD}Enter the full path to chrome binary, blank to cancel: ${C_RESET}"
-        local line
-        read -r line || return 1
-        line="${line#"${line%%[![:space:]]*}"}"
-        line="${line%"${line##*[![:space:]]}"}"
-        if (( ${#line} >= 2 )); then
-            if [[ "${line:0:1}" == '"' && "${line: -1}" == '"' ]] ||
-               [[ "${line:0:1}" == "'" && "${line: -1}" == "'" ]]; then
-                line="${line:1:${#line}-2}"
-            fi
-        fi
-        
-        if [[ -z "$line" ]]; then
-            return 1
-        fi
-        
-        if [[ ! -f "$line" ]]; then
-            errf "No file at that path. Try again, or leave blank to cancel."
-            continue
-        fi
-        
-        # Set the custom path and return success
-        CHOSEN_CUSTOM_PATH="$line"
-        return 0
-    done
-}
-
-choose_install() {
-    local count=${#INSTALLS_CHANNELS[@]}
-    if (( count == 0 )); then
-        warnf "No installed Chrome channel was found."
-        echo ""
-        if read_custom_path; then
-            TARGET_FILE="$CHOSEN_CUSTOM_PATH"
-            return 0
-        fi
-        infof "No path entered - nothing was changed."
-        return 1
-    fi
-
-    if (( count == 1 )); then
-        okf "One Chrome channel found:"
-        print_install_row 1 0
-    else
-        echo ""
-        echo "${TAG_INFO} ${count} Chrome release channels found:"
-        local j
-        for (( j = 0; j < count; j++ )); do
-            print_install_row $(( j + 1 )) "$j"
-        done
-        echo ""
-        echo "${TAG_INFO} Only the channel you pick is modified; the others keep running."
-    fi
-
-    while true; do
-        if (( count == 1 )); then
-            echo -n "${C_BOLD}Patch this channel? [Enter=yes, r=restore, c=custom path, q=quit]: ${C_RESET}"
-        else
-            echo -n "${C_BOLD}Which channel do you want to patch? [1-${count}, r=restore, c=custom path, q=quit]: ${C_RESET}"
-        fi
-        local line
-        read -r line || return 1
-
-        if [[ "$line" == "q" || "$line" == "Q" ]]; then
-            return 1
-        fi
-        if [[ "$line" == "c" || "$line" == "C" ]]; then
-            if read_custom_path; then
-                TARGET_FILE="$CHOSEN_CUSTOM_PATH"
-                return 0
-            fi
-            continue
-        fi
-        if [[ "$line" == "r" || "$line" == "R" ]]; then
-            cmd="restore"
-            if (( count == 1 )); then
-                CHOSEN_INDEX=0
-                return 0
-            fi
-            # Show restore-specific prompt for multiple channels
-            echo ""
-            echo "${TAG_INFO} Restore mode selected. Choose which channel to restore from backup:"
-            while true; do
-                echo -n "${C_BOLD}Which channel do you want to restore? [1-${count}, c=custom path, q=cancel]: ${C_RESET}"
-                local restore_line
-                read -r restore_line || return 1
-                
-                if [[ "$restore_line" == "q" || "$restore_line" == "Q" ]]; then
-                    infof "Restore cancelled."
-                    return 1
-                fi
-                if [[ "$restore_line" == "c" || "$restore_line" == "C" ]]; then
-                    if read_custom_path; then
-                        TARGET_FILE="$CHOSEN_CUSTOM_PATH"
-                        return 0
-                    fi
-                    continue
-                fi
-                if [[ "$restore_line" =~ ^[0-9]+$ ]] && (( restore_line >= 1 && restore_line <= count )); then
-                    CHOSEN_INDEX=$(( restore_line - 1 ))
-                    return 0
-                fi
-                errf "Enter a number between 1 and ${count}, c for custom path, or q to cancel."
-            done
-        fi
-        if (( count == 1 )) && [[ -z "$line" ]]; then
-            CHOSEN_INDEX=0
-            return 0
-        fi
-        if [[ "$line" =~ ^[0-9]+$ ]] && (( line >= 1 && line <= count )); then
-            CHOSEN_INDEX=$(( line - 1 ))
-            return 0
-        fi
-        if (( count == 1 )); then
-            errf "Press Enter to accept, r to restore, c for custom path, or q to quit."
-        else
-            errf "Enter a number between 1 and ${count}, r to restore, c for custom path, or q to quit."
-        fi
-    done
-}
-
 confirm_force_close() {
     local channel="$1" holders="$2"
     echo ""
     echo "${C_BOLD}${C_YEL}  !! WARNING: Chrome ${channel} is running !!${C_RESET}"
     echo "     Close it now to patch cleanly. If you continue, its ${holders} process(es)"
     echo "     will be FORCE CLOSED and any unsaved tabs or downloads are lost."
-
     while true; do
         echo -n "${C_BOLD}Force close Chrome ${channel} and patch? [y/N]: ${C_RESET}"
-        local line
-        read -r line || return 1
+        local line; read -r line || return 1
         case "$line" in
             y|Y) return 0 ;;
             ""|n|N) infof "Cancelled - nothing was changed."; return 1 ;;
@@ -1503,7 +1327,6 @@ request_target_close() {
     local target="$1" assume_yes="$2" holders
     holders=$(proc_holders "$target")
     (( holders == 0 )) && return 0
-
     if $assume_yes; then
         warnf "Chrome is running and will be force closed (--yes)."
     elif $QUIET; then
@@ -1513,7 +1336,6 @@ request_target_close() {
     else
         confirm_force_close "$(basename "$(dirname "$target")")" "$holders" || return 1
     fi
-
     if ! kill_chrome_processes "$target"; then
         errf "Chrome processes still hold this binary after 5 seconds."
         echo "    Close this channel manually and re-run; nothing was written."
@@ -1521,36 +1343,157 @@ request_target_close() {
     fi
 }
 
-# ============================================================================
-# Orchestration — patch / restore flows
-# ============================================================================
-
-TARGET_FILE=""
+LNX_CHANNELS=(); LNX_PATHS=(); LNX_VERSIONS=(); LNX_RUNNING=(); LNX_HOLDERS=(); LNX_BACKUPS=()
 CHOSEN_INDEX=-1
 CHOSEN_CUSTOM_PATH=""
 
-do_patch() {
-    local target="$1" assume_yes="$2" allow_partial="$3"
-    local fsize
-    fsize=$(stat -c%s "$target" 2>/dev/null || stat -f%z "$target" 2>/dev/null)
-    if (( fsize == 0 )); then
-        errf "Error: the target file is empty."
+enumerate_linux_installs() {
+    LNX_CHANNELS=(); LNX_PATHS=(); LNX_VERSIONS=(); LNX_RUNNING=(); LNX_HOLDERS=(); LNX_BACKUPS=()
+    local i
+    for (( i = 0; i < ${#LINUX_CHANNELS[@]}; i++ )); do
+        local bin="${LINUX_DIRS[$i]}/chrome"
+        if [[ ! -f "$bin" ]]; then continue; fi
+        local ver holders has_backup running
+        ver=$(chrome_version "$bin"); holders=$(proc_holders "$bin")
+        if (( holders > 0 )); then running=true; else running=false; fi
+        if [[ -f "${bin}.bak" ]]; then has_backup=true; else has_backup=false; fi
+        LNX_CHANNELS+=("${LINUX_CHANNELS[$i]}"); LNX_PATHS+=("$bin"); LNX_VERSIONS+=("$ver")
+        LNX_RUNNING+=("$running"); LNX_HOLDERS+=("$holders"); LNX_BACKUPS+=("$has_backup")
+    done
+}
+
+print_linux_install_row() {
+    local idx="$1" i="$2"
+    echo -n "  ${C_BOLD}${idx})${C_RESET} ${C_CYN}${LNX_CHANNELS[$i]}${C_RESET}"
+    if [[ -n "${LNX_VERSIONS[$i]}" ]]; then echo -n "  ${LNX_VERSIONS[$i]}"; fi
+    if ${LNX_RUNNING[$i]}; then
+        echo -n "  ${C_YEL}[RUNNING, ${LNX_HOLDERS[$i]} process(es)]${C_RESET}"
+    else
+        echo -n "  ${C_GRN}[not running]${C_RESET}"
+    fi
+    if ${LNX_BACKUPS[$i]}; then echo -n " ${C_DIM}(backup present)${C_RESET}"; fi
+    echo ""
+    echo "      ${C_DIM}${LNX_PATHS[$i]}${C_RESET}"
+}
+
+read_custom_path() {
+    while true; do
+        echo -n "${C_BOLD}Enter the full path to chrome binary, blank to cancel: ${C_RESET}"
+        local line; read -r line || return 1
+        line="${line#"${line%%[![:space:]]*}"}"
+        line="${line%"${line##*[![:space:]]}"}"
+        if (( ${#line} >= 2 )); then
+            if [[ "${line:0:1}" == '"' && "${line: -1}" == '"' ]] ||
+               [[ "${line:0:1}" == "'" && "${line: -1}" == "'" ]]; then
+                line="${line:1:${#line}-2}"
+            fi
+        fi
+        if [[ -z "$line" ]]; then return 1; fi
+        if [[ ! -f "$line" ]]; then
+            errf "Not a file: ${line}"; continue
+        fi
+        CHOSEN_CUSTOM_PATH="$line"; return 0
+    done
+}
+
+choose_linux_install() {
+    local count=${#LNX_CHANNELS[@]}
+    if (( count == 0 )); then
+        warnf "No installed Chrome channel was found."
+        echo ""
+        if read_custom_path; then TARGET_FILE="$CHOSEN_CUSTOM_PATH"; return 0; fi
+        infof "No path entered - nothing was changed."
         return 1
     fi
+    if (( count == 1 )); then
+        okf "One Chrome channel found:"; print_linux_install_row 1 0
+    else
+        echo ""; echo "${TAG_INFO} ${count} Chrome release channels found:"
+        local j
+        for (( j = 0; j < count; j++ )); do print_linux_install_row $(( j + 1 )) "$j"; done
+        echo ""; echo "${TAG_INFO} Only the channel you pick is modified; the others keep running."
+    fi
+    while true; do
+        if (( count == 1 )); then
+            echo -n "${C_BOLD}Patch this channel? [Enter=yes, r=restore, c=custom path, q=quit]: ${C_RESET}"
+        else
+            echo -n "${C_BOLD}Which channel do you want to patch? [1-${count}, r=restore, c=custom path, q=quit]: ${C_RESET}"
+        fi
+        local line; read -r line || return 1
+        if [[ "$line" == "q" || "$line" == "Q" ]]; then return 1; fi
+        if [[ "$line" == "c" || "$line" == "C" ]]; then
+            if read_custom_path; then TARGET_FILE="$CHOSEN_CUSTOM_PATH"; return 0; fi
+            continue
+        fi
+        if [[ "$line" == "r" || "$line" == "R" ]]; then
+            cmd="restore"
+            if (( count == 1 )); then CHOSEN_INDEX=0; return 0; fi
+            echo ""; echo "${TAG_INFO} Restore mode selected. Choose which channel to restore from backup:"
+            while true; do
+                echo -n "${C_BOLD}Which channel do you want to restore? [1-${count}, c=custom path, q=cancel]: ${C_RESET}"
+                local restore_line; read -r restore_line || return 1
+                if [[ "$restore_line" == "q" || "$restore_line" == "Q" ]]; then infof "Restore cancelled."; return 1; fi
+                if [[ "$restore_line" == "c" || "$restore_line" == "C" ]]; then
+                    if read_custom_path; then TARGET_FILE="$CHOSEN_CUSTOM_PATH"; return 0; fi
+                    continue
+                fi
+                if [[ "$restore_line" =~ ^[0-9]+$ ]] && (( restore_line >= 1 && restore_line <= count )); then
+                    CHOSEN_INDEX=$(( restore_line - 1 )); return 0
+                fi
+                errf "Enter a number between 1 and ${count}, c for custom path, or q to cancel."
+            done
+        fi
+        if (( count == 1 )) && [[ -z "$line" ]]; then CHOSEN_INDEX=0; return 0; fi
+        if [[ "$line" =~ ^[0-9]+$ ]] && (( line >= 1 && line <= count )); then CHOSEN_INDEX=$(( line - 1 )); return 0; fi
+        if (( count == 1 )); then
+            errf "Press Enter to accept, r to restore, c for custom path, or q to quit."
+        else
+            errf "Enter a number between 1 and ${count}, r to restore, c for custom path, or q to quit."
+        fi
+    done
+}
+
+choose_macos_install() {
+    local count=${#MAC_APPS[@]} i
+    if (( count == 0 )); then
+        warnf "No installed Google Chrome.app was found under /Applications or ~/Applications."
+        echo "    Pass a path explicitly: bash $0 patch \"/path/to/Google Chrome.app\""
+        return 1
+    fi
+    echo ""; echo "${TAG_INFO} ${count} Chrome install(s) found:"
+    for (( i = 0; i < count; i++ )); do
+        echo -n "  ${C_BOLD}$(( i + 1 ))${C_RESET}) ${C_CYN}${MAC_LABELS[$i]}${C_RESET}"
+        [[ -n "${MAC_VERSIONS[$i]}" ]] && echo -n "  ${MAC_VERSIONS[$i]}"
+        ${MAC_RUNNING[$i]} && echo -n "  ${C_YEL}[running]${C_RESET}" || echo -n "  ${C_GRN}[not running]${C_RESET}"
+        echo ""; echo "      ${C_DIM}${MAC_APPS[$i]}${C_RESET}"
+    done
+    while true; do
+        echo -n "${C_BOLD}Which install? [1-${count}, q=quit]: ${C_RESET}"
+        local line; read -r line || return 1
+        [[ "$line" == q || "$line" == Q ]] && return 1
+        if [[ "$line" =~ ^[0-9]+$ ]] && (( line >= 1 && line <= count )); then CHOSEN_INDEX=$(( line - 1 )); return 0; fi
+        errf "Enter a number between 1 and ${count}, or q."
+    done
+}
+
+# ============================================================================
+# Orchestration - ELF flow (Linux). Uses the shared slice engine on the single
+# elf slice; keeps the strict backup-must-be-complete-stock safety checks.
+# ============================================================================
+do_patch_elf() {
+    local target="$1" assume_yes="$2" allow_partial="$3"
+    local fsize; fsize=$(file_size "$target")
+    (( fsize > 0 )) || { errf "Error: the target file is empty."; return 1; }
     okf "Target: ${target} (${fsize} bytes)."
 
     parse_elf "$target" || return 1
     local target_id target_hash
     target_id=$(get_elf_build_id "$target")
-    target_hash=$(sha256sum -- "$target" | awk '{print $1}')
-    if [[ -z "$target_id" ]]; then
-        errf "Could not extract a valid GNU build-id from ${target}."
-        return 1
-    fi
+    target_hash=$(file_sha256 "$target")
+    [[ -n "$target_id" ]] || { errf "Could not extract a valid GNU build-id from ${target}."; return 1; }
 
-    infof "Starting MV2 patching (ManifestV2Handler architecture, ELF target)..."
     infof "Probing target for a known Chrome layout (${NUM_MILESTONES} milestone table(s))..."
-    probe_milestones "$target" || return 1
+    probe_slice 0 "$target"
     if (( BEST_SATISFIED == 0 )); then
         report_layout_candidates "$target"
         warnf "No known MV2 layout matched this binary; nothing was modified."
@@ -1560,150 +1503,101 @@ do_patch() {
         warnf "${BEST_TIES} milestones tied at ${BEST_SATISFIED} sites; the layout is ambiguous."
         return 1
     fi
-    classify_flip_states "$target" || { errf "Located jump bytes are in an invalid mixed/corrupt state."; return 1; }
+    classify_flip_states_slice "$target" || { errf "Located jump bytes are in an invalid mixed/corrupt state."; return 1; }
 
     local backup="${target}.bak"
-    local work_file
-    work_file=$(mktemp /tmp/chrome-mv2-work.XXXXXX)
-    WORK_FILE="$work_file"
+    local work_file; work_file=$(mktemp "${TMPDIR:-/tmp}/chrome-mv2-work.XXXXXX"); WORK_FILE="$work_file"
 
     if [[ ! -f "$backup" ]]; then
         if { ! $BEST_FULL && ! $allow_partial; } || (( STATE_PATCHED != 0 )); then
             errf "No clean backup exists and the target is not a complete stock layout."
             echo "    Restore/reinstall Chrome first; refusing to save modified bytes as the baseline."
-            rm -f -- "$work_file"
-            return 1
+            rm -f -- "$work_file"; WORK_FILE=""; return 1
         fi
         infof "Creating initial backup copy: ${backup} ..."
-        save_backup_snapshot "$target" "$backup" "$target" "$target_id" || { rm -f -- "$work_file"; return 1; }
-        validate_backup_snapshot "$backup" || { errf "Initial backup verification failed."; rm -f -- "$work_file"; return 1; }
+        save_backup_snapshot "$target" "$backup" "$target" "$target_id" || { rm -f -- "$work_file"; WORK_FILE=""; return 1; }
+        validate_backup_snapshot "$backup" || { errf "Initial backup verification failed."; rm -f -- "$work_file"; WORK_FILE=""; return 1; }
         okf "Initial backup created and verified."
     else
-        if ! validate_backup_snapshot "$backup"; then
-            errf "Backup or its metadata failed validation; refusing to overwrite it."
-            rm -f -- "$work_file"
-            return 1
-        fi
-
-        # A usable baseline must itself be a complete stock layout.
-        parse_elf "$backup" || { rm -f -- "$work_file"; return 1; }
-        probe_milestones "$backup" || { rm -f -- "$work_file"; return 1; }
-        classify_flip_states "$backup" || { errf "Backup jump state is invalid."; rm -f -- "$work_file"; return 1; }
+        validate_backup_snapshot "$backup" || { errf "Backup or its metadata failed validation; refusing to overwrite it."; rm -f -- "$work_file"; WORK_FILE=""; return 1; }
+        parse_elf "$backup" || { rm -f -- "$work_file"; WORK_FILE=""; return 1; }
+        probe_slice 0 "$backup"
+        classify_flip_states_slice "$backup" || { errf "Backup jump state is invalid."; rm -f -- "$work_file"; WORK_FILE=""; return 1; }
         if { ! $BEST_FULL && ! $allow_partial; } || (( BEST_TIES != 1 || STATE_PATCHED != 0 )); then
-            errf "Backup is not a complete clean stock layout."
-            rm -f -- "$work_file"
-            return 1
+            errf "Backup is not a complete clean stock layout."; rm -f -- "$work_file"; WORK_FILE=""; return 1
         fi
-
         if [[ "$target_id" != "$BACKUP_BUILD_ID" ]]; then
-            # Refresh only from a fully recognized stock target. Otherwise keep
-            # the old known-good backup untouched and decline the new build.
-            parse_elf "$target" || { rm -f -- "$work_file"; return 1; }
-            probe_milestones "$target" || { rm -f -- "$work_file"; return 1; }
-            classify_flip_states "$target" || { rm -f -- "$work_file"; return 1; }
+            parse_elf "$target" || { rm -f -- "$work_file"; WORK_FILE=""; return 1; }
+            probe_slice 0 "$target"
+            classify_flip_states_slice "$target" || { rm -f -- "$work_file"; WORK_FILE=""; return 1; }
             if ! $BEST_FULL || (( BEST_TIES != 1 || STATE_PATCHED != 0 )); then
                 errf "Chrome changed builds, but the new target is not a complete recognized stock layout."
                 echo "    The existing backup was preserved. Add signatures for this build first."
-                rm -f -- "$work_file"
-                return 1
+                rm -f -- "$work_file"; WORK_FILE=""; return 1
             fi
             infof "Chrome update detected (build-id changed) - refreshing backup ${backup} ..."
-            okf "  Old build-id: ${BACKUP_BUILD_ID:0:16}..."
-            okf "  New build-id: ${target_id:0:16}..."
-            save_backup_snapshot "$target" "$backup" "$target" "$target_id" || { rm -f -- "$work_file"; return 1; }
-            validate_backup_snapshot "$backup" || { errf "Updated backup verification failed."; rm -f -- "$work_file"; return 1; }
+            save_backup_snapshot "$target" "$backup" "$target" "$target_id" || { rm -f -- "$work_file"; WORK_FILE=""; return 1; }
+            validate_backup_snapshot "$backup" || { errf "Updated backup verification failed."; rm -f -- "$work_file"; WORK_FILE=""; return 1; }
             okf "Backup updated and verified."
         elif $BACKUP_LEGACY; then
-            save_backup_snapshot "$target" "$backup" "$backup" "$BACKUP_BUILD_ID" || { rm -f -- "$work_file"; return 1; }
+            save_backup_snapshot "$target" "$backup" "$backup" "$BACKUP_BUILD_ID" || { rm -f -- "$work_file"; WORK_FILE=""; return 1; }
             okf "Legacy backup validated and metadata added."
         fi
     fi
-
     cp -- "$backup" "$work_file"
-    parse_elf "$work_file" || { rm -f -- "$work_file"; return 1; }
-
-    infof "Probing for a known Chrome layout (${NUM_MILESTONES} milestone table(s))..."
-
-    if ! probe_milestones "$work_file"; then
-        rm -f "$work_file"
-        return 1
-    fi
-
+    parse_elf "$work_file" || { rm -f -- "$work_file"; WORK_FILE=""; return 1; }
+    probe_slice 0 "$work_file"
     if (( BEST_SATISFIED == 0 )); then
         report_layout_candidates "$work_file"
         warnf "No known MV2 layout matched this binary."
-        echo "    Chrome likely shifted its layout (new milestone or different codegen)."
-        echo "    Nothing was modified. See 'Porting to a new Chrome version' in the"
-        echo "    mv2-reversing.md notes."
-        rm -f "$work_file"
-        return 1
+        rm -f -- "$work_file"; WORK_FILE=""; return 1
     fi
     if ! $BEST_FULL && (( BEST_TIES > 1 )); then
         warnf "${BEST_TIES} milestones tied at ${BEST_SATISFIED} sites; declining ambiguous layout."
-        rm -f -- "$work_file"
-        return 1
+        rm -f -- "$work_file"; WORK_FILE=""; return 1
     fi
     if ! $BEST_FULL && ! $allow_partial; then
         warnf "Only ${BEST_SATISFIED}/${BEST_TOTAL} sites matched; partial writes require --allow-partial."
-        rm -f -- "$work_file"
-        return 1
+        rm -f -- "$work_file"; WORK_FILE=""; return 1
     fi
 
-    apply_flips "$work_file"
+    infof "Chrome ${BEST_MS_NAME} MV2 layout (${BEST_SATISFIED}/${BEST_TOTAL} sites, ${#FLIP_OFFSETS[@]} flip(s))."
+    apply_flips_slice "$work_file"
 
-    local msg
-    if (( PATCH_STATUS == 1 )); then
-        msg="applied."
-    else
-        msg="all sites already patched (no change needed)."
-    fi
-    infof "Chrome ${BEST_MS_NAME} ${msg}"
+    # Verify the prepared image is fully flipped and unambiguous.
+    parse_elf "$work_file" || { rm -f -- "$work_file"; WORK_FILE=""; return 1; }
+    probe_slice 0 "$work_file"
+    (( BEST_SATISFIED > 0 && BEST_TIES == 1 )) || { errf "Prepared output failed post-patch verification."; rm -f -- "$work_file"; WORK_FILE=""; return 1; }
+    classify_flip_states_slice "$work_file" || { errf "Prepared output has invalid gate bytes."; rm -f -- "$work_file"; WORK_FILE=""; return 1; }
+    (( STATE_STOCK == 0 && STATE_PATCHED == ${#FLIP_OFFSETS[@]} )) || { errf "Prepared output is not fully flipped."; rm -f -- "$work_file"; WORK_FILE=""; return 1; }
 
-    okf "ELF: no post-flip fixups needed."
-    if ! verify_patched_output "$work_file"; then
-        errf "Prepared output failed post-patch verification."
-        rm -f -- "$work_file"
-        return 1
-    fi
-
-    local prepared_hash
-    prepared_hash=$(sha256sum -- "$work_file" | awk '{print $1}')
+    local prepared_hash; prepared_hash=$(file_sha256 "$work_file")
     if [[ "$prepared_hash" == "$target_hash" ]]; then
-        rm -f -- "$work_file"
+        rm -f -- "$work_file"; WORK_FILE=""
         successf "Target is already fully patched; no write was needed."
         return 0
     fi
     if [[ "$target_hash" != "$BACKUP_HASH" ]]; then
         errf "Target contains changes unrelated to this patch; refusing to overwrite them."
         echo "    Restore/reinstall Chrome or inspect the binary manually before retrying."
-        rm -f -- "$work_file"
-        WORK_FILE=""
-        return 1
+        rm -f -- "$work_file"; WORK_FILE=""; return 1
     fi
 
-    request_target_close "$target" "$assume_yes" || { rm -f -- "$work_file"; return 1; }
+    request_target_close "$target" "$assume_yes" || { rm -f -- "$work_file"; WORK_FILE=""; return 1; }
     if (( $(proc_holders "$target") > 0 )); then
         errf "Chrome restarted after it was closed; nothing was written."
-        rm -f -- "$work_file"
-        WORK_FILE=""
-        return 1
+        rm -f -- "$work_file"; WORK_FILE=""; return 1
     fi
-    write_target "$target" "$work_file" "$target_hash" || { rm -f -- "$work_file"; return 1; }
-    rm -f -- "$work_file"
-    WORK_FILE=""
-    if [[ "$(sha256sum -- "$target" | awk '{print $1}')" != "$prepared_hash" ]]; then
-        errf "Post-write SHA-256 verification failed."
-        return 1
-    fi
+    write_target "$target" "$work_file" "$target_hash" || { rm -f -- "$work_file"; WORK_FILE=""; return 1; }
+    rm -f -- "$work_file"; WORK_FILE=""
+    if [[ "$(file_sha256 "$target")" != "$prepared_hash" ]]; then errf "Post-write SHA-256 verification failed."; return 1; fi
 
-    # Report outcome
     rule
     if $BEST_FULL; then
         successf "Binary successfully patched!"
         echo "          Manifest V2 extension support re-enabled (Chrome ${BEST_MS_NAME} layout)."
     else
         echo "${TAG_WARNING} Binary was PARTIALLY patched (Chrome ${BEST_MS_NAME} layout, ${BEST_SATISFIED}/${BEST_TOTAL} gates)."
-        echo "          The flips found were written, but"
         echo "          $((BEST_TOTAL - BEST_SATISFIED)) gate(s) were not located, so MV2 may STILL be blocked."
         echo "          Please report the exact version. Revert with: sudo bash $0 restore"
     fi
@@ -1711,80 +1605,54 @@ do_patch() {
     return 0
 }
 
-do_restore() {
+do_restore_elf() {
     local target="$1" assume_yes="$2" force_restore="$3"
     local backup="${target}.bak"
-
     infof "Restore mode requested..."
-    if [[ ! -f "$backup" ]]; then
-        errf "Error: backup file ${backup} does not exist."
-        return 1
-    fi
-
-    if ! validate_backup_snapshot "$backup"; then
-        errf "Backup or its metadata failed validation."
-        return 1
-    fi
+    [[ -f "$backup" ]] || { errf "Error: backup file ${backup} does not exist."; return 1; }
+    validate_backup_snapshot "$backup" || { errf "Backup or its metadata failed validation."; return 1; }
     parse_elf "$backup" || return 1
-    probe_milestones "$backup" || return 1
-    classify_flip_states "$backup" || return 1
+    probe_slice 0 "$backup"
+    classify_flip_states_slice "$backup" || return 1
     if (( BEST_SATISFIED == 0 || BEST_TIES != 1 || STATE_PATCHED != 0 )); then
-        errf "Backup is not a complete clean stock layout."
-        return 1
+        errf "Backup is not a complete clean stock layout."; return 1
     fi
-
     parse_elf "$target" || return 1
     local target_id target_hash
     target_id=$(get_elf_build_id "$target")
-    target_hash=$(sha256sum -- "$target" | awk '{print $1}')
+    target_hash=$(file_sha256 "$target")
     if [[ "$target_id" != "$BACKUP_BUILD_ID" ]] && ! $force_restore; then
         errf "Backup belongs to a different Chrome build; refusing to downgrade the installed binary."
         echo "    Use --force-restore only when restoring that older build is intentional."
         return 1
     fi
-    if [[ "$target_id" != "$BACKUP_BUILD_ID" ]]; then
-        warnf "Forcing restore from a different Chrome build (--force-restore)."
-    fi
-    if [[ "$target_hash" == "$BACKUP_HASH" ]]; then
-        successf "Target already matches the verified backup; no write was needed."
-        return 0
-    fi
+    if [[ "$target_id" != "$BACKUP_BUILD_ID" ]]; then warnf "Forcing restore from a different Chrome build (--force-restore)."; fi
+    if [[ "$target_hash" == "$BACKUP_HASH" ]]; then successf "Target already matches the verified backup; no write was needed."; return 0; fi
     request_target_close "$target" "$assume_yes" || return 1
-    if (( $(proc_holders "$target") > 0 )); then
-        errf "Chrome restarted after it was closed; nothing was written."
-        return 1
-    fi
+    if (( $(proc_holders "$target") > 0 )); then errf "Chrome restarted after it was closed; nothing was written."; return 1; fi
     write_target "$target" "$backup" "$target_hash" || return 1
-    if [[ "$(sha256sum -- "$target" | awk '{print $1}')" != "$BACKUP_HASH" ]]; then
-        errf "Post-restore SHA-256 verification failed."
-        return 1
-    fi
+    if [[ "$(file_sha256 "$target")" != "$BACKUP_HASH" ]]; then errf "Post-restore SHA-256 verification failed."; return 1; fi
     successf "Original binary successfully restored from backup!"
     return 0
 }
 
-do_check() {
-    local target="$1"
+do_check_elf() {
+    local target="$1" build_id size hash
     parse_elf "$target" || return 1
-    local build_id size hash
-    build_id=$(get_elf_build_id "$target")
-    size=$(stat -c%s "$target")
-    hash=$(sha256sum -- "$target" | awk '{print $1}')
+    build_id=$(get_elf_build_id "$target"); size=$(file_size "$target"); hash=$(file_sha256 "$target")
     okf "ELF identity: build-id=${build_id}, size=${size}, SHA-256=${hash}"
-
-    probe_milestones "$target" || return 1
+    probe_slice 0 "$target"
     if (( BEST_SATISFIED == 0 )); then
         warnf "No known MV2 layout matched."
     elif ! $BEST_FULL && (( BEST_TIES > 1 )); then
         warnf "${BEST_TIES} milestones tied at ${BEST_SATISFIED} sites; layout is ambiguous."
     else
-        classify_flip_states "$target" || { warnf "Located gates contain invalid bytes."; return 1; }
+        classify_flip_states_slice "$target" || { warnf "Located gates contain invalid bytes."; return 1; }
         local state="patched"
         (( STATE_STOCK > 0 && STATE_PATCHED == 0 )) && state="stock"
         (( STATE_STOCK > 0 && STATE_PATCHED > 0 )) && state="mixed"
         okf "Layout: Chrome ${BEST_MS_NAME}, ${BEST_SATISFIED}/${BEST_TOTAL} sites, state=${state}."
     fi
-
     local backup="${target}.bak"
     if [[ -f "$backup" ]]; then
         if validate_backup_snapshot "$backup"; then
@@ -1797,219 +1665,353 @@ do_check() {
     else
         infof "Backup: absent."
     fi
-
     $BEST_FULL && (( BEST_TIES == 1 ))
 }
 
+# ============================================================================
+# Orchestration - Mach-O flow (macOS). Per-slice probe/flip on the host slice,
+# UUID-keyed backup outside the bundle, ad-hoc inside-out re-sign.
+# ============================================================================
+do_check_macho() {
+    local target="$1"
+    parse_macho "$target" || return 1
+    compute_identity "$target"; TARGET_TOKEN=$(identity_token)
+    okf "Mach-O identity (per-slice UUID): ${IDENTITY_UUIDS}"
+    okf "Size=$(file_size "$target"), SHA-256=$(file_sha256 "$target")"
+    local idx
+    for (( idx = 0; idx < NUM_SLICES; idx++ )); do
+        local c="${SLICE_CONTAINER[$idx]}"
+        probe_slice "$idx" "$target"
+        if (( BEST_SATISFIED == 0 )); then
+            warnf "  ${c}: no known MV2 layout matched."
+        elif ! $BEST_FULL && (( BEST_TIES > 1 )); then
+            warnf "  ${c}: ${BEST_TIES} milestones tied at ${BEST_SATISFIED}; ambiguous."
+        else
+            if classify_flip_states_slice "$target"; then
+                local state="stock"
+                if (( STATE_PATCHED > 0 && STATE_STOCK == 0 )); then state="patched"
+                elif (( STATE_PATCHED > 0 && STATE_STOCK > 0 )); then state="mixed"; fi
+                okf "  ${c}: Chrome ${BEST_MS_NAME}, ${BEST_SATISFIED}/${BEST_TOTAL} sites, state=${state}."
+            else
+                warnf "  ${c}: located gates contain invalid bytes."
+            fi
+        fi
+    done
+    local backup; backup=$(backup_path)
+    if [[ -f "$backup" ]]; then
+        if validate_backup_snapshot "$backup"; then okf "Backup: verified (metadata=$(! $BACKUP_LEGACY && echo true || echo false))."
+        else warnf "Backup: invalid."; fi
+        infof "Backup path: ${backup}"
+    else infof "Backup: absent (would be ${backup})."; fi
+    return 0
+}
+
+do_restore_macho() {
+    local target="$1" app_path="$2" assume_yes="$3" force_restore="$4"
+    infof "Restore mode requested..."
+    parse_macho "$target" >/dev/null || return 1
+    compute_identity "$target"; local target_id="$IDENTITY_UUIDS"
+    TARGET_TOKEN=$(identity_token)                 # backup dir is keyed by this
+    local backup; backup=$(backup_path)
+    [[ -f "$backup" ]] || { errf "Backup ${backup} does not exist."; return 1; }
+    validate_backup_snapshot "$backup" || { errf "Backup or metadata failed validation."; return 1; }
+
+    local target_hash; target_hash=$(file_sha256 "$target")
+    if [[ "$target_id" != "$BACKUP_IDENTITY" ]] && ! $force_restore; then
+        errf "Backup belongs to a different Chrome build; refusing to downgrade."
+        echo "    Use --force-restore only if restoring that older build is intentional."; return 1
+    fi
+    if [[ "$target_hash" == "$BACKUP_HASH" ]]; then successf "Target already matches the backup; nothing to do."; return 0; fi
+
+    if [[ -n "$app_path" ]]; then quit_chrome "$app_path" "$assume_yes" || return 1; fi
+    write_target "$target" "$backup" "$target_hash" || return 1
+    if [[ "$(file_sha256 "$target")" != "$BACKUP_HASH" ]]; then errf "Post-restore SHA-256 mismatch."; return 1; fi
+    if [[ -n "$app_path" ]] && have_codesign; then
+        resign_inside_out "$FRAMEWORK_BUNDLE" "$app_path" || warnf "Re-seal after restore failed; re-run: bash $0 restore \"$app_path\""
+    fi
+    successf "Original framework restored from backup."
+    return 0
+}
+
+do_patch_macho() {
+    local target="$1" app_path="$2" assume_yes="$3" allow_partial="$4"
+    local size; size=$(file_size "$target")
+    (( size > 0 )) || { errf "Target file is empty."; return 1; }
+    okf "Target: ${target} (${size} bytes)."
+    parse_macho "$target" || return 1
+    compute_identity "$target"; local target_id="$IDENTITY_UUIDS"
+    TARGET_TOKEN=$(identity_token)                 # backup dir is keyed by this
+    local target_hash; target_hash=$(file_sha256 "$target")
+
+    # Decide which slices we will patch (probe each against the live target).
+    local idx to_patch=() ic=() any=false default_declined=false
+    for (( idx = 0; idx < NUM_SLICES; idx++ )); do
+        local c="${SLICE_CONTAINER[$idx]}"
+        probe_slice "$idx" "$target"
+        if slice_decision "$c" "$allow_partial"; then
+            to_patch+=("$idx"); ic+=("$c"); any=true
+            infof "  ${c}: will patch (Chrome ${BEST_MS_NAME}, ${BEST_SATISFIED}/${BEST_TOTAL} sites)."
+        else
+            warnf "  ${c}: skipped (${SKIP_REASON})."
+            [[ "$c" == "macho-x64" ]] && default_declined=true
+        fi
+    done
+    if ! $any; then errf "No slice matched a known, permitted MV2 layout; nothing was modified."; return 1; fi
+
+    local backup; backup=$(backup_path)
+    if [[ ! -f "$backup" ]]; then
+        infof "Creating initial backup: ${backup}"
+        save_backup_snapshot "$target" "$backup" "$target" "$target_id" || return 1
+        validate_backup_snapshot "$backup" || { errf "Initial backup verification failed."; return 1; }
+    else
+        validate_backup_snapshot "$backup" || { errf "Backup/metadata failed validation; refusing to overwrite it."; return 1; }
+        if [[ "$target_id" != "$BACKUP_IDENTITY" ]]; then
+            infof "Chrome update detected (UUID changed) - refreshing backup."
+            save_backup_snapshot "$target" "$backup" "$target" "$target_id" || return 1
+            validate_backup_snapshot "$backup" || { errf "Updated backup verification failed."; return 1; }
+        elif $BACKUP_LEGACY; then
+            save_backup_snapshot "$target" "$backup" "$backup" "$BACKUP_IDENTITY" || return 1
+        fi
+    fi
+
+    # Build the patched image from the clean backup, per slice.
+    local work; work=$(mktemp "${TMPDIR:-/tmp}/chrome-mv2-work.XXXXXX"); WORK_FILE="$work"
+    cp -- "$backup" "$work"
+    parse_macho "$work" >/dev/null || { rm -f -- "$work"; WORK_FILE=""; return 1; }
+    local k
+    for k in "${to_patch[@]}"; do
+        probe_slice "$k" "$work"
+        apply_flips_slice "$work"
+    done
+    # Verify the prepared slices are fully flipped.
+    parse_macho "$work" >/dev/null || { rm -f -- "$work"; WORK_FILE=""; return 1; }
+    for k in "${to_patch[@]}"; do
+        probe_slice "$k" "$work"
+        classify_flip_states_slice "$work" || { errf "Prepared output has invalid gate bytes."; rm -f -- "$work"; WORK_FILE=""; return 1; }
+        if (( STATE_STOCK != 0 )); then errf "Prepared ${SLICE_CONTAINER[$k]} slice is not fully flipped."; rm -f -- "$work"; WORK_FILE=""; return 1; fi
+    done
+
+    local prepared_hash; prepared_hash=$(file_sha256 "$work")
+    if [[ "$prepared_hash" == "$target_hash" ]]; then rm -f -- "$work"; WORK_FILE=""; successf "Target already fully patched for the selected slices."; return 0; fi
+    if [[ "$target_hash" != "$BACKUP_HASH" ]]; then
+        errf "Target has changes unrelated to this patch; refusing to overwrite them."
+        echo "    Reinstall Chrome or inspect the framework before retrying."; rm -f -- "$work"; WORK_FILE=""; return 1
+    fi
+
+    if [[ -n "$app_path" ]]; then quit_chrome "$app_path" "$assume_yes" || { rm -f -- "$work"; WORK_FILE=""; return 1; }; fi
+    write_target "$target" "$work" "$target_hash" || { rm -f -- "$work"; WORK_FILE=""; return 1; }
+    rm -f -- "$work"; WORK_FILE=""
+
+    # Re-sign the now-modified bundle inside-out, then verify. On any failure,
+    # roll the framework back to the pristine backup so the app still launches.
+    if [[ -n "$app_path" ]]; then
+        if have_codesign; then
+            if ! resign_inside_out "$FRAMEWORK_BUNDLE" "$app_path" || ! verify_signature "$app_path"; then
+                errf "Re-sign/verify failed; rolling framework back to stock."
+                write_target "$target" "$backup" "" || true
+                have_codesign && resign_inside_out "$FRAMEWORK_BUNDLE" "$app_path" >/dev/null 2>&1 || true
+                return 1
+            fi
+            okf "Ad-hoc signature verified (codesign --verify --deep --strict)."
+        else
+            errf "codesign not found at /usr/bin/codesign (unexpected - it ships with macOS)."
+            echo "    The framework is patched but UNSIGNED and will not launch on Apple Silicon."
+            echo "    Restore stock with:  bash $0 restore \"$app_path\""
+            return 1
+        fi
+    fi
+
+    rule
+    successf "Manifest V2 re-enabled for: ${ic[*]}"
+    [[ -n "$app_path" ]] && echo "          Relaunch Chrome. Revert with: bash $0 restore \"$app_path\""
+    rule
+    return 0
+}
+
+# ============================================================================
+# Target resolution + entry point
+# ============================================================================
+# Resolve a user-supplied path into TARGET_CONTAINER / TARGET_FILE / APP_PATH /
+# FRAMEWORK_BUNDLE. A .app/.framework or a Mach-O file is the macOS flow; an ELF
+# file is the Linux flow. The container is decided by magic, not the host OS, so
+# a scratch copy of either binary can be patched anywhere bash runs.
+resolve_any_target() {
+    local path="$1"
+    APP_PATH=""; FRAMEWORK_BUNDLE=""; TARGET_FILE=""; TARGET_CONTAINER=""
+    if [[ -d "$path" ]]; then
+        case "$path" in
+            *.app|*.framework) TARGET_CONTAINER="macho"; resolve_macho_target "$path" || return 1 ;;
+            *) errf "Directory is not a .app or .framework: ${path}"; return 1 ;;
+        esac
+    elif [[ -f "$path" ]]; then
+        local kind; kind=$(detect_container_kind "$path")
+        case "$kind" in
+            elf)   TARGET_CONTAINER="elf"; TARGET_FILE="$path" ;;
+            macho) TARGET_CONTAINER="macho"; resolve_macho_target "$path" || return 1 ;;
+            *)     errf "Unrecognized binary (neither ELF nor Mach-O): ${path}"; return 1 ;;
+        esac
+    else
+        errf "Path is not a file or directory: ${path}"; return 1
+    fi
+    return 0
+}
+
 print_usage() {
-    cat <<'EOF'
+    cat <<EOF
 Usage: bash chrome-mv2.sh [command] [path] [options]
 
 Re-enables Manifest V2 extension support in Google Chrome by flipping the
-inlined IsExtensionAffected manifest-version checks (Linux ELF only).
+inlined IsExtensionAffected manifest-version checks. One script for both Unix
+targets: it patches an ELF chrome (Linux) or the universal Mach-O framework
+inside Google Chrome.app (macOS), detecting the container from the file magic.
+On macOS only the slice matching this Mac's CPU is patched, then the app is
+ad-hoc re-signed so it launches.
 
 Commands:
   patch                  Flip the MV2 gates (default if omitted).
-  restore                Restore the target binary from its verified .bak.
+  restore                Restore the target from its verified .bak.
   check                  Read-only layout/patch/backup diagnostics.
 
 Arguments:
-  path                   Full path to target chrome binary. If omitted, installed
-                         channels are listed to pick from. Can also specify a custom
-                         path to patch a non-standard Chrome installation.
+  path                   Linux: full path to the chrome binary. macOS: a Google
+                         Chrome.app, a *.framework, or the framework Mach-O file.
+                         If omitted, installed Chrome is discovered by host OS.
 
 Options:
-  -y, --yes              Force close a running Chrome without asking.
+  -y, --yes              Quit/force-close a running Chrome without asking.
   -q, --quiet            Do not pause for interactive prompts (for scripting).
       --allow-partial    Developer override: write an incomplete milestone.
       --force-restore    Restore a backup from a different Chrome build.
-      --signatures PATH  Use this external signature document explicitly.
+      --signatures PATH  Use this external signature JSON (needs python3).
   -v, --version          Print the tool version and exit.
   -h, --help             Show this help and exit.
 
-Examples:
-  sudo bash chrome-mv2.sh
-  sudo bash chrome-mv2.sh patch /opt/google/chrome/chrome --yes
-  sudo bash chrome-mv2.sh restore
-  bash chrome-mv2.sh check /custom/path/to/chrome
-  sudo bash chrome-mv2.sh patch /custom/path/to/chrome
-
 Environment:
-  MV2_TEST_NO_ELEVATION  If set, skip the write-permission check (tests only).
-  NO_COLOR               Disable ANSI colour output.
-  FORCE_COLOR            Force ANSI colour output.
+  MV2_TEST_NO_ELEVATION  Skip the write-permission check (tests only).
+  MV2_TEST_HOST_ARCH     Force the detected Mac host CPU (arm64/x86_64; tests).
+  NO_COLOR / FORCE_COLOR Disable / force ANSI colour.
 EOF
 }
 
-# ============================================================================
-# Cleanup
-# ============================================================================
-
 cleanup() {
-    local tmp
-    for tmp in "${SCAN_PATTERNS_FILE:-}" "${SIGNATURE_PARSE_FILE:-}" "${WORK_FILE:-}" "${WRITE_TMP:-}" "${META_TMP:-}"; do
-        if [[ -n "$tmp" && -f "$tmp" ]]; then rm -f -- "$tmp"; fi
+    local rc=$?      # preserve the real exit status; the trap must not mask it
+    local t
+    for t in "${WORK_FILE:-}" "${WRITE_TMP:-}" "${META_TMP:-}"; do
+        [[ -n "$t" && -f "$t" ]] && rm -f -- "$t"
     done
+    return "$rc"
 }
 trap cleanup EXIT
 
-# ============================================================================
-# Entry point
-# ============================================================================
-
 main() {
     init_colors
-
-    # Parse arguments - match PS1 parameter order: [command] [path] [options]
-    local cmd="patch"
-    local target_path=""
-    local assume_yes=false
-    local allow_partial=false
-    local force_restore=false
+    local cmd="patch" target_path="" assume_yes=false allow_partial=false force_restore=false
     QUIET=false
-    
-    local positional_args=()
-
+    local positional=()
     while (( $# > 0 )); do
         case "$1" in
-            --yes|-y)
-                assume_yes=true ;;
-            --quiet|-q)
-                QUIET=true ;;
-            --allow-partial)
-                allow_partial=true ;;
-            --force-restore)
-                force_restore=true ;;
-            --signatures)
-                if (( $# < 2 )); then errf "--signatures requires a path."; exit 2; fi
-                SIGNATURES_OVERRIDE="$2"
-                shift ;;
-            --)
-                shift
-                while (( $# > 0 )); do positional_args+=("$1"); shift; done
-                break ;;
-            --version|-v)
-                echo "chrome-mv2-patch ${APP_VERSION}"
-                exit 0 ;;
-            --help|-h)
-                print_usage
-                exit 0 ;;
-            -*)
-                errf "Unknown option: $1"
-                print_usage
-                exit 2 ;;
-            *)
-                positional_args+=("$1") ;;
+            --yes|-y) assume_yes=true ;;
+            --quiet|-q) QUIET=true ;;
+            --allow-partial) allow_partial=true ;;
+            --force-restore) force_restore=true ;;
+            --signatures) (( $# >= 2 )) || { errf "--signatures needs a path."; exit 2; }; SIGNATURES_OVERRIDE="$2"; shift ;;
+            --) shift; while (( $# > 0 )); do positional+=("$1"); shift; done; break ;;
+            --version|-v) echo "chrome-mv2-patch ${APP_VERSION}"; exit 0 ;;
+            --help|-h) print_usage; exit 0 ;;
+            -*) errf "Unknown option: $1"; print_usage; exit 2 ;;
+            *) positional+=("$1") ;;
         esac
         shift
     done
-    
-    # Process positional arguments (match PS1: Position 0 = command, Position 1 = path)
-    if (( ${#positional_args[@]} >= 1 )); then
-        case "${positional_args[0]}" in
-            patch|restore|check)
-                cmd="${positional_args[0]}"
-                if (( ${#positional_args[@]} >= 2 )); then
-                    target_path="${positional_args[1]}"
-                fi
-                ;;
-            *)
-                # Not a command, treat as path (for backward compat: "script.sh /path/to/chrome")
-                target_path="${positional_args[0]}"
-                if (( ${#positional_args[@]} > 1 )); then
-                    errf "Too many positional arguments."
-                    print_usage
-                    exit 2
-                fi
-                ;;
+    if (( ${#positional[@]} >= 1 )); then
+        case "${positional[0]}" in
+            patch|restore|check) cmd="${positional[0]}"; (( ${#positional[@]} >= 2 )) && target_path="${positional[1]}" ;;
+            *) target_path="${positional[0]}" ;;
         esac
     fi
+    (( ${#positional[@]} <= 2 )) || { errf "Too many positional arguments."; print_usage; exit 2; }
 
-    if (( ${#positional_args[@]} > 2 )); then
-        errf "Too many positional arguments."
-        print_usage
-        exit 2
-    fi
-
-    # Help/version exited above. Operational commands now load and validate
-    # signatures; malformed data can no longer break the informational flags.
     load_milestones || exit 1
-
     banner
 
-    # Check for required tools (all coreutils/POSIX - present on any Linux)
     local tool
-    for tool in python3 dd od grep head mktemp stat sha256sum awk cp mv sync readlink id; do
-        if ! command -v "$tool" &>/dev/null; then
-            errf "Required tool '${tool}' not found."
-            exit 1
-        fi
+    for tool in od dd grep head mktemp cp mv awk; do
+        command -v "$tool" >/dev/null 2>&1 || { errf "Required tool '${tool}' not found."; exit 1; }
     done
-    init_scan_backend || exit 1
+    command -v shasum >/dev/null 2>&1 || command -v sha256sum >/dev/null 2>&1 || { errf "Need shasum or sha256sum."; exit 1; }
 
-    # Resolve target
+    # Resolve the target. A given path is dispatched by magic; otherwise install
+    # discovery is chosen by the host OS.
     if [[ -n "$target_path" ]]; then
-        if [[ ! -f "$target_path" ]]; then
-            errf "Error: the given path does not exist: ${target_path}"
-            exit 1
+        [[ -e "$target_path" ]] || { errf "Path does not exist: ${target_path}"; exit 1; }
+        resolve_any_target "$target_path" || exit 1
+    elif [[ "$(uname -s 2>/dev/null || echo)" == "Darwin" ]]; then
+        infof "Scanning for installed Google Chrome..."
+        enumerate_macos_installs
+        if $QUIET; then
+            (( ${#MAC_APPS[@]} == 1 )) || { errf "Need exactly one install for --quiet; pass a path."; exit 1; }
+            CHOSEN_INDEX=0
+        else
+            choose_macos_install || exit 0
         fi
-        TARGET_FILE="$target_path"
+        APP_PATH="${MAC_APPS[$CHOSEN_INDEX]}"; TARGET_CONTAINER="macho"
+        resolve_framework_from_app "$APP_PATH" || { errf "No Chrome framework inside ${APP_PATH}"; exit 1; }
     else
         infof "Scanning for installed Chrome release channels..."
-        enumerate_installs
-
+        enumerate_linux_installs
         if $QUIET; then
-            if (( ${#INSTALLS_CHANNELS[@]} == 0 )); then
+            if (( ${#LNX_CHANNELS[@]} == 0 )); then
                 errf "Error: no installed Chrome channel was found."
-                echo "    Pass the path explicitly, e.g. sudo bash $0 patch /path/to/chrome"
-                exit 1
+                echo "    Pass the path explicitly, e.g. sudo bash $0 patch /path/to/chrome"; exit 1
             fi
-            if (( ${#INSTALLS_CHANNELS[@]} > 1 )); then
-                errf "${#INSTALLS_CHANNELS[@]} channels are installed and --quiet cannot prompt."
-                local j
-                for (( j = 0; j < ${#INSTALLS_CHANNELS[@]}; j++ )); do
-                    print_install_row $(( j + 1 )) "$j"
-                done
-                echo "    Re-run with the path of the channel you want."
-                exit 1
+            if (( ${#LNX_CHANNELS[@]} > 1 )); then
+                errf "${#LNX_CHANNELS[@]} channels are installed and --quiet cannot prompt."
+                local j; for (( j = 0; j < ${#LNX_CHANNELS[@]}; j++ )); do print_linux_install_row $(( j + 1 )) "$j"; done
+                echo "    Re-run with the path of the channel you want."; exit 1
             fi
             CHOSEN_INDEX=0
         else
-            choose_install || exit 0
+            choose_linux_install || exit 0
         fi
-
-        if [[ -z "$TARGET_FILE" ]]; then
-            TARGET_FILE="${INSTALLS_PATHS[$CHOSEN_INDEX]}"
+        if [[ -z "$TARGET_FILE" ]]; then TARGET_FILE="${LNX_PATHS[$CHOSEN_INDEX]}"; fi
+        TARGET_CONTAINER="elf"
+    fi
+    if [[ "$TARGET_CONTAINER" == "macho" ]]; then
+        detect_host_container
+        infof "Host CPU: $(host_arch_label); default target slice: ${HOST_CONTAINER#macho-}."
+        okf "Framework binary: ${TARGET_FILE}"
+        if [[ -n "$APP_PATH" ]]; then
+            okf "App bundle: ${APP_PATH}"
+        elif [[ "$cmd" != "check" ]]; then
+            warnf "No .app resolved: bundle re-signing will be skipped (offline/scratch mode)."
         fi
+    else
+        okf "Target channel: ${C_CYN}$(basename "$(dirname "$TARGET_FILE")")${C_RESET}"
+        okf "Target file: ${TARGET_FILE}"
     fi
 
-    okf "Target channel: ${C_CYN}$(basename "$(dirname "$TARGET_FILE")")${C_RESET}"
-    okf "Target file: ${TARGET_FILE}"
-
-    # Check is always read-only. Patch/restore require write access to the
-    # containing directory for atomic replacement and backup creation, but a
-    # user-owned offline copy should not require root.
+    # Check is read-only. Patch/restore need write access to the target and its
+    # directory for the atomic replace/backup, but a user-owned offline copy
+    # should not require root.
     if [[ "$cmd" != "check" && -z "${MV2_TEST_NO_ELEVATION:-}" ]]; then
-        local target_dir
-        target_dir=$(dirname "$TARGET_FILE")
-        if [[ ! -w "$TARGET_FILE" || ! -w "$target_dir" ]]; then
-            errf "Write access is required for ${TARGET_FILE} and ${target_dir}."
-            echo "    Re-run with sudo for a system installation, or use a writable offline copy."
+        local dir; dir=$(dirname "$TARGET_FILE")
+        if [[ ! -w "$TARGET_FILE" || ! -w "$dir" ]]; then
+            errf "Write access is required for ${TARGET_FILE} and its directory."
+            echo "    Re-run with sudo for a system install, or use a writable offline copy."
             exit 1
         fi
     fi
 
-    # Dispatch
     case "$cmd" in
         restore)
-            do_restore "$TARGET_FILE" "$assume_yes" "$force_restore"
-            ;;
+            if [[ "$TARGET_CONTAINER" == "elf" ]]; then do_restore_elf "$TARGET_FILE" "$assume_yes" "$force_restore"
+            else do_restore_macho "$TARGET_FILE" "$APP_PATH" "$assume_yes" "$force_restore"; fi ;;
         patch)
-            do_patch "$TARGET_FILE" "$assume_yes" "$allow_partial"
-            ;;
+            if [[ "$TARGET_CONTAINER" == "elf" ]]; then do_patch_elf "$TARGET_FILE" "$assume_yes" "$allow_partial"
+            else do_patch_macho "$TARGET_FILE" "$APP_PATH" "$assume_yes" "$allow_partial"; fi ;;
         check)
-            do_check "$TARGET_FILE"
-            ;;
+            if [[ "$TARGET_CONTAINER" == "elf" ]]; then do_check_elf "$TARGET_FILE"
+            else do_check_macho "$TARGET_FILE"; fi ;;
     esac
 }
 

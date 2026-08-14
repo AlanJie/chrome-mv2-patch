@@ -31,7 +31,6 @@ jobs:
         shell: bash
         run: |
           bash -n chrome-mv2.sh
-          bash -n chrome-mv2-mac.sh
       - name: Full local suite (ELF + Mach-O + arm64 safety; PE where pwsh exists)
         run: python scripts/run_tests.py
       - name: derive_milestone self-checks (synthetic Mach-O)
@@ -94,7 +93,7 @@ jobs:
 
       - name: check (read-only) recognizes the layout
         run: |
-          bash chrome-mv2-mac.sh check "$APP"
+          bash chrome-mv2.sh check "$APP"
 
       # Baseline BEFORE patching: at 151/152 the MV2 disable is a compiled-in
       # feature default (--enable-features no longer toggles it), so a stock CfT
@@ -107,7 +106,7 @@ jobs:
 
       - name: patch + verify signature
         run: |
-          bash chrome-mv2-mac.sh patch "$APP" --yes --quiet
+          bash chrome-mv2.sh patch "$APP" --yes --quiet
           FW=$(find "$APP/Contents/Frameworks" -maxdepth 4 -name "*Framework" -type f | head -1)
           echo "flipped framework: $FW"
           # The backup must live OUTSIDE the bundle - a stray .bak inside a signed
@@ -164,7 +163,7 @@ jobs:
         run: |
           FW=$(find "$APP/Contents/Frameworks" -maxdepth 4 -name "*Framework" -type f | head -1)
           # $BAK was captured in the patch step (Application Support/chrome-mv2-patch/<uuid>/).
-          bash chrome-mv2-mac.sh restore "$APP" --yes --quiet
+          bash chrome-mv2.sh restore "$APP" --yes --quiet
           # the .bak holds Google's original bytes; after restore the framework matches it
           diff <(shasum -a 256 "$BAK" | awk '{print $1}') <(shasum -a 256 "$FW" | awk '{print $1}')
           echo "restore reproduced stock framework bytes"
