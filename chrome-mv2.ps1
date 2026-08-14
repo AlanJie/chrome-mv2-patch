@@ -430,13 +430,13 @@ function Import-Milestones {
         }
         if ($milestoneNames.ContainsKey($msName)) { throw "duplicate milestone name '$msName'" }
         $milestoneNames[$msName] = $true
-        if ($container -notin 'pe', 'pe32', 'pe-arm64', 'elf', 'macho-x64', 'macho-arm64') {
+        if ($container -notin 'pe', 'pe32', 'pe-arm64', 'elf', 'elf-arm64', 'macho-x64', 'macho-arm64') {
             throw "milestone $msName has unsupported container '$container'"
         }
         # This script patches only Windows PE (x64 'pe', x86 'pe32', arm64
-        # 'pe-arm64'). A shared signatures.json may also carry the Linux (elf) and
-        # macOS (macho-x64/macho-arm64) tables, so skip any non-PE milestone rather
-        # than validate a kind this engine does not implement.
+        # 'pe-arm64'). A shared signatures.json may also carry the Linux (elf,
+        # elf-arm64) and macOS (macho-x64/macho-arm64) tables, so skip any non-PE
+        # milestone rather than validate a kind this engine does not implement.
         if ($container -notin 'pe', 'pe32', 'pe-arm64') { continue }
         if ($null -eq $rm.sites -or @($rm.sites).Count -eq 0) {
             throw "milestone $msName contains no sites"
@@ -1517,16 +1517,24 @@ function Select-Install {
         Write-Host "`n$script:TagInfo Only the channel you pick is modified; the others keep running."
     }
 
+    # 'check' is read-only and must never turn into a write, so it neither offers
+    # nor honors the restore switch; only 'patch' may divert to restore. The verb
+    # keeps the prompt honest for whichever command is actually running.
+    $verb = switch ($script:Command) { 'check' { 'Check' } 'restore' { 'Restore' } default { 'Patch' } }
+    $verbLower = $verb.ToLower()
+    $allowRestore = ($script:Command -eq 'patch')
+
     while ($true) {
+        $restoreOpt = if ($allowRestore) { 'r=restore, ' } else { '' }
         $prompt = if ($Installs.Count -eq 1) {
-            'Patch this channel? [Enter=yes, r=restore, c=custom path, q=quit]'
+            "$verb this channel? [Enter=yes, ${restoreOpt}c=custom path, q=quit]"
         } else {
-            "Which channel do you want to patch? [1-$($Installs.Count), r=restore, c=custom path, q=quit]"
+            "Which channel do you want to ${verbLower}? [1-$($Installs.Count), ${restoreOpt}c=custom path, q=quit]"
         }
         $line = (Read-Host "`n$prompt").Trim()
 
         if ($line -in 'q', 'Q') { return $null }
-        if ($line -in 'r', 'R') { 
+        if ($allowRestore -and $line -in 'r', 'R') {
             $script:Command = 'restore'
             if ($Installs.Count -eq 1) { return $Installs[0] }
             # Show restore-specific prompt for multiple channels
@@ -1554,10 +1562,11 @@ function Select-Install {
         if ([int]::TryParse($line, [ref]$n) -and $n -ge 1 -and $n -le $Installs.Count) {
             return $Installs[$n - 1]
         }
+        $restoreHint = if ($allowRestore) { 'r to restore, ' } else { '' }
         if ($Installs.Count -eq 1) {
-            Write-Err 'Press Enter to accept, r to restore, c for a custom path, or q to quit.'
+            Write-Err "Press Enter to accept, ${restoreHint}c for a custom path, or q to quit."
         } else {
-            Write-Err "Enter a number between 1 and $($Installs.Count), r to restore, c for a custom path, or q to quit."
+            Write-Err "Enter a number between 1 and $($Installs.Count), ${restoreHint}c for a custom path, or q to quit."
         }
     }
 }
@@ -1836,6 +1845,11 @@ function Invoke-Check {
         } catch { Write-Warn "Backup: invalid ($_)." }
     } else { Write-Info 'Backup: absent.' }
 
+    # Exit-code contract (kept in step with chrome-mv2.sh): 0 = a complete,
+    # internally consistent layout was recognized, whether stock or patched;
+    # non-zero = no complete layout matched, or it was mixed/partial. This is
+    # deliberately NOT a patched-vs-stock detector - read the printed
+    # state=stock|patched|mixed line for that distinction.
     return $(if ($probe.Full) { 0 } else { 1 })
 }
 
@@ -1880,9 +1894,7 @@ function Invoke-Main {
         if (-not $alreadyTried) {
             $childCode = Invoke-SelfElevate -ResolvedTargetPath ([IO.Path]::GetFullPath($target.Path))
             if ($null -ne $childCode) {
-                # The elevated child owns the console output and its own exit
-                # pause; pausing again here would ask twice.
-                $script:SuppressPause = $true
+                # The elevated child owns the console output.
                 return $childCode
             }
             return 1
@@ -1895,17 +1907,7 @@ function Invoke-Main {
     return (Invoke-Patch -Target $target -AssumeYes $Yes.IsPresent)
 }
 
-# Set when an elevated child ran: it printed its own output and did its own exit
-# pause, so pausing here as well would ask twice.
-$script:SuppressPause = $false
-
 if ($env:MV2_TEST_LIBRARY_ONLY) { return }
 
-# Double-clicking a .ps1 or running it from a shortcut closes the window on exit,
-# so hold it open unless -Quiet asked for a scripting-friendly run.
 $exitCode = Invoke-Main
-if (-not $Quiet -and -not $script:SuppressPause) {
-    Write-Host ''
-    Read-Host 'Press Enter to exit' | Out-Null
-}
 exit $exitCode

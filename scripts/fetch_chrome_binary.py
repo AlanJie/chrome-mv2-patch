@@ -83,7 +83,7 @@ PLATFORMS = {
     # Pin an older build with --url (a per-build dl.google.com/release2 installer),
     # or hand-copy an arm64 chrome.dll.
     "win-arm64": {"api": "win_arm64", "container": "pe-arm64", "binary": "chrome.dll", "pe_magic": 0x20B, "machine": 0xAA64, "tag": "win-arm64", "suffix": ".dll"},
-    "linux":     {"api": "linux", "container": "elf",  "binary": "chrome",     "pe_magic": None,  "tag": "linux64", "suffix": "",     "cft": "linux64"},
+    "linux":     {"api": "linux", "container": "elf",  "binary": "chrome",     "pe_magic": None,  "machine": 0x3E, "tag": "linux64", "suffix": "",     "cft": "linux64"},
     # Linux on ARM: native aarch64 `chrome` ELF (EM_AARCH64 0xB7), same bcond flip
     # as Windows/macOS arm64. Google began shipping official arm64 Linux .debs in
     # mid-2026; they share the `linux` VersionHistory feed (one version for both
@@ -236,7 +236,10 @@ def _progress(done, total):
 
 
 def download(url, dest):
-    """Stream a URL to dest, resuming through a .part file. Returns dest or None."""
+    """Stream a URL to dest via a .part temp file, size-checked against
+    Content-Length then atomically renamed into place. No resume: each call
+    refetches from the start. Returns dest, or None on network error / truncated
+    transfer."""
     os.makedirs(os.path.dirname(dest), exist_ok=True)
     part = dest + ".part"
     try:
@@ -461,8 +464,8 @@ def locate_binary(root, spec):
             if filename.lower() != spec["binary"]:
                 continue
             if container.startswith("elf"):
-                # ELF64 `chrome`; when the spec pins a machine (elf-arm64 -> 0xB7)
-                # require it so an arm64 fetch skips a stray x86_64 binary.
+                # ELF64 `chrome` of the spec's pinned machine (elf -> 0x3E x86_64,
+                # elf-arm64 -> 0xB7) so a fetch never grabs the wrong-arch binary.
                 if _is_elf64(path) and (not spec.get("machine") or _elf_machine(path) == spec["machine"]):
                     matches.append(path)
             elif _pe_optional_magic(path) == spec["pe_magic"]:

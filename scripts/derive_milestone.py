@@ -587,17 +587,22 @@ def name_for(ranges, jg_rva):
 # Modes
 # ---------------------------------------------------------------------------
 def milestone_name_for(base, img):
-    """Mach-O slices get an arch-tagged milestone name (e.g. 151 -> 151-macos-arm64)
-    so the two slices of a universal binary land in distinct, non-cross-probing
-    tables; a Windows arm64 PE gets 151 -> 151-win-arm64 and an arm64 ELF gets
-    151 -> 151-linux-arm64 for the same reason; PE x64/x86 and x86_64 ELF keep the
-    base name."""
+    """Give every non-x64-PE container an arch/OS-tagged milestone name so each
+    lands in a distinct, non-cross-probing table and never collides with the bare
+    x64-PE name: Mach-O slices 151 -> 151-macos-arm64, Windows arm64 151 ->
+    151-win-arm64, arm64 ELF 151 -> 151-linux-arm64, x86_64 ELF 151 -> 151-linux,
+    32-bit PE 151 -> 151-x86. Only the x64 PE (container 'pe') keeps the base name.
+    This mirrors the naming convention already shipped in signatures.json."""
     if img.container.startswith("macho-"):
         return f"{base}-macos-{img.container.split('-', 1)[1]}"
     if img.container == "pe-arm64":
         return f"{base}-win-arm64"
     if img.container == "elf-arm64":
         return f"{base}-linux-arm64"
+    if img.container == "elf":
+        return f"{base}-linux"
+    if img.container == "pe32":
+        return f"{base}-x86"
     return base
 
 

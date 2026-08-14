@@ -10,7 +10,7 @@ keyword filter in derive_milestone.load_symbols needs.
 
 Usage:
     python scripts/symbols_from_elf.py <elf-with-symbols> [out.txt]
-    python scripts/derive_milestone.py <chrome> --symbols out.txt --name <ver>-linux --json
+    python scripts/derive_milestone.py <chrome> --symbols out.txt --name <ver> --json
 """
 
 import struct

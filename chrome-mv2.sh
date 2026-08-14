@@ -258,12 +258,13 @@ for m in ms:
         kind = s.get("kind")
         if kind not in ("short", "near", "bcond"):
             raise ValueError("bad kind in %s/%s" % (name, snm))
-        # x86_64 ELF gates are cmp/jg (short/near); the arm64 ELF gate is the
-        # cmp w,#2 ; b.gt bcond flip. Reject a mismatched kind for the container.
-        if kind == "bcond" and container == "elf":
-            raise ValueError("elf milestone %s has an arm64 bcond site %s" % (name, snm))
-        if kind != "bcond" and container == "elf-arm64":
-            raise ValueError("elf-arm64 milestone %s has a non-bcond site %s" % (name, snm))
+        # x86_64 gates (elf, macho-x64) are cmp/jg (short/near); the arm64 gates
+        # (elf-arm64, macho-arm64) are the cmp w,#2 ; b.gt bcond flip. Reject a
+        # kind that does not match the container architecture.
+        if kind == "bcond" and container in ("elf", "macho-x64"):
+            raise ValueError("x86_64 milestone %s has an arm64 bcond site %s" % (name, snm))
+        if kind != "bcond" and container in ("elf-arm64", "macho-arm64"):
+            raise ValueError("arm64 milestone %s has a non-bcond site %s" % (name, snm))
         rva = s.get("jgRVA")
         if not isinstance(rva, str) or not re.fullmatch(r"0[xX][0-9A-Fa-f]+", rva):
             raise ValueError("bad jgRVA in %s/%s" % (name, snm))
@@ -722,7 +723,12 @@ find_site_matches() {
     build_binary_anchor "$sig_hex" "$kind" "$jg_off"
     local anchor_hex="$BINARY_ANCHOR_HEX"
     if [[ -z "$anchor_hex" ]]; then
-        errf "Signature has no safe raw scan anchor: ${name}"; return 1
+        # No >=4-byte fixed run to grep for (signature too fragmented for a raw
+        # scan). Report it and leave FOUND_OFFSETS empty so this site is counted
+        # unsatisfied and the milestone is declined - fail closed. Returning
+        # non-zero here would abort the whole run under `set -e`, because the
+        # caller (probe_slice_pass) invokes us as a bare, untested statement.
+        warnf "Signature has no safe raw scan anchor: ${name}"; return 0
     fi
     local anchor_bin="" ai abyte
     for (( ai = 0; ai < ${#anchor_hex}; ai += 2 )); do
@@ -1831,13 +1837,24 @@ do_patch_macho() {
     rm -f -- "$work"; WORK_FILE=""
 
     # Re-sign the now-modified bundle inside-out, then verify. On any failure,
-    # roll the framework back to the pristine backup so the app still launches.
+    # roll the framework binary back to the pristine backup and re-sign as best we
+    # can, then report the true state (see below) rather than assume a clean stock.
     if [[ -n "$app_path" ]]; then
         if have_codesign; then
             if ! resign_inside_out "$FRAMEWORK_BUNDLE" "$app_path" || ! verify_signature "$app_path"; then
-                errf "Re-sign/verify failed; rolling framework back to stock."
+                errf "Re-sign/verify failed; rolling the framework binary back to stock."
                 write_target "$target" "$backup" "" || true
-                have_codesign && resign_inside_out "$FRAMEWORK_BUNDLE" "$app_path" >/dev/null 2>&1 || true
+                # resign_inside_out signs inside-out, so it may have already re-signed
+                # sibling bundle components before failing. A framework-only rollback
+                # cannot undo those, so the bundle can be left in a mixed signing
+                # state. Re-sign+verify the reverted bundle and report honestly.
+                if resign_inside_out "$FRAMEWORK_BUNDLE" "$app_path" >/dev/null 2>&1 \
+                   && verify_signature "$app_path" >/dev/null 2>&1; then
+                    infof "Framework reverted to stock and re-signed; the app should launch."
+                else
+                    warnf "The bundle may be in an inconsistent signing state and may not launch."
+                    echo "    Run a full restore for a clean stock bundle:  bash $0 restore \"$app_path\""
+                fi
                 return 1
             fi
             okf "Ad-hoc signature verified (codesign --verify --deep --strict)."

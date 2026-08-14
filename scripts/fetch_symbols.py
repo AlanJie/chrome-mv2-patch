@@ -41,7 +41,7 @@ import tarfile
 import urllib.error
 import urllib.request
 import zlib
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 
 REPO = Path(__file__).resolve().parent.parent
 DEFAULT_OUT = REPO / "_scratch"
@@ -333,7 +333,10 @@ def _parse_rsds(data, off):
     end = data.find(b"\x00", off + 24)
     if end < 0:
         end = len(data)
-    name = Path(data[off + 24:end].decode("utf-8", errors="ignore")).name
+    # The RSDS record stores a Windows path (e.g. C:\...\chrome.dll.pdb). Strip it
+    # with PureWindowsPath so both `\` and `/` separators are handled even when
+    # this runs on a POSIX host - PurePosixPath.name would keep the whole string.
+    name = PureWindowsPath(data[off + 24:end].decode("utf-8", errors="ignore")).name
     if not name or name == ".":
         return None
     guid = f"{d1:08X}{d2:04X}{d3:04X}{d4.hex().upper()}"
