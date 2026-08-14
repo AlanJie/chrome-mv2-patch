@@ -1,5 +1,9 @@
 # Changelog
 
+## [1.4.0] - 2026-08-14
+
+- Linux ARM (arm64) support.
+
 ## [1.3.0] - 2026-08-13
 
 - macOS x64, ARM support.

@@ -6,9 +6,12 @@
 # extension support by flipping the inlined IsExtensionAffected manifest-version
 # checks, dispatching on the target binary's container:
 #
-#   - ELF (Linux): the `chrome` binary. x86 cmp/jg flip.
+#   - ELF (Linux): the `chrome` binary. x86_64 uses the x86 cmp/jg flip.
 #       JG_SHORT  0x7F disp8       -> 0xEB disp8        (jmp short, same disp8)
 #       JG_NEAR   0x0F 0x8F disp32 -> 0x90 0xE9 disp32  (nop ; jmp near, same disp32)
+#       arm64 (aarch64) has no cmp/jg - the gate is cmp w,#2 ; b.gt and the flip
+#       rewrites ONLY the B.cond condition GT(0xC) -> AL(0xE), same bcond flip as
+#       macOS/Windows arm64.
 #   - Mach-O (macOS): the universal (fat) "Google Chrome Framework" inside
 #       Google Chrome.app. Only the slice matching this Mac's CPU is patched.
 #       x86_64 uses the same short/near flip; arm64 (Apple Silicon) has no
@@ -42,7 +45,7 @@
 
 set -euo pipefail
 
-readonly APP_VERSION="1.3.0"
+readonly APP_VERSION="1.4.0"
 
 # ============================================================================
 # Embedded signature tables (pre-tokenized so the default path needs no python3
@@ -51,7 +54,7 @@ readonly APP_VERSION="1.3.0"
 # Records, one per line, pipe-delimited:
 #   M|<milestone name>|<container>
 #   S|<site name>|<kind>|<jgRVA>|<jgOff>|<expectedMatches>|<sig hex>
-# container: elf | macho-x64 | macho-arm64
+# container: elf | elf-arm64 | macho-x64 | macho-arm64
 # kind: short (7F->EB) | near (0F8F->90E9) | bcond (arm64 B.cond GT->AL)
 # jgRVA: hex RVA of the jg/b.cond opcode in the reference build (fast-path probe)
 # jgOff: byte index of the jump opcode within sig
@@ -73,6 +76,19 @@ S|ManifestV2Handler::IsExtensionAffected / ShouldBlockExtensionEnable (shared bo
 S|ManifestV2Handler::MaybeReEnableExtension (inlined)|short|0x0985B238|4|1|837B50027F30488B8B280200008B413080BB08020000007508
 S|StandardManagementPolicyProvider::UserMayInstall (inlined, near jg)|near|0x0A256BAA|4|1|837B50020F8FD1000000488B8B280200008B413080BB080200000075
 S|StandardManagementPolicyProvider::MustRemainDisabled (inlined, near jg)|near|0x0599A69A|4|1|837E50020F8F8E000000498B8E280200008B41304180BE0802000000
+E
+M|151-linux-arm64|elf-arm64
+S|ManifestV2Handler::ShouldBlockExtensionInstallation|bcond|0x05E6C0CC|4|1|3F0800716C0100545F040071A10000547F14007164184A7AE0079F1AC0035FD6
+S|StandardManagementPolicyProvider::UserMayInstall (inlined)|bcond|0x06086804|4|1|5F0900710C010054293140B91F050071611300543F150071600000543F290071
+S|StandardManagementPolicyProvider::UserMayInstall (inlined, 2nd call site)|bcond|0x06A71584|4|1|5F0900710C010054293140B91F050071A11300543F150071600000543F290071
+S|MV2DeprecationImpactChecker::IsExtensionAffected (shared predicate; OnExtensionSystemReady / MaybeReEnableExtension / ShouldBlockExtensionEnable call it out-of-line)|bcond|0x0A525764|4|1|1F0900710C020054291441F92A204839283140B98A000037296940B93F050071
+S|StandardManagementPolicyProvider::MustRemainDisabled (inlined)|bcond|0x0A69570C|4|1|5F090071EC030054293140B91F050071010300543F150071F4031F2A60000054
+E
+M|152-linux-arm64|elf-arm64
+S|ManifestV2Handler::MaybeReEnableExtension (shared body)|bcond|0x05D64DD8|4|2|1F0900712C020054691641F96A224839283140B98A000037296940B93F050071
+S|ManifestV2Handler::IsExtensionAffected / ShouldBlockExtensionEnable (shared body)|bcond|0x05D64F9C|4|1|1F0900710C020054091441F90A204839283140B98A000037296940B93F050071
+S|StandardManagementPolicyProvider::MustRemainDisabled / UserMayInstall (shared body)|bcond|0x05F78874|4|2|1F0900718C010054891641F98A224839283140B98A000037296940B93F050071
+S|ManifestV2Handler::OnExtensionSystemReady (shared body)|bcond|0x0696E3C8|4|2|3F090071EC4A0054091541F90A214839283140B98A000037296940B93F050071
 E
 M|151-macos-x64|macho-x64
 S|StandardManagementPolicyProvider::MustRemainDisabled|short|0x01B652F7|3|1|83FA027F5B8B493083F80175494531F683F905740583F90A75
@@ -208,8 +224,8 @@ get_signatures_path() {
 }
 
 # JSON -> pipe-tokenized records (M|.. / S|..). Keeps only the containers THIS
-# script patches (elf + macho-x64/arm64), skipping the shared table's pe/pe32/
-# pe-arm64 Windows milestones. Validates kinds and the stock opcode at jgOff.
+# script patches (elf + elf-arm64 + macho-x64/arm64), skipping the shared table's
+# pe/pe32/pe-arm64 Windows milestones. Validates kinds and the stock opcode at jgOff.
 # Requires python3.
 json_to_tokens() {
     python3 -c '
@@ -228,7 +244,7 @@ for m in ms:
     if name in seen: raise ValueError("duplicate milestone " + name)
     seen.add(name)
     container = m.get("container")
-    if container not in ("elf", "macho-x64", "macho-arm64"):
+    if container not in ("elf", "elf-arm64", "macho-x64", "macho-arm64"):
         continue  # this script patches ELF + Mach-O; skip pe/pe32/pe-arm64
     sites = m.get("sites")
     if not isinstance(sites, list) or not sites:
@@ -242,8 +258,12 @@ for m in ms:
         kind = s.get("kind")
         if kind not in ("short", "near", "bcond"):
             raise ValueError("bad kind in %s/%s" % (name, snm))
+        # x86_64 ELF gates are cmp/jg (short/near); the arm64 ELF gate is the
+        # cmp w,#2 ; b.gt bcond flip. Reject a mismatched kind for the container.
         if kind == "bcond" and container == "elf":
             raise ValueError("elf milestone %s has an arm64 bcond site %s" % (name, snm))
+        if kind != "bcond" and container == "elf-arm64":
+            raise ValueError("elf-arm64 milestone %s has a non-bcond site %s" % (name, snm))
         rva = s.get("jgRVA")
         if not isinstance(rva, str) or not re.fullmatch(r"0[xX][0-9A-Fa-f]+", rva):
             raise ValueError("bad jgRVA in %s/%s" % (name, snm))
@@ -474,8 +494,9 @@ parse_macho() {
 
 # ---- ELF64 -----------------------------------------------------------------
 # parse_elf locates .text and also synthesizes a single SLICE_* entry (container
-# "elf") so the shared slice engine can probe/flip it. get_elf_build_id reads
-# the GNU build-id (the ELF backup identity, stable across the flip).
+# "elf" for x86_64, "elf-arm64" for aarch64, chosen from e_machine) so the shared
+# slice engine can probe/flip it. get_elf_build_id reads the GNU build-id (the ELF
+# backup identity, stable across the flip).
 ELF_SHOFF=0 ELF_SHENTSIZE=0 ELF_SHNUM=0 ELF_SHSTRNDX=0 ELF_STROFF=0 ELF_STRSIZE=0
 TEXT_VADDR=0 TEXT_RAW=0 TEXT_SIZE=0
 
@@ -544,6 +565,12 @@ parse_elf() {
     ei_class=$(read_byte "$file" 4); ei_data=$(read_byte "$file" 5)
     if (( ei_class != 2 )); then errf "Not a 64-bit ELF (EI_CLASS=${ei_class})."; return 1; fi
     if (( ei_data != 1 )); then errf "Not a little-endian ELF (EI_DATA=${ei_data})."; return 1; fi
+    # e_machine (0x12, u16): 0x3E x86_64 (cmp/jg gates, container "elf") vs 0xB7
+    # aarch64 (cmp w,#2 ; b.gt gates, container "elf-arm64"). The tag routes the
+    # slice to the right milestone table; the flip engine dispatches on site kind.
+    local e_machine slice_container="elf"
+    e_machine=$(read_u16_le "$file" $((0x12)))
+    if (( e_machine == 0xB7 )); then slice_container="elf-arm64"; fi
     if ! validate_elf_section_table "$file" "$fsize"; then
         errf "ELF section table or section-name table is out of bounds."; return 1
     fi
@@ -568,11 +595,11 @@ parse_elf() {
     fi
 
     # Model the ELF as a single "slice" so the shared engine drives it.
-    SLICE_CONTAINER=("elf"); SLICE_BASE=(0); SLICE_SIZE=("$fsize")
+    SLICE_CONTAINER=("$slice_container"); SLICE_BASE=(0); SLICE_SIZE=("$fsize")
     SLICE_TVADDR=("$TEXT_VADDR"); SLICE_TRAW=("$TEXT_RAW"); SLICE_TSIZE=("$TEXT_SIZE")
     SLICE_UUID=(""); NUM_SLICES=1
 
-    okf "ELF64 parsed: .text vaddr=0x$(printf '%X' $TEXT_VADDR) offset=0x$(printf '%X' $TEXT_RAW) size=0x$(printf '%X' $TEXT_SIZE) ($(( TEXT_SIZE / 1024 / 1024 )) MiB)"
+    okf "ELF64 parsed (${slice_container}): .text vaddr=0x$(printf '%X' $TEXT_VADDR) offset=0x$(printf '%X' $TEXT_RAW) size=0x$(printf '%X' $TEXT_SIZE) ($(( TEXT_SIZE / 1024 / 1024 )) MiB)"
     return 0
 }
 
@@ -1130,15 +1157,16 @@ host_arch_label() {
     esac
 }
 
-# Should this slice be patched? Sets SKIP_REASON on decline. ELF is single-arch
-# and always eligible; a Mach-O slice is eligible only if it matches this Mac.
+# Should this slice be patched? Sets SKIP_REASON on decline. An ELF target is a
+# single-arch file (elf / elf-arm64) and always eligible; a Mach-O slice is
+# eligible only if it matches this Mac.
 SKIP_REASON=""
 slice_decision() {
     local container="$1" allow_partial="$2"
     SKIP_REASON=""
     if (( BEST_SATISFIED == 0 )); then SKIP_REASON="no known layout matched"; return 1; fi
     if ! $BEST_FULL && (( BEST_TIES > 1 )); then SKIP_REASON="ambiguous (${BEST_TIES} milestones tied)"; return 1; fi
-    if [[ "$container" != "elf" && "$HOST_CONTAINER" != "$container" ]]; then
+    if [[ "$container" != "elf" && "$container" != "elf-arm64" && "$HOST_CONTAINER" != "$container" ]]; then
         local label="${container#macho-}"; [[ "$label" == "x64" ]] && label="x86_64"
         SKIP_REASON="the ${label} slice does not run on this $(host_arch_label) Mac"; return 1
     fi

@@ -124,6 +124,21 @@ def main():
            "atomic writer should reject a changed target")
     A.eq(rt.read_text(), "old", "race rejection must preserve target bytes")
 
+    # ELF64 arm64 (aarch64): e_machine 0xB7 -> container elf-arm64, bcond flip.
+    # Gate = cmp w8,#2 ; b.gt ; nop ; cmp w?,#1 ; the flip rewrites b.gt(0x8C)->b.al(0x8E).
+    a64 = tmp / "arm64 fixture chrome"
+    a64sig = tmp / "arm64 signatures.json"
+    T.make_elf(a64, "1F0900718C0000541F2003D51F050071", machine=0xB7)
+    a64sig.write_text(json.dumps({"milestones": [{"name": "test-elf-arm64", "container": "elf-arm64", "sites": [
+        {"name": "gate", "kind": "bcond", "jgRVA": "0x00400044", "jgOff": 4,
+         "expectedMatches": 1, "sig": "1F0900718C0000541F2003D51F050071"}]}]}))
+    A.true(patch(a64, a64sig).returncode == 0, "arm64 ELF patch should succeed")
+    A.eq(T.byte_at(a64, 0x144), 0x8E, "arm64 patch should flip b.gt (0x8C) to b.al (0x8E)")
+    A.is_file(f"{a64}.bak", "arm64 patch should create backup")
+    restore(a64, a64sig)
+    A.eq(T.byte_at(a64, 0x144), 0x8C, "arm64 restore should recover stock b.gt")
+    A.true(patch(a64, sigs).returncode != 0, "elf (x86_64) table must not patch an elf-arm64 binary")
+
     print(f"Bash tests passed: {A.passed} assertions")
 
 

@@ -104,12 +104,13 @@ def sha256(path):
 # ---------------------------------------------------------------------------
 # Synthetic fixtures (byte-identical to the old shell harnesses' builders).
 # ---------------------------------------------------------------------------
-def make_elf(path, sig_hex, build_byte=0x11):
+def make_elf(path, sig_hex, build_byte=0x11, machine=62):
     """Minimal ELF64 with a .text carrying `sig_hex` at file offset 0x140 and a
-    GNU build-id note. Mirrors the former test-bash.sh make_elf."""
+    GNU build-id note. Mirrors the former test-bash.sh make_elf. `machine` is the
+    ELF e_machine (62 x86_64 default, 183/0xB7 for aarch64 -> container elf-arm64)."""
     buf = bytearray(0x700)
     ident = bytes(b"\x7fELF" + bytes([2, 1, 1, 0]) + bytes(8))
-    buf[:64] = struct.pack("<16sHHIQQQIHHHHHH", ident, 2, 62, 1, 0, 0, 0x500, 0, 64, 0, 0, 64, 4, 3)
+    buf[:64] = struct.pack("<16sHHIQQQIHHHHHH", ident, 2, machine, 1, 0, 0, 0x500, 0, 64, 0, 0, 64, 4, 3)
     sig = bytes.fromhex(sig_hex)
     buf[0x140:0x140 + len(sig)] = sig
     note = struct.pack("<III", 4, 20, 3) + b"GNU\0" + bytes([build_byte]) * 20

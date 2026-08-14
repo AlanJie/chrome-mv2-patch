@@ -78,5 +78,23 @@ g_x64 = dm.find_gates_for(Img("pe", stock))  # x64 jg finder must NOT match arm6
 print(f"[7] pe (x64) dispatch -> jg finder on arm64 bytes: {len(g_x64)} (expect 0)")
 ok &= len(g_x64) == 0
 
+# 8. Linux arm64 shares the same bcond finder: find_gates_for must dispatch
+#    'elf-arm64' to find_gates_arm64 too (while x86_64 'elf' uses the jg finder).
+g_lin = dm.find_gates_for(Img("elf-arm64", stock))
+print(f"[8] elf-arm64 dispatch -> arm64 finder: {len(g_lin)} gate(s) kind={g_lin[0][2] if g_lin else None} (expect 1 bcond)")
+ok &= len(g_lin) == 1 and g_lin[0][2] == "bcond"
+ok &= len(dm.find_gates_for(Img("elf", stock))) == 0  # x86_64 elf must not match arm64 bytes
+
+# 9. parse_elf tags the container from e_machine: 0xB7 aarch64 -> elf-arm64,
+#    0x3E x86_64 -> elf (so the two never cross-probe).
+import tempfile, _testutil as T
+_d = Path(tempfile.mkdtemp(prefix="mv2-derive-elf-"))
+T.make_elf(_d / "a64", "1F0900718C0000541F2003D51F050071", machine=0xB7)
+T.make_elf(_d / "x64", "837E50027F2F554889E5")
+c_arm = dm.parse_elf((_d / "a64").read_bytes()).container
+c_x64 = dm.parse_elf((_d / "x64").read_bytes()).container
+print(f"[9] parse_elf containers: aarch64->{c_arm} x86_64->{c_x64} (expect elf-arm64 / elf)")
+ok &= c_arm == "elf-arm64" and c_x64 == "elf"
+
 print("ALL bcond SAFETY CHECKS:", "PASS" if ok else "FAIL")
 sys.exit(0 if ok else 1)

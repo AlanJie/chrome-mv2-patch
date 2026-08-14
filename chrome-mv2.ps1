@@ -116,7 +116,7 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$AppVersion      = '1.3.0'
+$AppVersion      = '1.4.0'
 $SignaturesFile  = 'signatures.json'
 $script:CsLoaded = $false
 

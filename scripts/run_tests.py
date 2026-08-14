@@ -35,9 +35,11 @@ def main():
     step("macOS Mach-O (chrome-mv2.sh)", py + [str(HERE / "test_macos.py")])
     step("Windows PE (chrome-mv2.ps1)", py + [str(HERE / "test_windows.py")])
 
-    # Syntax check for the shell patcher (one cross-platform script).
-    if shutil.which("bash"):
-        step("bash -n chrome-mv2.sh", ["bash", "-n", T.posix(REPO / "chrome-mv2.sh")])
+    # Syntax check for the shell patcher (one cross-platform script). Use the
+    # resolved bash (T.BASH): a bare "bash" in subprocess can hit the WSL launcher
+    # on Windows, which cannot read the git-bash /c/... path form T.posix emits.
+    if T.BASH:
+        step("bash -n chrome-mv2.sh", [T.BASH, "-n", T.posix(REPO / "chrome-mv2.sh")])
     else:
         print("\n(bash not found; skipping shell syntax checks)")
 

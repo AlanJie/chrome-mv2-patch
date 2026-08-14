@@ -4,7 +4,8 @@ One tool, all containers and both x86 `jg` encodings:
   - PE `chrome.dll` on Windows: 64-bit PE32+ x64 (`pe`), 32-bit PE32 x86 (`pe32`),
     and 64-bit PE32+ arm64 (`pe-arm64`, the Windows-on-ARM native dll - same
     `bcond` flip as macOS arm64 below)
-  - ELF `chrome` on Linux (`elf`)
+  - ELF `chrome` on Linux: x86_64 (`elf`) and the arm64 build (`elf-arm64`, the
+    same `bcond` flip as macOS/Windows arm64 below)
   - the universal "Google Chrome Framework" Mach-O on macOS: the x86_64 slice
     (`macho-x64`, reusing the x86 short/near `jg` flip) and the arm64 slice
     (`macho-arm64`, a new `bcond` kind: `cmp w,#2 ; b.gt` with the condition
@@ -53,7 +54,7 @@ DEFAULT_JSON = REPO / "signatures.json"
 # ---------------------------------------------------------------------------
 class Image:
     def __init__(self, container, text_virt, text_raw, text_size, data):
-        self.container = container      # "pe" | "pe32" | "pe-arm64" | "elf" | "macho-x64" | "macho-arm64"
+        self.container = container      # "pe" | "pe32" | "pe-arm64" | "elf" | "elf-arm64" | "macho-x64" | "macho-arm64"
         self.text_virt = text_virt
         self.text_raw = text_raw
         self.text_size = text_size
@@ -110,6 +111,12 @@ def parse_pe(data):
 def parse_elf(data):
     if data[4] != 2 or data[5] != 1:
         raise ValueError("not little-endian ELF64")
+    # e_machine (0x12, u16): 0x3E x86_64 -> "elf", 0xB7 aarch64 -> "elf-arm64".
+    # arm64 has no cmp/jg; its gate is cmp w,#2 ; b.gt (the bcond flip), so it must
+    # be tagged distinctly to route through find_gates_arm64 and avoid cross-probing
+    # the x86_64 table.
+    e_machine = struct.unpack_from("<H", data, 0x12)[0]
+    container = "elf-arm64" if e_machine == 0xB7 else "elf"
     shoff = struct.unpack_from("<Q", data, 0x28)[0]
     shentsize = struct.unpack_from("<H", data, 0x3A)[0]
     shnum = struct.unpack_from("<H", data, 0x3C)[0]
@@ -126,7 +133,7 @@ def parse_elf(data):
             addr = struct.unpack_from("<Q", data, sh + 0x10)[0]
             off = struct.unpack_from("<Q", data, sh + 0x18)[0]
             size = struct.unpack_from("<Q", data, sh + 0x20)[0]
-            return Image("elf", addr, off, size, data)
+            return Image(container, addr, off, size, data)
     raise ValueError("no .text section")
 
 
@@ -471,7 +478,7 @@ def find_gates_arm64(img):
 
 def find_gates_for(img):
     """Dispatch to the arm64 or x86 finder by container."""
-    return find_gates_arm64(img) if img.container in ("macho-arm64", "pe-arm64") else find_gates(img)
+    return find_gates_arm64(img) if img.container in ("macho-arm64", "pe-arm64", "elf-arm64") else find_gates(img)
 
 
 # Default signature window past the cmp, matching the shipping entries (24-32B).
@@ -582,12 +589,15 @@ def name_for(ranges, jg_rva):
 def milestone_name_for(base, img):
     """Mach-O slices get an arch-tagged milestone name (e.g. 151 -> 151-macos-arm64)
     so the two slices of a universal binary land in distinct, non-cross-probing
-    tables; a Windows arm64 PE gets 151 -> 151-win-arm64 for the same reason; PE
-    x64/x86 and ELF keep the base name."""
+    tables; a Windows arm64 PE gets 151 -> 151-win-arm64 and an arm64 ELF gets
+    151 -> 151-linux-arm64 for the same reason; PE x64/x86 and x86_64 ELF keep the
+    base name."""
     if img.container.startswith("macho-"):
         return f"{base}-macos-{img.container.split('-', 1)[1]}"
     if img.container == "pe-arm64":
         return f"{base}-win-arm64"
+    if img.container == "elf-arm64":
+        return f"{base}-linux-arm64"
     return base
 
 

@@ -272,6 +272,92 @@
       ]
     },
     {
+      "name": "151-linux-arm64",
+      "container": "elf-arm64",
+      "_comment": "Linux aarch64 `chrome` ELF (EM_AARCH64 0xB7), 151.0.7922.137 (official arm64 .deb). arm64 has no cmp/jg; each gate is cmp w,#2 ; b.gt and the flip rewrites the B.cond condition GT 0xC->AL 0xE (kind bcond, one byte, imm19 preserved) - the same primitive as 151-macos-arm64 / 151-win-arm64. Google publishes no arm64 Linux debug-info, so the gates were located structurally by the arm64 finder and cross-checked against the same-architecture, symbol-verified 151-win-arm64 / 151-macos-arm64 tables. Like 151-linux (x86_64), IsExtensionAffected is a shared out-of-line predicate.",
+      "sites": [
+        {
+          "name": "ManifestV2Handler::ShouldBlockExtensionInstallation",
+          "kind": "bcond",
+          "jgRVA": "0x05E6C0CC",
+          "jgOff": 4,
+          "expectedMatches": 1,
+          "sig": "3F0800716C0100545F040071A10000547F14007164184A7AE0079F1AC0035FD6"
+        },
+        {
+          "name": "StandardManagementPolicyProvider::UserMayInstall (inlined)",
+          "kind": "bcond",
+          "jgRVA": "0x06086804",
+          "jgOff": 4,
+          "expectedMatches": 1,
+          "sig": "5F0900710C010054293140B91F050071611300543F150071600000543F290071"
+        },
+        {
+          "name": "StandardManagementPolicyProvider::UserMayInstall (inlined, 2nd call site)",
+          "kind": "bcond",
+          "jgRVA": "0x06A71584",
+          "jgOff": 4,
+          "expectedMatches": 1,
+          "sig": "5F0900710C010054293140B91F050071A11300543F150071600000543F290071"
+        },
+        {
+          "name": "MV2DeprecationImpactChecker::IsExtensionAffected (shared predicate; OnExtensionSystemReady / MaybeReEnableExtension / ShouldBlockExtensionEnable call it out-of-line)",
+          "kind": "bcond",
+          "jgRVA": "0x0A525764",
+          "jgOff": 4,
+          "expectedMatches": 1,
+          "sig": "1F0900710C020054291441F92A204839283140B98A000037296940B93F050071"
+        },
+        {
+          "name": "StandardManagementPolicyProvider::MustRemainDisabled (inlined)",
+          "kind": "bcond",
+          "jgRVA": "0x0A69570C",
+          "jgOff": 4,
+          "expectedMatches": 1,
+          "sig": "5F090071EC030054293140B91F050071010300543F150071F4031F2A60000054"
+        }
+      ]
+    },
+    {
+      "name": "152-linux-arm64",
+      "container": "elf-arm64",
+      "_comment": "Linux aarch64 `chrome` ELF, 152.0.7977.42 beta (official arm64 .deb) - same build version as 152-win-arm64 / 152-macos-arm64, whose four gate bodies this table matches 1:1 (register allocation aside). B.cond GT->AL flip (kind bcond); shared folded bodies carry expectedMatches=2. Structurally derived (no arm64 Linux symbols) and cross-checked against those two symbol-verified tables.",
+      "sites": [
+        {
+          "name": "ManifestV2Handler::MaybeReEnableExtension (shared body)",
+          "kind": "bcond",
+          "jgRVA": "0x05D64DD8",
+          "jgOff": 4,
+          "expectedMatches": 2,
+          "sig": "1F0900712C020054691641F96A224839283140B98A000037296940B93F050071"
+        },
+        {
+          "name": "ManifestV2Handler::IsExtensionAffected / ShouldBlockExtensionEnable (shared body)",
+          "kind": "bcond",
+          "jgRVA": "0x05D64F9C",
+          "jgOff": 4,
+          "expectedMatches": 1,
+          "sig": "1F0900710C020054091441F90A204839283140B98A000037296940B93F050071"
+        },
+        {
+          "name": "StandardManagementPolicyProvider::MustRemainDisabled / UserMayInstall (shared body)",
+          "kind": "bcond",
+          "jgRVA": "0x05F78874",
+          "jgOff": 4,
+          "expectedMatches": 2,
+          "sig": "1F0900718C010054891641F98A224839283140B98A000037296940B93F050071"
+        },
+        {
+          "name": "ManifestV2Handler::OnExtensionSystemReady (shared body)",
+          "kind": "bcond",
+          "jgRVA": "0x0696E3C8",
+          "jgOff": 4,
+          "expectedMatches": 2,
+          "sig": "3F090071EC4A0054091541F90A214839283140B98A000037296940B93F050071"
+        }
+      ]
+    },
+    {
       "name": "152-x86",
       "container": "pe32",
       "sites": [

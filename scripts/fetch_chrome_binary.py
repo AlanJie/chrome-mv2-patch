@@ -84,6 +84,13 @@ PLATFORMS = {
     # or hand-copy an arm64 chrome.dll.
     "win-arm64": {"api": "win_arm64", "container": "pe-arm64", "binary": "chrome.dll", "pe_magic": 0x20B, "machine": 0xAA64, "tag": "win-arm64", "suffix": ".dll"},
     "linux":     {"api": "linux", "container": "elf",  "binary": "chrome",     "pe_magic": None,  "tag": "linux64", "suffix": "",     "cft": "linux64"},
+    # Linux on ARM: native aarch64 `chrome` ELF (EM_AARCH64 0xB7), same bcond flip
+    # as Windows/macOS arm64. Google began shipping official arm64 Linux .debs in
+    # mid-2026; they share the `linux` VersionHistory feed (one version for both
+    # arches) but there is NO Chrome for Testing arm64 Linux build, so -- like
+    # win-arm64 -- there is no CfT --version fallback: use --channel stable/beta
+    # for the current build, or hand-copy an arm64 `chrome`.
+    "linux-arm64": {"api": "linux", "container": "elf-arm64", "binary": "chrome", "pe_magic": None, "machine": 0xB7, "tag": "linux-arm64", "suffix": ""},
     # macOS: CfT-only. The gate binary is the framework Mach-O inside the .app;
     # matched brand-agnostically by a "framework" name + the slice's cputype.
     "mac-x64":   {"api": "mac",       "container": "macho-x64",   "binary": None, "pe_magic": None, "tag": "mac-x64",   "suffix": "", "cft": "mac-x64",   "cputype": 0x01000007, "cft_only": True},
@@ -101,12 +108,14 @@ INSTALLERS = {
         "win":       "https://dl.google.com/chrome/install/standalonesetup.exe",
         "win-arm64": "https://dl.google.com/dl/chrome/install/googlechromestandaloneenterprise_arm64.msi",
         "linux":     "https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb",
+        "linux-arm64": "https://dl.google.com/linux/direct/google-chrome-stable_current_arm64.deb",
     },
     "beta": {
         "win64":     "https://dl.google.com/tag/s/dl/chrome/install/beta/googlechromebetastandaloneenterprise64.msi",
         "win":       "https://dl.google.com/tag/s/dl/chrome/install/beta/googlechromebetastandaloneenterprise.msi",
         "win-arm64": "https://dl.google.com/tag/s/dl/chrome/install/beta/googlechromebetastandaloneenterprise_arm64.msi",
         "linux":     "https://dl.google.com/linux/direct/google-chrome-beta_current_amd64.deb",
+        "linux-arm64": "https://dl.google.com/linux/direct/google-chrome-beta_current_arm64.deb",
     },
 }
 
@@ -405,6 +414,19 @@ def _is_elf64(path):
     return head[:4] == b"\x7fELF" and len(head) == 5 and head[4] == 2
 
 
+def _elf_machine(path):
+    """ELF e_machine (0x3E x86_64 / 0xB7 aarch64), or None. Splits the two ELF64
+    `chrome` builds so a linux-arm64 fetch never grabs the x86_64 binary."""
+    try:
+        with open(path, "rb") as handle:
+            head = handle.read(0x14)
+    except OSError:
+        return None
+    if head[:4] != b"\x7fELF" or len(head) < 0x14:
+        return None
+    return struct.unpack_from("<H", head, 0x12)[0]
+
+
 def _macho_cputype(path):
     """cputype of a THIN little-endian 64-bit Mach-O (CfT ships per-arch, thin),
     or None. Used to pick the right slice's framework in a mac .app."""
@@ -438,8 +460,10 @@ def locate_binary(root, spec):
                 continue
             if filename.lower() != spec["binary"]:
                 continue
-            if container == "elf":
-                if _is_elf64(path):
+            if container.startswith("elf"):
+                # ELF64 `chrome`; when the spec pins a machine (elf-arm64 -> 0xB7)
+                # require it so an arm64 fetch skips a stray x86_64 binary.
+                if _is_elf64(path) and (not spec.get("machine") or _elf_machine(path) == spec["machine"]):
                     matches.append(path)
             elif _pe_optional_magic(path) == spec["pe_magic"]:
                 # PE32+ x64 and arm64 share magic 0x20B; the machine field (when
@@ -547,6 +571,10 @@ def fetch(platform, channel, version, out_dir, keep, url_override=None):
         print(f"  python scripts/derive_milestone.py {os.path.relpath(dest)} --name <ver> --json")
         print("  # mac symbols are not published for CfT: the x64 slice cross-checks against")
         print("  # the Linux x64 table; arm64 is located structurally (eyeball the gate).")
+    elif spec["container"] == "elf-arm64":
+        print(f"  python scripts/derive_milestone.py {os.path.relpath(dest)} --name <ver> --json")
+        print("  # no arm64 Linux debug-info zip is published: the arm64 gates are located")
+        print("  # structurally and cross-checked against the macos-arm64 / win-arm64 tables.")
     else:
         print(f"  python scripts/fetch_symbols.py {os.path.relpath(dest)}")
         if spec["container"] == "elf":

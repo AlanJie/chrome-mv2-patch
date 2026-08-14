@@ -6,9 +6,10 @@ the Chrome MV2 gate signatures used by `../chrome-mv2.ps1` (Windows) and
 Works for any future Chrome version on x86, x86-64, and arm64:
 64-bit PE `chrome.dll` (container `pe`), 32-bit PE `chrome.dll` (container
 `pe32`), 64-bit **arm64** PE `chrome.dll` on Windows-on-ARM (container
-`pe-arm64`, the same `bcond` flip as macOS arm64), the ELF `chrome` on Linux
-(container `elf`), and the universal `Google Chrome Framework` Mach-O on macOS —
-its x86_64 slice (`macho-x64`) and arm64 slice (`macho-arm64`).
+`pe-arm64`, the same `bcond` flip as macOS arm64), the ELF `chrome` on Linux —
+x86_64 (`elf`) and **arm64** (`elf-arm64`, same `bcond` flip) — and the universal
+`Google Chrome Framework` Mach-O on macOS — its x86_64 slice (`macho-x64`) and
+arm64 slice (`macho-arm64`).
 Replaces the old single-build `port152/` workspace.
 
 Full rationale: [`../mv2-reversing.md`](../mv2-reversing.md) §"Porting to a new version".
@@ -48,6 +49,11 @@ python scripts/derive_milestone.py <stock chrome.dll|chrome>  --verify
      `--url <per-build installer>` rather than `--version`, or hand-copy an
      arm64 `chrome.dll`.)
    - Linux:       `python scripts/fetch_chrome_binary.py --platform linux`
+   - Linux arm64: `python scripts/fetch_chrome_binary.py --platform linux-arm64`
+     (fetches the current stable/beta build from the arm64 `.deb`; shares the
+     `linux` version feed. Chrome for Testing has no arm64 Linux build, so it
+     can't pin an older `--version` — use `--channel stable`/`beta`, or hand-copy
+     an arm64 `chrome`.)
    - macOS Intel: `python scripts/fetch_chrome_binary.py --platform mac-x64`
    - macOS ARM:   `python scripts/fetch_chrome_binary.py --platform mac-arm64`
 
@@ -118,6 +124,19 @@ so arm64 and x64 never cross-probe. arm64 has no `cmp/jg`; the gate is
 mv2-reversing.md). The shipped `151-win-arm64` entry was derived from the
 consumer arm64 `chrome.dll` (fetched via `--url`) and symbol-verified against its
 PDB (`symbols_from_pdb.py` reads the PE32+ `ImageBase` regardless of machine).
+
+**Linux arm64 (aarch64) Chrome** (official Google `.deb` since mid-2026) is the
+ELF counterpart: `derive_milestone.py` reads `e_machine` (`0xB7` aarch64 vs `0x3E`
+x86_64) to tag `container: "elf-arm64"`, so it never cross-probes the x86_64 `elf`
+table, and it uses the same `bcond` `cmp w,#2 ; b.gt` GT→AL flip as Windows/macOS
+arm64. **Google publishes no arm64 Linux debug-info zip** (only `…-linux64-…`), so
+unlike the other arm64 tables the gates can't be symbol-named. They are located
+structurally by the arm64 finder and cross-checked against the same-version,
+already symbol-verified `…-macos-arm64` / `…-win-arm64` tables (identical
+`ManifestV2Handler` / `StandardManagementPolicyProvider` gates; the arm64
+instruction idiom matches modulo register allocation). The shipped
+`151-linux-arm64` / `152-linux-arm64` entries were derived this way from the
+fetched arm64 `.deb`, `--verify`ed, and confirmed on real aarch64 Linux hardware.
 
 The masking and match-count rules mirror both runtime scripts:
 `Find-AffectedJgSites` / `Invoke-PatchMilestones` in `chrome-mv2.ps1` and
