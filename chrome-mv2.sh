@@ -735,7 +735,111 @@ build_binary_anchor() {
     fi
 }
 
+# Resolve a Python 3 interpreter ONCE (memoised in MV2_PYTHON): prefer `python3`,
+# then accept a bare `python` only if it is actually Python 3 (a py2 `python`
+# would choke on the scanner, and we must know that BEFORE taking the python
+# branch so the grep fallback can still run). MV2_PYTHON stays "" when no usable
+# python exists - the scan then falls back to grep, and the default RVA fast path
+# needs no interpreter at all. The `python` probe only runs when `python3` is
+# absent, so it never disturbs the common case.
+MV2_PYTHON=""; MV2_PYTHON_RESOLVED=false
+resolve_python() {
+    $MV2_PYTHON_RESOLVED && return 0
+    MV2_PYTHON_RESOLVED=true
+    if command -v python3 >/dev/null 2>&1; then MV2_PYTHON="python3"; return 0; fi
+    if command -v python >/dev/null 2>&1 \
+       && python -c 'import sys; sys.exit(0 if sys.version_info[0] >= 3 else 1)' >/dev/null 2>&1; then
+        MV2_PYTHON="python"; return 0
+    fi
+    MV2_PYTHON=""
+}
+
+# Optional python3 accelerator for the relocated-gate scan. Reads ONE site's
+# .text region once - FROM STDIN, which the caller redirects the target file into,
+# so python never has to interpret a shell path (this dodges MSYS/cygwin/WSL
+# path-format mismatches when python3 is a native-Windows build) - and does the
+# anchor find + full masked match in-process, printing the ABSOLUTE file offset
+# of each jump opcode (exact parity with sig_matches_at). Faster and far more
+# reliable than grep-on-binary, whose long-line/NUL handling misses anchors in
+# the ~285 MB Chrome .text on some builds (notably WSL's GNU grep 3.11 - see
+# mv2-sh-grep-slowpath-wsl). Prints nothing on any error so the caller fails
+# closed; grep stays the fallback when python3 is absent (keeps the default
+# no-python path, e.g. stock macOS, intact).
+# Stdin: the target file.  Args: traw tsize sig_hex kind jg_off expected anchor_hex anchor_off
+python_scan_site() {
+    "$MV2_PYTHON" -c '
+import sys
+try:
+    a = sys.argv
+    traw = int(a[1]); tsize = int(a[2])
+    sig  = bytes.fromhex(a[3]); kind = a[4]; jg = int(a[5]); expected = int(a[6])
+    anchor = bytes.fromhex(a[7]); aoff = int(a[8])
+    if not anchor:
+        sys.exit(0)
+    f = sys.stdin.buffer
+    try:
+        f.seek(traw); data = f.read(tsize)
+    except Exception:
+        data = f.read()[traw:traw + tsize]
+    n = len(data); L = len(sig)
+    def ok(s):
+        if s < 0 or s + L > n:
+            return False
+        if kind == "bcond":
+            w = data[s+jg] | (data[s+jg+1] << 8) | (data[s+jg+2] << 16) | (data[s+jg+3] << 24)
+            if (w & 0xFF000010) != 0x54000000:
+                return False
+            c = w & 0xF
+            if c != 0x0C and c != 0x0E:
+                return False
+        for k in range(L):
+            p = data[s+k]
+            if kind == "short":
+                if k == jg:
+                    if p != 0x7F and p != 0xEB:
+                        return False
+                elif k == jg + 1:
+                    pass
+                elif p != sig[k]:
+                    return False
+            elif kind == "near":
+                if k == jg:
+                    if not ((p == 0x0F and data[s+jg+1] == 0x8F) or (p == 0x90 and data[s+jg+1] == 0xE9)):
+                        return False
+                elif k == jg + 1:
+                    pass
+                elif jg + 2 <= k <= jg + 5:
+                    pass
+                elif p != sig[k]:
+                    return False
+            else:  # bcond: the 4-byte branch word was validated above
+                if jg <= k <= jg + 3:
+                    pass
+                elif p != sig[k]:
+                    return False
+        return True
+
+    seen = set(); out = []; pos = 0
+    while True:
+        i = data.find(anchor, pos)
+        if i < 0:
+            break
+        pos = i + 1
+        s = i - aoff
+        if ok(s):
+            off = traw + s + jg
+            if off not in seen:
+                seen.add(off); out.append(off)
+                if len(out) > expected + 1:
+                    break
+    sys.stdout.buffer.write("".join("%d\n" % o for o in out).encode())
+except Exception:
+    sys.exit(0)
+' "$@" 2>/dev/null || true
+}
+
 # find_site_matches <file> <base> <traw> <tvaddr> <tsize> <spec> -> FOUND_OFFSETS, RELOCATED
+
 # spec is "name|kind|jgRVA|jgOff|expectedMatches|sig". FOUND_OFFSETS holds
 # ABSOLUTE file offsets of the jump opcode within this slice. Fast path probes
 # the recorded RVA; a miss falls back to one raw fixed-string grep for the site.
@@ -774,6 +878,24 @@ find_site_matches() {
         # caller (probe_slice_pass) invokes us as a bare, untested statement.
         warnf "Couldn't search for one of the changes - skipping it."; return 0
     fi
+
+    # Prefer the python3 accelerator when a usable interpreter is present: one
+    # in-process pass over .text, no per-candidate od reads, and reliable where
+    # grep-on-binary is not. grep is the fallback below when no python is found.
+    resolve_python
+    if [[ -n "$MV2_PYTHON" ]]; then
+        local matches=() jg_file_offset
+        while IFS= read -r jg_file_offset; do
+            jg_file_offset="${jg_file_offset%$'\r'}"   # a Windows python3 may emit CRLF
+            [[ "$jg_file_offset" =~ ^[0-9]+$ ]] || continue
+            matches+=("$jg_file_offset")
+        done < <(python_scan_site "$traw" "$tsize" "$sig_hex" "$kind" "$jg_off" "$expected" "$anchor_hex" "$BINARY_ANCHOR_OFF" < "$file")
+        if (( ${#matches[@]} > 0 )); then
+            FOUND_OFFSETS=("${matches[@]}"); RELOCATED=true
+        fi
+        return 0
+    fi
+
     local anchor_bin="" ai abyte
     for (( ai = 0; ai < ${#anchor_hex}; ai += 2 )); do
         abyte="${anchor_hex:ai:2}"
@@ -997,13 +1119,16 @@ report_layout_candidates() {
 WORK_FILE=""; WRITE_TMP=""; META_TMP=""; QUIET=false
 
 write_target() {
-    local target="$1" source="$2" expected_hash="${3:-}"
+    local target="$1" source="$2" expected_hash="${3:-}" known_source_hash="${4:-}"
     local dir; dir=$(dirname "$target")
     local tmp; tmp=$(mktemp "${dir}/.chrome-mv2-XXXXXX"); WRITE_TMP="$tmp"
     if [[ -e "$target" ]]; then cp -p -- "$target" "$tmp"; fi
     cp -- "$source" "$tmp"
     local shash thash chash
-    shash=$(file_sha256 "$source"); thash=$(file_sha256 "$tmp")
+    # Trust a caller-supplied source hash (it was just computed) to avoid a second
+    # full-file pass; the tmp copy is always hashed and compared, so the write is
+    # still verified byte-for-byte.
+    shash="${known_source_hash:-$(file_sha256 "$source")}"; thash=$(file_sha256 "$tmp")
     if [[ "$shash" != "$thash" ]]; then rm -f -- "$tmp"; WRITE_TMP=""; errf "Couldn't write the file safely - nothing was changed."; return 1; fi
     if [[ -n "$expected_hash" ]]; then
         chash=$(file_sha256 "$target")
@@ -1423,22 +1548,43 @@ request_target_close() {
     fi
 }
 
-LNX_CHANNELS=(); LNX_PATHS=(); LNX_VERSIONS=(); LNX_RUNNING=(); LNX_HOLDERS=(); LNX_BACKUPS=()
+LNX_CHANNELS=(); LNX_PATHS=(); LNX_VERSIONS=(); LNX_RUNNING=(); LNX_HOLDERS=(); LNX_BACKUPS=(); LNX_STATE=()
 CHOSEN_INDEX=-1
 CHOSEN_CUSTOM_PATH=""
 
+# Cheap patched/stock hint for the install list. Runs the FAST probe only (the
+# recorded-RVA check, never the full .text scan), so it costs a handful of
+# targeted reads rather than a sweep of the ~285 MB binary. Echoes "patched",
+# "not patched", or "" (unknown / relocated / unrecognized - the list just omits
+# a tag then; the real patch/check path still does the full probe). Clobbers the
+# parse/probe globals, which the actual flow resets before it runs.
+elf_patch_state() {
+    local f="$1"
+    parse_elf "$f" >/dev/null 2>&1 || { echo ""; return; }
+    reset_probe_results
+    FAST_PROBE_ONLY=true
+    probe_slice_pass "$f" "${SLICE_BASE[0]}" "${SLICE_TRAW[0]}" "${SLICE_TVADDR[0]}" "${SLICE_TSIZE[0]}" "${SLICE_CONTAINER[0]}"
+    FAST_PROBE_ONLY=false
+    if (( BEST_SATISFIED == 0 )) || { ! $BEST_FULL && (( BEST_TIES > 1 )); }; then echo ""; return; fi
+    classify_flip_states_slice "$f" 2>/dev/null || { echo ""; return; }
+    if (( STATE_STOCK > 0 && STATE_PATCHED == 0 )); then echo "not patched"
+    elif (( STATE_STOCK == 0 && STATE_PATCHED > 0 )); then echo "patched"
+    else echo ""; fi
+}
+
 enumerate_linux_installs() {
-    LNX_CHANNELS=(); LNX_PATHS=(); LNX_VERSIONS=(); LNX_RUNNING=(); LNX_HOLDERS=(); LNX_BACKUPS=()
+    LNX_CHANNELS=(); LNX_PATHS=(); LNX_VERSIONS=(); LNX_RUNNING=(); LNX_HOLDERS=(); LNX_BACKUPS=(); LNX_STATE=()
     local i
     for (( i = 0; i < ${#LINUX_CHANNELS[@]}; i++ )); do
         local bin="${LINUX_DIRS[$i]}/chrome"
         if [[ ! -f "$bin" ]]; then continue; fi
-        local ver holders has_backup running
+        local ver holders has_backup running state
         ver=$(chrome_version "$bin"); holders=$(proc_holders "$bin")
         if (( holders > 0 )); then running=true; else running=false; fi
         if [[ -f "${bin}.bak" ]]; then has_backup=true; else has_backup=false; fi
+        state=$(elf_patch_state "$bin")
         LNX_CHANNELS+=("${LINUX_CHANNELS[$i]}"); LNX_PATHS+=("$bin"); LNX_VERSIONS+=("$ver")
-        LNX_RUNNING+=("$running"); LNX_HOLDERS+=("$holders"); LNX_BACKUPS+=("$has_backup")
+        LNX_RUNNING+=("$running"); LNX_HOLDERS+=("$holders"); LNX_BACKUPS+=("$has_backup"); LNX_STATE+=("$state")
     done
 }
 
@@ -1451,6 +1597,10 @@ print_linux_install_row() {
     else
         echo -n "  ${C_GRN}[closed]${C_RESET}"
     fi
+    case "${LNX_STATE[$i]:-}" in
+        patched)       echo -n "  ${C_GRN}[patched]${C_RESET}" ;;
+        "not patched") echo -n "  ${C_DIM}[not patched]${C_RESET}" ;;
+    esac
     if ${LNX_BACKUPS[$i]}; then echo -n " ${C_DIM}(backup saved)${C_RESET}"; fi
     echo ""
     echo "      ${C_DIM}${LNX_PATHS[$i]}${C_RESET}"
@@ -1677,9 +1827,10 @@ do_patch_elf() {
         errf "Chrome reopened before we could finish - nothing was changed."
         rm -f -- "$work_file"; WORK_FILE=""; return 1
     fi
-    write_target "$target" "$work_file" "$target_hash" || { rm -f -- "$work_file"; WORK_FILE=""; return 1; }
+    write_target "$target" "$work_file" "$target_hash" "$prepared_hash" || { rm -f -- "$work_file"; WORK_FILE=""; return 1; }
     rm -f -- "$work_file"; WORK_FILE=""
-    if [[ "$(file_sha256 "$target")" != "$prepared_hash" ]]; then errf "The change didn't save correctly."; return 1; fi
+    # write_target verified the copy against prepared_hash before the atomic mv,
+    # so the target now equals the prepared image - no post-write re-read needed.
 
     rule
     if $BEST_FULL; then
@@ -1725,8 +1876,7 @@ do_restore_elf() {
     fi
     request_target_close "$target" "$assume_yes" || return 1
     if (( $(proc_holders "$target") > 0 )); then errf "Chrome reopened before we could finish - nothing was changed."; return 1; fi
-    write_target "$target" "$backup" "$target_hash" || return 1
-    if [[ "$(file_sha256 "$target")" != "$BACKUP_HASH" ]]; then errf "The restore didn't save correctly."; return 1; fi
+    write_target "$target" "$backup" "$target_hash" "$BACKUP_HASH" || return 1
     successf "Done. Your original Chrome is back."
     rm -f -- "$backup" "$(backup_meta_path "$backup")"
     infof "Backup removed - Chrome is back to normal."
@@ -1833,8 +1983,7 @@ do_restore_macho() {
     fi
 
     if [[ -n "$app_path" ]]; then quit_chrome "$app_path" "$assume_yes" || return 1; fi
-    write_target "$target" "$backup" "$target_hash" || return 1
-    if [[ "$(file_sha256 "$target")" != "$BACKUP_HASH" ]]; then errf "The restore didn't save correctly."; return 1; fi
+    write_target "$target" "$backup" "$target_hash" "$BACKUP_HASH" || return 1
     if [[ -n "$app_path" ]] && have_codesign; then
         resign_inside_out "$FRAMEWORK_BUNDLE" "$app_path" || warnf "Re-signing failed. Try again: bash $0 restore \"$app_path\""
     fi
@@ -1910,7 +2059,7 @@ do_patch_macho() {
     fi
 
     if [[ -n "$app_path" ]]; then quit_chrome "$app_path" "$assume_yes" || { rm -f -- "$work"; WORK_FILE=""; return 1; }; fi
-    write_target "$target" "$work" "$target_hash" || { rm -f -- "$work"; WORK_FILE=""; return 1; }
+    write_target "$target" "$work" "$target_hash" "$prepared_hash" || { rm -f -- "$work"; WORK_FILE=""; return 1; }
     rm -f -- "$work"; WORK_FILE=""
 
     # Re-sign the now-modified bundle inside-out, then verify. On any failure,

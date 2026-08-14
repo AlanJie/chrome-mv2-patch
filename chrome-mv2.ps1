@@ -651,7 +651,11 @@ function Write-AtomicFile {
         [string]$TargetPath,
         [byte[]]$Buf,
         [string]$ExpectedCurrentHash = '',
-        [string]$PreserveMetadataFrom = ''
+        [string]$PreserveMetadataFrom = '',
+        # Caller-supplied SHA-256 of $Buf. When set, the read-back verification
+        # compares against it instead of re-hashing the 285 MB $Buf a second time
+        # (the caller has usually just computed this hash).
+        [string]$KnownBufHash = ''
     )
 
     $full = [IO.Path]::GetFullPath($TargetPath)
@@ -669,7 +673,8 @@ function Write-AtomicFile {
         } finally { $fs.Dispose() }
 
         $written = [IO.File]::ReadAllBytes($tmp)
-        if ($written.LongLength -ne $Buf.LongLength -or (Get-ByteHash $written) -ne (Get-ByteHash $Buf)) {
+        $bufHash = if ($KnownBufHash) { $KnownBufHash } else { Get-ByteHash $Buf }
+        if ($written.LongLength -ne $Buf.LongLength -or (Get-ByteHash $written) -ne $bufHash) {
             throw "Couldn't write to $TargetPath safely - nothing was changed."
         }
 
@@ -1002,10 +1007,11 @@ function Test-PatchOutput {
 
 function Get-CleanStockLayout {
     param([byte[]]$Buf, $Img, [array]$Milestones, [bool]$AllowPartialLayout = $false)
-    $copy = [byte[]]$Buf.Clone()
-    # This is a validation probe (no write). Suppress the per-site "stock jg at
-    # RVA ..." host output (stream 6) - callers print their own one-line summary.
-    $probe = Invoke-PatchMilestones -Buf $copy -Img $Img -Milestones $Milestones `
+    # A read-only validation probe: Invoke-PatchMilestones with -Apply $false
+    # never writes to $Buf, so it is passed through directly (no defensive clone
+    # of the 285 MB buffer). Suppress the per-site "stock jg at RVA ..." host
+    # output (stream 6) - callers print their own one-line summary.
+    $probe = Invoke-PatchMilestones -Buf $Buf -Img $Img -Milestones $Milestones `
         -AllowPartial $AllowPartialLayout -Apply $false 6>$null
     $clean = ($probe.Status -ne 0 -and $probe.Stock -gt 0 -and $probe.Already -eq 0 -and
         ($probe.Full -or $AllowPartialLayout) -and -not $probe.Reason)
@@ -1352,8 +1358,8 @@ function Test-TargetDirectoryWritable {
 # Writes the patched image in place. The file was unlocked first, so a straight
 # overwrite is safe (Chrome reopens chrome.dll on next launch).
 function Write-Target {
-    param([string]$TargetPath, [byte[]]$Buf, [string]$ExpectedCurrentHash = '')
-    Write-AtomicFile -TargetPath $TargetPath -Buf $Buf -ExpectedCurrentHash $ExpectedCurrentHash -PreserveMetadataFrom $TargetPath
+    param([string]$TargetPath, [byte[]]$Buf, [string]$ExpectedCurrentHash = '', [string]$KnownBufHash = '')
+    Write-AtomicFile -TargetPath $TargetPath -Buf $Buf -ExpectedCurrentHash $ExpectedCurrentHash -PreserveMetadataFrom $TargetPath -KnownBufHash $KnownBufHash
 }
 
 # ============================================================================
@@ -1414,6 +1420,32 @@ function Find-DllUnderApplication {
 
 # One target's display/decision facts: channel, version, whether it is running,
 # and whether a .bak already exists.
+# Cheap patched/stock probe for the install list. Reads ONLY the PE header (not
+# the ~285 MB body) and inspects the Authenticode Security Directory: a stock,
+# signed chrome.dll has one; patching zeroes it (see Complete-Image). Returns
+# 'patched', 'not patched', or '' (unknown / not a PE). This is a fast list hint,
+# not the authoritative gate probe that 'check'/'patch' run.
+function Get-PatchStateQuick {
+    param([string]$Path)
+    try {
+        $hdr = [byte[]]::new(8192)
+        $fs = [IO.File]::OpenRead($Path)
+        try { $n = $fs.Read($hdr, 0, $hdr.Length) } finally { $fs.Dispose() }
+        if ($n -lt 64 -or $hdr[0] -ne 0x4D -or $hdr[1] -ne 0x5A) { return '' }
+        $eLfanew = [BitConverter]::ToUInt32($hdr, 0x3C)
+        if ($eLfanew + 24 -gt $n) { return '' }
+        if ($hdr[$eLfanew] -ne 0x50 -or $hdr[$eLfanew + 1] -ne 0x45) { return '' }
+        $optOff = [int]$eLfanew + 24
+        $magic = [BitConverter]::ToUInt16($hdr, $optOff)
+        $fixedLen = if ($magic -eq 0x20B) { 112 } elseif ($magic -eq 0x10B) { 96 } else { return '' }
+        $secDirAt = $optOff + $fixedLen + 4 * 8      # data directory [4] = Security
+        if ($secDirAt + 8 -gt $n) { return '' }
+        $va = [BitConverter]::ToUInt32($hdr, $secDirAt)
+        $sz = [BitConverter]::ToUInt32($hdr, $secDirAt + 4)
+        if ($va -ne 0 -and $sz -ne 0) { return 'not patched' } else { return 'patched' }
+    } catch { return '' }
+}
+
 function Get-InstallDetails {
     param([string]$TargetPath, [string]$Channel)
 
@@ -1440,6 +1472,7 @@ function Get-InstallDetails {
         Running   = $running
         Holders   = $holders.Count
         HasBackup = (Test-Path -LiteralPath (Get-BackupPath $TargetPath) -PathType Leaf)
+        State     = (Get-PatchStateQuick $TargetPath)
     }
 }
 
@@ -1484,6 +1517,10 @@ function Show-InstallRow {
         $line += "  $($C.Yel)[open]$($C.Reset)"
     } else {
         $line += "  $($C.Grn)[closed]$($C.Reset)"
+    }
+    if ($Inst.PSObject.Properties['State']) {
+        if     ($Inst.State -eq 'patched')     { $line += "  $($C.Grn)[patched]$($C.Reset)" }
+        elseif ($Inst.State -eq 'not patched') { $line += "  $($C.Dim)[not patched]$($C.Reset)" }
     }
     if ($Inst.HasBackup) { $line += " $($C.Dim)(backup saved)$($C.Reset)" }
     Write-Host $line
@@ -1751,9 +1788,10 @@ function Invoke-Patch {
         Write-Err 'Chrome is still open - close it and try again.'
         return 1
     }
-    Write-Target -TargetPath $Target.Path -Buf $buf -ExpectedCurrentHash $targetHash
-    $afterHash = (Get-FileHash -LiteralPath $Target.Path -Algorithm SHA256).Hash.ToLowerInvariant()
-    if ($afterHash -ne $preparedHash) { throw "The change didn't save correctly." }
+    # Write-AtomicFile reads the written bytes back and verifies them against
+    # $preparedHash before the atomic Replace, so the target already equals the
+    # prepared image on success - no post-write re-read/re-hash is needed.
+    Write-Target -TargetPath $Target.Path -Buf $buf -ExpectedCurrentHash $targetHash -KnownBufHash $preparedHash
 
     Write-Rule
     if ($patch.Full) {
@@ -1814,9 +1852,9 @@ function Invoke-Restore {
         Write-Err 'Chrome is still open - close it and try again.'
         return 1
     }
-    Write-Target -TargetPath $Target.Path -Buf $backup.Buf -ExpectedCurrentHash $currentIdentity.SHA256
-    $afterHash = (Get-FileHash -LiteralPath $Target.Path -Algorithm SHA256).Hash.ToLowerInvariant()
-    if ($afterHash -ne $backup.Identity.SHA256) { throw "The restore didn't save correctly." }
+    # As in Invoke-Patch: Write-AtomicFile verifies the read-back against the
+    # backup's known hash before the atomic Replace, so no post-write re-read.
+    Write-Target -TargetPath $Target.Path -Buf $backup.Buf -ExpectedCurrentHash $currentIdentity.SHA256 -KnownBufHash $backup.Identity.SHA256
     Write-Success 'Done. Your original Chrome is back.'
     Remove-BackupFiles $backupPath
     Write-Info 'Backup removed - Chrome is back to normal.'
