@@ -170,18 +170,59 @@ banner() {
 }
 
 # ============================================================================
-# Binary read helpers - LE/BE integers and hex from a file at an offset, via od.
+# Binary read helpers - LE/BE integers and hex from a file at an offset.
+#
+# Each od/tr launch costs ~100 ms under Windows git-bash (fork emulation), and a
+# single parse issues hundreds of reads, so a file that fits is slurped ONCE into
+# an uppercase-hex cache (_HC_HEX) and every read slices that string in pure bash.
+# Files larger than HEXCACHE_CAP (the ~200 MB real Chrome binary) keep the
+# streaming od path, which never materializes the whole file.
+#
+# The cache MUST be primed by _hexcache_load in PARENT scope (read helpers run
+# inside $(...) command-substitution subshells, whose variable writes are lost);
+# subshells then inherit and slice _HC_HEX read-only. Read-heavy functions call
+# _hexcache_load at their top; any writer calls _hexcache_flush so a stale slice
+# is never returned. An un-primed or big-file read falls back to a single od.
 # ============================================================================
-read_u16_le() { local b; b=$(od -A n -t x1 -j "$2" -N 2 "$1" | tr -d ' \n'); echo $(( 16#${b:2:2}${b:0:2} )); }
-read_u32_le() { local b; b=$(od -A n -t x1 -j "$2" -N 4 "$1" | tr -d ' \n'); echo $(( 16#${b:6:2}${b:4:2}${b:2:2}${b:0:2} )); }
-read_u32_be() { local b; b=$(od -A n -t x1 -j "$2" -N 4 "$1" | tr -d ' \n'); echo $(( 16#${b:0:2}${b:2:2}${b:4:2}${b:6:2} )); }
-read_u64_le() { local b; b=$(od -A n -t x1 -j "$2" -N 8 "$1" | tr -d ' \n'); echo $(( 16#${b:14:2}${b:12:2}${b:10:2}${b:8:2}${b:6:2}${b:4:2}${b:2:2}${b:0:2} )); }
-read_u64_be() { local b; b=$(od -A n -t x1 -j "$2" -N 8 "$1" | tr -d ' \n'); echo $(( 16#${b:0:2}${b:2:2}${b:4:2}${b:6:2}${b:8:2}${b:10:2}${b:12:2}${b:14:2} )); }
-read_bytes_hex() { od -A n -v -t x1 -j "$2" -N "$3" "$1" | tr -d ' \n' | tr 'a-f' 'A-F'; }
-read_byte() { local h; h=$(od -A n -t x1 -j "$2" -N 1 "$1" | tr -d ' \n'); echo $(( 16#$h )); }
+HEXCACHE_CAP=$(( 16 * 1024 * 1024 ))
+_HC_FILE=""; _HC_HEX=""; _HC_BIG=0
+_hexcache_flush() { _HC_FILE=""; _HC_HEX=""; _HC_BIG=0; }
+_hexcache_load() {
+    local file="$1"
+    [[ "$file" == "$_HC_FILE" ]] && return 0
+    local sz; sz=$(file_size "$file")
+    _HC_FILE="$file"; _HC_HEX=""; _HC_BIG=0
+    if (( sz > 0 && sz <= HEXCACHE_CAP )); then
+        _HC_HEX=$(od -A n -v -t x1 "$file" | tr -d ' \n' | tr 'a-f' 'A-F')
+    else
+        _HC_BIG=1
+    fi
+    return 0
+}
+# Uppercase hex for N bytes at OFF: slice the primed cache, else a single od read.
+# Never primes the cache (that must happen in parent scope - see above).
+_read_hex() {
+    if [[ "$1" == "$_HC_FILE" && "$_HC_BIG" == "0" ]]; then
+        printf '%s' "${_HC_HEX:$(( $2 * 2 )):$(( $3 * 2 ))}"
+    else
+        od -A n -v -t x1 -j "$2" -N "$3" "$1" | tr -d ' \n' | tr 'a-f' 'A-F'
+    fi
+}
+read_bytes_hex() { _read_hex "$1" "$2" "$3"; }
+read_byte()   { local b; b=$(_read_hex "$1" "$2" 1); echo $(( 16#$b )); }
+read_u16_le() { local b; b=$(_read_hex "$1" "$2" 2); echo $(( 16#${b:2:2}${b:0:2} )); }
+read_u32_le() { local b; b=$(_read_hex "$1" "$2" 4); echo $(( 16#${b:6:2}${b:4:2}${b:2:2}${b:0:2} )); }
+read_u32_be() { local b; b=$(_read_hex "$1" "$2" 4); echo $(( 16#${b:0:2}${b:2:2}${b:4:2}${b:6:2} )); }
+read_u64_le() { local b; b=$(_read_hex "$1" "$2" 8); echo $(( 16#${b:14:2}${b:12:2}${b:10:2}${b:8:2}${b:6:2}${b:4:2}${b:2:2}${b:0:2} )); }
+read_u64_be() { local b; b=$(_read_hex "$1" "$2" 8); echo $(( 16#${b:0:2}${b:2:2}${b:4:2}${b:6:2}${b:8:2}${b:10:2}${b:12:2}${b:14:2} )); }
 
-file_size() { stat -f%z "$1" 2>/dev/null || stat -c%s "$1" 2>/dev/null; }
-file_sha256() { shasum -a 256 -- "$1" 2>/dev/null | awk '{print $1}' || sha256sum -- "$1" | awk '{print $1}'; }
+# GNU coreutils (Linux + Windows git-bash) answer `stat -c%s` first, so try it
+# first to spend one process instead of two; macOS BSD stat falls through to -f%z.
+file_size() { stat -c%s "$1" 2>/dev/null || stat -f%z "$1" 2>/dev/null; }
+# GNU/BSD checksum tools prefix the line with '\' when the path contains a
+# backslash; strip it so hash comparisons hold for Windows-style paths too.
+# Parse the first field in-shell (no awk) to spend one process, not two.
+file_sha256() { local out; out=$(shasum -a 256 -- "$1" 2>/dev/null) || out=$(sha256sum -- "$1"); out="${out%% *}"; echo "${out#\\}"; }
 
 range_within_file() {
     local offset="$1" count="$2" size="$3"
@@ -443,6 +484,7 @@ parse_thin_slice() {
 
 parse_macho() {
     local file="$1"
+    _hexcache_load "$file"   # prime the byte cache (big frameworks fall back to od)
     SLICE_CONTAINER=(); SLICE_BASE=(); SLICE_SIZE=()
     SLICE_TVADDR=(); SLICE_TRAW=(); SLICE_TSIZE=(); SLICE_UUID=()
     NUM_SLICES=0
@@ -519,6 +561,7 @@ validate_elf_section_table() {
 
 get_elf_build_id() {
     local file="$1" fsize
+    _hexcache_load "$file"   # prime the byte cache for the reads below
     fsize=$(file_size "$file")
     if (( fsize < 64 )); then echo ""; return 1; fi
     local magic; magic=$(read_bytes_hex "$file" 0 4)
@@ -533,8 +576,10 @@ get_elf_build_id() {
         sh_off=$(( ELF_SHOFF + i * ELF_SHENTSIZE ))
         name_off=$(read_u32_le "$file" "$sh_off")
         (( name_off < ELF_STRSIZE )) || continue
-        sec_name=$(dd if="$file" bs=1 skip=$(( ELF_STROFF + name_off )) count=32 2>/dev/null | tr '\0' '\n' | head -1)
-        if [[ "$sec_name" == ".note.gnu.build-id" ]]; then
+        # section name via the byte cache (no dd/tr/head): read a window, keep the
+        # bytes up to the NUL terminator, compare to the hex of ".note.gnu.build-id".
+        sec_name=$(read_bytes_hex "$file" $(( ELF_STROFF + name_off )) 24); sec_name="${sec_name%%00*}"
+        if [[ "$sec_name" == "2E6E6F74652E676E752E6275696C642D6964" ]]; then
             sec_off=$(read_u64_le "$file" $(( sh_off + 0x18 )))
             sec_size=$(read_u64_le "$file" $(( sh_off + 0x20 )))
             if (( sec_size < 16 )) || ! range_within_file "$sec_off" "$sec_size" "$fsize"; then echo ""; return 1; fi
@@ -558,6 +603,7 @@ get_elf_build_id() {
 
 parse_elf() {
     local file="$1" fsize
+    _hexcache_load "$file"   # prime the byte cache for the reads below
     fsize=$(file_size "$file")
     if (( fsize < 64 )); then errf "Not a valid ELF: file too small (${fsize} bytes)."; return 1; fi
     local magic; magic=$(read_bytes_hex "$file" 0 4)
@@ -582,8 +628,10 @@ parse_elf() {
         sh_off=$(( ELF_SHOFF + i * ELF_SHENTSIZE ))
         name_off=$(read_u32_le "$file" "$sh_off")
         (( name_off < ELF_STRSIZE )) || continue
-        sec_name=$(dd if="$file" bs=1 skip=$(( ELF_STROFF + name_off )) count=16 2>/dev/null | tr '\0' '\n' | head -1)
-        if [[ "$sec_name" == ".text" ]]; then
+        # section name via the byte cache (no dd/tr/head): keep bytes up to the NUL
+        # terminator and compare to the hex of ".text".
+        sec_name=$(read_bytes_hex "$file" $(( ELF_STROFF + name_off )) 8); sec_name="${sec_name%%00*}"
+        if [[ "$sec_name" == "2E74657874" ]]; then
             TEXT_VADDR=$(read_u64_le "$file" $(( sh_off + 0x10 )))
             TEXT_RAW=$(read_u64_le "$file" $(( sh_off + 0x18 )))
             TEXT_SIZE=$(read_u64_le "$file" $(( sh_off + 0x20 )))
@@ -807,6 +855,7 @@ probe_slice_pass() {
 
 probe_slice() {
     local idx="$1" file="$2"
+    _hexcache_load "$file"   # prime the byte cache for both probe passes
     local base="${SLICE_BASE[$idx]}" traw="${SLICE_TRAW[$idx]}"
     local tvaddr="${SLICE_TVADDR[$idx]}" tsize="${SLICE_TSIZE[$idx]}"
     local container="${SLICE_CONTAINER[$idx]}"
@@ -830,6 +879,7 @@ probe_slice() {
 SLICE_FLIPS=0; SLICE_ALREADY=0
 apply_flips_slice() {
     local file="$1" applied=0 already=0 i name kind offset cur o0 o1 nib newb
+    _hexcache_load "$file"   # prime for the per-site reads; flushed after writing
     SLICE_FLIPS=0; SLICE_ALREADY=0
     for (( i = 0; i < ${#FLIP_OFFSETS[@]}; i++ )); do
         name="${FLIP_NAMES[$i]}"; kind="${FLIP_KINDS[$i]}"; offset="${FLIP_OFFSETS[$i]}"
@@ -867,11 +917,13 @@ apply_flips_slice() {
         okf "    ${BEST_MS_NAME}: ${name} flipped${suffix}"
     done
     SLICE_FLIPS=$applied; SLICE_ALREADY=$already
+    _hexcache_flush   # the dd writes above dirtied the file; drop the stale slice
 }
 
 STATE_STOCK=0; STATE_PATCHED=0
 classify_flip_states_slice() {
     local file="$1" i kind offset o0 o1 nib
+    _hexcache_load "$file"   # prime the byte cache for the per-site reads
     STATE_STOCK=0; STATE_PATCHED=0
     for (( i = 0; i < ${#FLIP_OFFSETS[@]}; i++ )); do
         kind="${FLIP_KINDS[$i]}"; offset="${FLIP_OFFSETS[$i]}"
@@ -963,6 +1015,7 @@ write_target() {
         if [[ "$chash" != "$expected_hash" ]]; then rm -f -- "$tmp"; WRITE_TMP=""; errf "Target changed after inspection; refusing to overwrite."; return 1; fi
     fi
     mv -f -- "$tmp" "$target"; WRITE_TMP=""
+    _hexcache_flush   # $target was just replaced; any cached slice is now stale
     sync 2>/dev/null || true
 }
 
@@ -1651,6 +1704,7 @@ do_restore_elf() {
     if (( BEST_SATISFIED == 0 || BEST_TIES != 1 || STATE_PATCHED != 0 )); then
         errf "Backup is not a complete clean stock layout."; return 1
     fi
+    okf "Backup verified: clean stock Chrome ${BEST_MS_NAME} (${BEST_SATISFIED}/${BEST_TOTAL} MV2 gate sites intact)."
     parse_elf "$target" || return 1
     local target_id target_hash
     target_id=$(get_elf_build_id "$target")
@@ -1661,12 +1715,19 @@ do_restore_elf() {
         return 1
     fi
     if [[ "$target_id" != "$BACKUP_BUILD_ID" ]]; then warnf "Forcing restore from a different Chrome build (--force-restore)."; fi
-    if [[ "$target_hash" == "$BACKUP_HASH" ]]; then successf "Target already matches the verified backup; no write was needed."; return 0; fi
+    if [[ "$target_hash" == "$BACKUP_HASH" ]]; then
+        successf "Target already matches the verified backup; no write was needed."
+        rm -f -- "$backup" "$(backup_meta_path "$backup")"
+        infof "Backup removed; the installed binary is the original stock build."
+        return 0
+    fi
     request_target_close "$target" "$assume_yes" || return 1
     if (( $(proc_holders "$target") > 0 )); then errf "Chrome restarted after it was closed; nothing was written."; return 1; fi
     write_target "$target" "$backup" "$target_hash" || return 1
     if [[ "$(file_sha256 "$target")" != "$BACKUP_HASH" ]]; then errf "Post-restore SHA-256 verification failed."; return 1; fi
     successf "Original binary successfully restored from backup!"
+    rm -f -- "$backup" "$(backup_meta_path "$backup")"
+    infof "Backup removed; the installed binary is the original stock build."
     return 0
 }
 
@@ -1740,6 +1801,18 @@ do_check_macho() {
     return 0
 }
 
+# Remove a Mach-O backup and its metadata after a successful restore. For a real
+# .app the backup lives in a UUID-keyed dir under Application Support; prune the
+# now-empty dir (and the brand dir) too. Loose Mach-O keeps <file>.bak beside it.
+remove_macho_backup() {
+    local backup="$1"
+    rm -f -- "$backup" "$(backup_meta_path "$backup")"
+    if [[ "$TARGET_CONTAINER" == "macho" && -n "$APP_PATH" ]]; then
+        rmdir -- "$(backup_dir)" 2>/dev/null || true
+        rmdir -- "$(dirname "$(backup_dir)")" 2>/dev/null || true
+    fi
+}
+
 do_restore_macho() {
     local target="$1" app_path="$2" assume_yes="$3" force_restore="$4"
     infof "Restore mode requested..."
@@ -1749,13 +1822,19 @@ do_restore_macho() {
     local backup; backup=$(backup_path)
     [[ -f "$backup" ]] || { errf "Backup ${backup} does not exist."; return 1; }
     validate_backup_snapshot "$backup" || { errf "Backup or metadata failed validation."; return 1; }
+    okf "Backup verified: clean stock Chrome framework."
 
     local target_hash; target_hash=$(file_sha256 "$target")
     if [[ "$target_id" != "$BACKUP_IDENTITY" ]] && ! $force_restore; then
         errf "Backup belongs to a different Chrome build; refusing to downgrade."
         echo "    Use --force-restore only if restoring that older build is intentional."; return 1
     fi
-    if [[ "$target_hash" == "$BACKUP_HASH" ]]; then successf "Target already matches the backup; nothing to do."; return 0; fi
+    if [[ "$target_hash" == "$BACKUP_HASH" ]]; then
+        successf "Target already matches the backup; nothing to do."
+        remove_macho_backup "$backup"
+        infof "Backup removed; the installed framework is the original stock build."
+        return 0
+    fi
 
     if [[ -n "$app_path" ]]; then quit_chrome "$app_path" "$assume_yes" || return 1; fi
     write_target "$target" "$backup" "$target_hash" || return 1
@@ -1764,6 +1843,8 @@ do_restore_macho() {
         resign_inside_out "$FRAMEWORK_BUNDLE" "$app_path" || warnf "Re-seal after restore failed; re-run: bash $0 restore \"$app_path\""
     fi
     successf "Original framework restored from backup."
+    remove_macho_backup "$backup"
+    infof "Backup removed; the installed framework is the original stock build."
     return 0
 }
 
@@ -1944,6 +2025,13 @@ cleanup() {
     for t in "${WORK_FILE:-}" "${WRITE_TMP:-}" "${META_TMP:-}"; do
         [[ -n "$t" && -f "$t" ]] && rm -f -- "$t"
     done
+    # On failure, hold a double-clicked terminal open so the error stays visible.
+    # Skip when scripting (--quiet) or with no interactive terminal (CI/pipes/tests).
+    if (( rc != 0 )) && ! ${QUIET:-false} && [[ -t 0 && -t 1 ]]; then
+        echo
+        read -n 1 -s -r -p "Press any key to exit..." || true
+        echo
+    fi
     return "$rc"
 }
 trap cleanup EXIT

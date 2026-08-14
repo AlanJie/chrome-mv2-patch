@@ -52,6 +52,11 @@ def main():
 
     restore(target, sigs)
     A.eq(T.byte_at(target, 0x144), 0x7F, "restore should recover stock byte")
+    A.true(not Path(f"{target}.bak").exists(), "restore should remove the backup")
+    A.true(not Path(f"{target}.bak.meta").exists(), "restore should remove the backup metadata")
+
+    # target is stock again; re-patch to recreate a backup for the remaining sub-tests
+    patch(target, sigs)
 
     # unrelated modification must be refused and preserved
     T.poke(target, 0x220, 0xA5)
@@ -65,6 +70,7 @@ def main():
     A.true(restore(target, sigs).returncode != 0, "stale restore should fail closed")
     A.true(restore(target, sigs, "--force-restore").returncode == 0, "forced stale restore should succeed")
     A.eq(T.byte_at(target, 0x144), 0x7F, "forced stale restore should recover backup")
+    A.true(not Path(f"{target}.bak").exists(), "forced restore should also remove the backup")
 
     # partial layout: declined by default, no backup; flips with --allow-partial
     partial = tmp / "partial fixture"
@@ -79,6 +85,7 @@ def main():
     A.eq(T.byte_at(partial, 0x144), 0xEB, "explicit partial patch should flip located gate")
     restore(partial, psig)
     A.eq(T.byte_at(partial, 0x144), 0x7F, "partial-mode backup should remain restorable")
+    A.true(not Path(f"{partial}.bak").exists(), "restore should remove the partial backup")
 
     # ambiguous milestones (two tie): declined even with --allow-partial
     amb = tmp / "ambiguous fixture"
@@ -101,15 +108,18 @@ def main():
         {"name": "near-gate", "kind": "near", "jgRVA": "0x00400044", "jgOff": 4, "expectedMatches": 1, "sig": "837F50020F8F8B000000488B"}]}]}))
     A.true(check(mixed, msig).returncode != 0, "mixed near pair should fail check")
 
-    # corrupt section table: check must fail
+    # corrupt section table: check must fail (target is stock here after the
+    # forced restore above, so it is a valid clean ELF to corrupt)
     bad = tmp / "bad elf"
-    T.copy(f"{target}.bak", bad)
+    T.copy(target, bad)
     with open(bad, "r+b") as f:
         f.seek(0x28)
         f.write(b"\xff\xff\xff\x7f\x00\x00\x00\x00")
     A.true(check(bad, sigs).returncode != 0, "out-of-bounds section table should fail")
 
-    # tampered backup metadata: restore must fail
+    # tampered backup metadata: restore must fail (re-patch to recreate a backup,
+    # since the restores above removed it)
+    patch(target, sigs)
     with open(f"{target}.bak.meta", "a") as f:
         f.write("sha256=bad\n")
     A.true(restore(target, sigs).returncode != 0, "tampered backup metadata should fail restore")
@@ -137,6 +147,7 @@ def main():
     A.is_file(f"{a64}.bak", "arm64 patch should create backup")
     restore(a64, a64sig)
     A.eq(T.byte_at(a64, 0x144), 0x8C, "arm64 restore should recover stock b.gt")
+    A.true(not Path(f"{a64}.bak").exists(), "arm64 restore should remove the backup")
     A.true(patch(a64, sigs).returncode != 0, "elf (x86_64) table must not patch an elf-arm64 binary")
 
     print(f"Bash tests passed: {A.passed} assertions")

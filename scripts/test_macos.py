@@ -66,6 +66,8 @@ def main():
     cmd("restore", target, sigs)
     A.eq(T.byte_at(target, x64_jg), 0x7F, "restore recovers x64 stock byte")
     A.eq(nib(target, arm_jg), 0x0C, "arm64 still stock after restore (GT)")
+    A.true(not Path(f"{target}.bak").exists(), "restore should remove the backup")
+    A.true(not Path(f"{target}.bak.meta").exists(), "restore should remove the backup metadata")
 
     # --- host-aware default on Apple Silicon --------------------------------
     # On an arm64 host the arm64 slice is the default target and is patched with
@@ -86,6 +88,7 @@ def main():
     # full restore -> arm64 slice stock again
     cmd("restore", ahost, sigs, env=ENV_ARM)
     A.eq(nib(ahost, aarm_jg), 0x0C, "restore recovers arm64 stock (GT)")
+    A.true(not Path(f"{ahost}.bak").exists(), "arm64-host restore should remove the backup")
 
     # refuse to overwrite unrelated modifications
     cmd("patch", target, sigs)

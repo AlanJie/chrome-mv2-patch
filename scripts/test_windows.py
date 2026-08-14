@@ -113,6 +113,11 @@ try {
     Assert-True ((Get-FileHash -LiteralPath $target -Algorithm SHA256).Hash -eq $patchedHash) 'idempotent re-patch should not rewrite different bytes'
     Assert-True ((Invoke-Restore -Target $targetObj -AssumeYes $true) -eq 0) 'verified restore should succeed'
     Assert-True (([IO.File]::ReadAllBytes($target))[0x444] -eq 0x7F) 'restore should recover stock byte'
+    Assert-True (-not (Test-Path -LiteralPath "$target.bak")) 'restore should remove the backup'
+    Assert-True (-not (Test-Path -LiteralPath "$target.bak.json")) 'restore should remove the backup metadata'
+    # target is stock again; re-patch to recreate a backup for the remaining sub-tests
+    Assert-True ((Invoke-Patch -Target $targetObj -AssumeYes $true) -eq 0) 're-patch after restore should recreate the backup'
+    Assert-True (Test-Path -LiteralPath "$target.bak") 're-patch should recreate the backup'
     $unrelated = [IO.File]::ReadAllBytes($target)
     $unrelated[0x620] = 0xA5
     [IO.File]::WriteAllBytes($target, $unrelated)
@@ -195,6 +200,7 @@ try {
     Assert-True ((Get-FileHash -LiteralPath $armTarget -Algorithm SHA256).Hash -eq $armHash) 'idempotent arm64 re-patch should not rewrite different bytes'
     Assert-True ((Invoke-Restore -Target $armObj -AssumeYes $true) -eq 0) 'arm64 restore should succeed'
     Assert-True (([IO.File]::ReadAllBytes($armTarget))[0x444] -eq 0x8C) 'restore should recover the stock b.gt byte'
+    Assert-True (-not (Test-Path -LiteralPath "$armTarget.bak")) 'arm64 restore should remove the backup'
     $script:Signatures = $sigPath
 
     Write-Host "PowerShell tests passed: $passed assertions"

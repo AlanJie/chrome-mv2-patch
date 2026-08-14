@@ -61,7 +61,7 @@
     Force close a running Chrome without asking.
 
     .PARAMETER Quiet
-    Do not pause for 'Press Enter' on exit (for scripting).
+    Do not pause on error ('Press any key to exit') (for scripting).
 
     .PARAMETER AllowPartial
     Developer-only override which permits writing a milestone when only some of
@@ -704,6 +704,19 @@ function Write-AtomicFile {
 
 function Get-BackupMetadataPath { param([string]$BackupPath) return "$BackupPath.json" }
 
+# Delete a backup and its metadata sidecar. Called after a successful restore:
+# the installed DLL is now the verified original, so the backup has served its
+# purpose. A later 'patch' recreates it from the restored stock DLL.
+function Remove-BackupFiles {
+    param([string]$BackupPath)
+    foreach ($p in @($BackupPath, (Get-BackupMetadataPath $BackupPath))) {
+        if (Test-Path -LiteralPath $p -PathType Leaf) {
+            try { Remove-Item -LiteralPath $p -Force -ErrorAction Stop }
+            catch { Write-Warn "Could not remove backup file ${p}: $_" }
+        }
+    }
+}
+
 function Save-BackupSnapshot {
     param([string]$TargetPath, [string]$BackupPath, [byte[]]$Buf, $Identity)
 
@@ -999,8 +1012,10 @@ function Test-PatchOutput {
 function Get-CleanStockLayout {
     param([byte[]]$Buf, $Img, [array]$Milestones, [bool]$AllowPartialLayout = $false)
     $copy = [byte[]]$Buf.Clone()
+    # This is a validation probe (no write). Suppress the per-site "stock jg at
+    # RVA ..." host output (stream 6) - callers print their own one-line summary.
     $probe = Invoke-PatchMilestones -Buf $copy -Img $Img -Milestones $Milestones `
-        -AllowPartial $AllowPartialLayout -Apply $false
+        -AllowPartial $AllowPartialLayout -Apply $false 6>$null
     $clean = ($probe.Status -ne 0 -and $probe.Stock -gt 0 -and $probe.Already -eq 0 -and
         ($probe.Full -or $AllowPartialLayout) -and -not $probe.Reason)
     return [pscustomobject]@{ Clean = $clean; Probe = $probe }
@@ -1791,6 +1806,8 @@ function Invoke-Restore {
         Write-Err 'Backup is not a recognized clean stock layout.'
         return 1
     }
+    Write-Ok ("Backup verified: clean stock Chrome {0} ({1}/{2} MV2 gate sites intact)." -f `
+        $backupLayout.Probe.Milestone, $backupLayout.Probe.Located, $backupLayout.Probe.Total)
 
     $current = [IO.File]::ReadAllBytes($Target.Path)
     $currentImg = Open-Image $current
@@ -1805,6 +1822,8 @@ function Invoke-Restore {
     }
     if ($currentIdentity.SHA256 -eq $backup.Identity.SHA256) {
         Write-Success 'Target already matches the verified backup; no write was needed.'
+        Remove-BackupFiles $backupPath
+        Write-Info 'Backup removed; the installed DLL is the original stock build.'
         return 0
     }
     if (-not (Request-TargetUnlock -Target $Target -AssumeYes $AssumeYes)) {
@@ -1815,6 +1834,8 @@ function Invoke-Restore {
     $afterHash = (Get-FileHash -LiteralPath $Target.Path -Algorithm SHA256).Hash.ToLowerInvariant()
     if ($afterHash -ne $backup.Identity.SHA256) { throw 'post-restore SHA-256 verification failed' }
     Write-Success 'Original binary successfully restored from backup!'
+    Remove-BackupFiles $backupPath
+    Write-Info 'Backup removed; the installed DLL is the original stock build.'
     return 0
 }
 
@@ -1894,7 +1915,9 @@ function Invoke-Main {
         if (-not $alreadyTried) {
             $childCode = Invoke-SelfElevate -ResolvedTargetPath ([IO.Path]::GetFullPath($target.Path))
             if ($null -ne $childCode) {
-                # The elevated child owns the console output.
+                # The elevated child ran in its own window and already paused on
+                # any error of its own, so don't pause again here.
+                $script:SuppressPause = $true
                 return $childCode
             }
             return 1
@@ -1907,7 +1930,21 @@ function Invoke-Main {
     return (Invoke-Patch -Target $target -AssumeYes $Yes.IsPresent)
 }
 
+# Set true when an elevated child ran: it owns its window and its own error pause.
+$script:SuppressPause = $false
+
 if ($env:MV2_TEST_LIBRARY_ONLY) { return }
 
 $exitCode = Invoke-Main
+
+# On failure, hold a double-clicked window open so the error stays visible. Skip
+# in -Quiet (scripting), when an elevated child already paused on its own error,
+# and when input is redirected (piped/automation) so an unattended run never hangs.
+if ($exitCode -ne 0 -and -not $Quiet -and -not $script:SuppressPause -and -not [Console]::IsInputRedirected) {
+    Write-Host ''
+    Write-Host 'Press any key to exit...' -NoNewline
+    try { [void]$Host.UI.RawUI.ReadKey('NoEcho,IncludeKeyDown') }
+    catch { Read-Host | Out-Null }
+    Write-Host ''
+}
 exit $exitCode
