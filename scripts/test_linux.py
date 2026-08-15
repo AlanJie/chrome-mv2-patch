@@ -87,6 +87,38 @@ def main():
     A.eq(T.byte_at(partial, 0x144), 0x7F, "partial-mode backup should remain restorable")
     A.true(not Path(f"{partial}.bak").exists(), "restore should remove the partial backup")
 
+    # milestone selection prefers the MOST-SPECIFIC full match. Two gates present;
+    # a 1-site milestone AND a 2-site superset both fully match (same container).
+    # The 2-site one must win (so a Chrome multi-site table beats a coexisting
+    # single-site Chromium table on a real Chrome binary, and vice-versa). "small"
+    # is listed first to prove the choice is by specificity, not table order.
+    two = tmp / "two gate fixture"
+    tsig = tmp / "two gate signatures.json"
+    T.make_elf(two, "837E50027F2F554889E5" + "00" * 22 + "837A50027F34488B8A28")
+    tsig.write_text(json.dumps({"milestones": [
+        {"name": "small", "container": "elf", "sites": [
+            {"name": "gate-a", "kind": "short", "jgRVA": "0x00400044", "jgOff": 4, "expectedMatches": 1, "sig": "837E50027F2F554889E5"}]},
+        {"name": "big", "container": "elf", "sites": [
+            {"name": "gate-a", "kind": "short", "jgRVA": "0x00400044", "jgOff": 4, "expectedMatches": 1, "sig": "837E50027F2F554889E5"},
+            {"name": "gate-b", "kind": "short", "jgRVA": "0x00400064", "jgOff": 4, "expectedMatches": 1, "sig": "837A50027F34488B8A28"}]}]}))
+    A.true(patch(two, tsig).returncode == 0, "most-specific full match should patch")
+    A.eq(T.byte_at(two, 0x144), 0xEB, "the 2-site milestone must flip gate A")
+    A.eq(T.byte_at(two, 0x164), 0xEB, "the 2-site milestone must flip gate B (proves 'big' won, not 'small')")
+    restore(two, tsig)
+
+    # two DIFFERENT milestones that each fully match with the SAME site count are a
+    # genuine collision -> declined even though both are full.
+    fullamb = tmp / "full ambiguous fixture"
+    fasig = tmp / "full ambiguous signatures.json"
+    T.make_elf(fullamb, "837E50027F2F554889E5" + "00" * 22 + "837A50027F34488B8A28")
+    fasig.write_text(json.dumps({"milestones": [
+        {"name": "x", "container": "elf", "sites": [
+            {"name": "gate-a", "kind": "short", "jgRVA": "0x00400044", "jgOff": 4, "expectedMatches": 1, "sig": "837E50027F2F554889E5"}]},
+        {"name": "y", "container": "elf", "sites": [
+            {"name": "gate-b", "kind": "short", "jgRVA": "0x00400064", "jgOff": 4, "expectedMatches": 1, "sig": "837A50027F34488B8A28"}]}]}))
+    A.true(patch(fullamb, fasig).returncode != 0, "two equal-size full matches should be declined")
+    A.eq(T.byte_at(fullamb, 0x144), 0x7F, "declined full collision must change nothing")
+
     # ambiguous milestones (two tie): declined even with --allow-partial
     amb = tmp / "ambiguous fixture"
     asig = tmp / "ambiguous signatures.json"

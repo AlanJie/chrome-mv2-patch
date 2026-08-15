@@ -45,7 +45,7 @@
 
 set -euo pipefail
 
-readonly APP_VERSION="1.4.0"
+readonly APP_VERSION="1.5.0"
 
 # ============================================================================
 # Embedded signature tables (pre-tokenized so the default path needs no python3
@@ -76,6 +76,18 @@ S|ManifestV2Handler::IsExtensionAffected / ShouldBlockExtensionEnable (shared bo
 S|ManifestV2Handler::MaybeReEnableExtension (inlined)|short|0x0985B238|4|1|837B50027F30488B8B280200008B413080BB08020000007508
 S|StandardManagementPolicyProvider::UserMayInstall (inlined, near jg)|near|0x0A256BAA|4|1|837B50020F8FD1000000488B8B280200008B413080BB080200000075
 S|StandardManagementPolicyProvider::MustRemainDisabled (inlined, near jg)|near|0x0599A69A|4|1|837E50020F8F8E000000498B8E280200008B41304180BE0802000000
+E
+M|152-chromium-linux|elf
+S|manifest_v2_util::IsExtensionAffected (free predicate)|short|0x0923C9D9|3|1|83FF027F1D83FE087718B90A0100000FA3F1730E83FA050F95
+E
+M|151-chromium-linux|elf
+S|manifest_v2_util::IsExtensionAffected (free predicate)|short|0x09350E79|3|1|83FE027F1D83FA087718BE0A0100000FA3D6730E83F9050F95
+E
+M|151-chromium-linux-xtradeb|elf
+S|ManifestV2Handler::OnExtensionSystemReady|near|0x07A64A55|4|1|837850020F8FD5000000488B90280200008B4A3080B8080200000075
+S|ManifestV2Handler::MaybeReEnableExtension|short|0x07A65559|4|1|837B50027F2F488B8B280200008B413080BB08020000007512
+S|ManagementSetEnabledFunction::CheckManifestV2Deprecation (inlined)|short|0x07DAC2A3|3|1|83FA027F2083F908771BBA0A0100000FA3CA73118B403083F8
+S|StandardManagementPolicyProvider::MustRemainDisabled (inlined)|short|0x08C5DADA|3|1|83FA027F4683F9087741BA0A0100000FA3CA73378B40304531
 E
 M|151-linux-arm64|elf-arm64
 S|ManifestV2Handler::ShouldBlockExtensionInstallation|bcond|0x05E6C0CC|4|1|3F0800716C0100545F040071A10000547F14007164184A7AE0079F1AC0035FD6
@@ -115,6 +127,9 @@ S|ManifestV2Handler::IsExtensionAffected|short|0x048BB6E4|4|1|837E50027F2F554889
 S|ManifestV2Handler::ShouldBlockExtensionInstallation|short|0x075489B8|4|1|837B50027F30488B8B280200008B413080BB08020000007508
 S|ManifestV2Handler::ShouldBlockExtensionInstallation (2)|short|0x07548BB9|3|1|83FF027F1D83FE087718B90A0100000FA3F1730E83FA050F95
 S|StandardManagementPolicyProvider::UserMayInstall|near|0x07F56A10|4|1|837B50020F8FB7000000488B8B280200008B413080BB080200000075
+E
+M|152-chromium-macos-x64|macho-x64
+S|manifest_v2_util::IsExtensionAffected (free predicate)|short|0x04814269|3|1|83FF027F1D83FE087718B90A0100000FA3F1730E83FA050F95
 E
 M|152-macos-arm64|macho-arm64
 S|StandardManagementPolicyProvider::MustRemainDisabled|bcond|0x02218740|4|1|1F090071EC040054891641F9283140B98A2248398A000037296940B93F050071
@@ -164,7 +179,7 @@ rule()     { echo "${C_CYN}=====================================================
 
 banner() {
     rule
-    echo "${C_BOLD}      Google Chrome Manifest V2 Patcher (bash, Unix)       ${C_RESET}"
+    echo "${C_BOLD}    Chrome / Chromium Manifest V2 Patcher (bash, Unix)    ${C_RESET}"
     echo "${C_DIM}                    v${APP_VERSION}                       ${C_RESET}"
     rule
 }
@@ -936,6 +951,13 @@ reset_probe_results() {
     FLIP_NAMES=(); FLIP_KINDS=(); FLIP_OFFSETS=(); FLIP_RELOCATED=()
 }
 
+# Ranking: a milestone whose EVERY site matched (full) always beats a partial
+# one, regardless of raw satisfied count; among full matches the one with MORE
+# sites wins (most specific), so a Chrome build's multi-site table is chosen over
+# a coexisting single-site Chromium table (which shares the container tag) and
+# vice-versa. Among partial matches the most-satisfied one wins. A genuine
+# equal-rank collision (two fulls of the same size, or two equal partials) bumps
+# BEST_TIES, and the callers decline on BEST_TIES > 1.
 probe_slice_pass() {
     local file="$1" base="$2" traw="$3" tvaddr="$4" tsize="$5" container="$6"
     local mi
@@ -958,13 +980,31 @@ probe_slice_pass() {
             fi
         done < <(sites_of "$mi")
 
-        if (( satisfied > BEST_SATISFIED )); then
+        (( satisfied > 0 )) || continue
+        local cand_full=false best_full=false
+        (( satisfied == total )) && cand_full=true
+        (( BEST_SATISFIED > 0 && BEST_SATISFIED == BEST_TOTAL )) && best_full=true
+
+        local take=false tie=false
+        if (( BEST_SATISFIED == 0 )); then
+            take=true                                     # first candidate
+        elif $cand_full && ! $best_full; then
+            take=true                                     # full beats partial
+        elif $cand_full && $best_full && (( total > BEST_TOTAL )); then
+            take=true                                     # more specific full
+        elif ! $cand_full && ! $best_full && (( satisfied > BEST_SATISFIED )); then
+            take=true                                     # more of a partial matched
+        elif { $cand_full && $best_full && (( total == BEST_TOTAL )); } ||
+             { ! $cand_full && ! $best_full && (( satisfied == BEST_SATISFIED )); }; then
+            tie=true                                      # genuine equal-rank collision
+        fi
+
+        if $take; then
             BEST_MS_NAME="$ms_name"; BEST_SATISFIED=$satisfied; BEST_TOTAL=$total
             FLIP_NAMES=("${fn[@]:-}"); FLIP_KINDS=("${fk[@]:-}")
             FLIP_OFFSETS=("${fo[@]:-}"); FLIP_RELOCATED=("${fr[@]:-}")
             BEST_TIES=1
-            (( satisfied == total )) && break
-        elif (( satisfied == BEST_SATISFIED && satisfied > 0 )); then
+        elif $tie; then
             BEST_TIES=$(( BEST_TIES + 1 ))
         fi
     done
@@ -1353,7 +1393,7 @@ slice_decision() {
     local container="$1" allow_partial="$2"
     SKIP_REASON=""
     if (( BEST_SATISFIED == 0 )); then SKIP_REASON="Chrome version not recognized"; return 1; fi
-    if ! $BEST_FULL && (( BEST_TIES > 1 )); then SKIP_REASON="couldn't tell which Chrome version this is"; return 1; fi
+    if (( BEST_TIES > 1 )); then SKIP_REASON="couldn't tell which Chrome version this is"; return 1; fi
     if [[ "$container" != "elf" && "$container" != "elf-arm64" && "$HOST_CONTAINER" != "$container" ]]; then
         SKIP_REASON="not the version your Mac runs"; return 1
     fi
@@ -1427,8 +1467,8 @@ resolve_macho_target() {
     return 0
 }
 
-CHROME_APPS=("Google Chrome.app" "Google Chrome Beta.app" "Google Chrome Dev.app" "Google Chrome Canary.app")
-CHROME_LABELS=("Stable" "Beta" "Dev" "Canary")
+CHROME_APPS=("Google Chrome.app" "Google Chrome Beta.app" "Google Chrome Dev.app" "Google Chrome Canary.app" "Chromium.app")
+CHROME_LABELS=("Stable" "Beta" "Dev" "Canary" "Chromium")
 MAC_LABELS=(); MAC_APPS=(); MAC_VERSIONS=(); MAC_RUNNING=()
 
 enumerate_macos_installs() {
@@ -1474,6 +1514,22 @@ quit_chrome() {
 LINUX_CHANNELS=("Stable" "Beta" "Dev")
 LINUX_DIRS=("/opt/google/chrome" "/opt/google/chrome-beta" "/opt/google/chrome-unstable")
 
+# Chromium (open-source) install layouts vary by distro/packaging; the gate ELF
+# is usually named "chromium" or "chrome" under one of these dirs. Snap/Flatpak
+# builds live on read-only mounts (squashfs/OSTree) and can't be patched in
+# place, so they are NOT auto-listed - extract a Google snapshot or pass an
+# explicit writable path instead.
+CHROMIUM_BINS=(
+    "/usr/lib/chromium/chromium"
+    "/usr/lib/chromium/chrome"
+    "/usr/lib/chromium-browser/chromium-browser"
+    "/usr/lib/chromium-browser/chrome"
+    "/usr/lib64/chromium/chromium"
+    "/usr/lib64/chromium-browser/chromium-browser"
+    "/opt/chromium.org/chromium/chrome"
+    "/opt/chromium/chrome"
+)
+
 chrome_version() {
     local bin="$1" pkg=""
     case "$bin" in
@@ -1483,8 +1539,29 @@ chrome_version() {
     esac
     if [[ -n "$pkg" ]] && command -v dpkg-query >/dev/null 2>&1; then
         dpkg-query -W -f='${Version}\n' "$pkg" 2>/dev/null | grep -o -E '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | head -1 || true
+        return
     elif [[ -n "$pkg" ]] && command -v rpm >/dev/null 2>&1; then
         rpm -q --qf '%{VERSION}\n' "$pkg" 2>/dev/null | grep -o -E '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | head -1 || true
+        return
+    fi
+    # Chromium (any distro/snapshot): no fixed package mapping. Try the common
+    # Chromium package names, then fall back to asking the binary itself
+    # ("Chromium X.Y.Z.W"), which is cheap - --version prints and exits.
+    local p ver
+    if command -v dpkg-query >/dev/null 2>&1; then
+        for p in chromium chromium-browser; do
+            ver=$(dpkg-query -W -f='${Version}\n' "$p" 2>/dev/null | grep -o -E '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | head -1 || true)
+            [[ -n "$ver" ]] && { echo "$ver"; return; }
+        done
+    fi
+    if command -v rpm >/dev/null 2>&1; then
+        for p in chromium chromium-browser; do
+            ver=$(rpm -q --qf '%{VERSION}\n' "$p" 2>/dev/null | grep -o -E '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | head -1 || true)
+            [[ -n "$ver" ]] && { echo "$ver"; return; }
+        done
+    fi
+    if [[ -x "$bin" ]]; then
+        "$bin" --version 2>/dev/null | grep -o -E '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | head -1 || true
     fi
 }
 
@@ -1574,7 +1651,7 @@ elf_patch_state() {
     FAST_PROBE_ONLY=true
     probe_slice_pass "$f" "${SLICE_BASE[0]}" "${SLICE_TRAW[0]}" "${SLICE_TVADDR[0]}" "${SLICE_TSIZE[0]}" "${SLICE_CONTAINER[0]}"
     FAST_PROBE_ONLY=false
-    if (( BEST_SATISFIED == 0 )) || { ! $BEST_FULL && (( BEST_TIES > 1 )); }; then echo ""; return; fi
+    if (( BEST_SATISFIED == 0 )) || { (( BEST_TIES > 1 )); }; then echo ""; return; fi
     classify_flip_states_slice "$f" 2>/dev/null || { echo ""; return; }
     if (( STATE_STOCK > 0 && STATE_PATCHED == 0 )); then echo "not patched"
     elif (( STATE_STOCK == 0 && STATE_PATCHED > 0 )); then echo "patched"
@@ -1583,16 +1660,31 @@ elf_patch_state() {
 
 enumerate_linux_installs() {
     LNX_CHANNELS=(); LNX_PATHS=(); LNX_VERSIONS=(); LNX_RUNNING=(); LNX_HOLDERS=(); LNX_BACKUPS=(); LNX_STATE=()
-    local i
+    local labels=() bins=() i
+    # Google Chrome channels first (gate ELF is <dir>/chrome)...
     for (( i = 0; i < ${#LINUX_CHANNELS[@]}; i++ )); do
-        local bin="${LINUX_DIRS[$i]}/chrome"
-        if [[ ! -f "$bin" ]]; then continue; fi
-        local ver holders has_backup running state
+        labels+=("${LINUX_CHANNELS[$i]}"); bins+=("${LINUX_DIRS[$i]}/chrome")
+    done
+    # ...then the open-source Chromium candidates.
+    for (( i = 0; i < ${#CHROMIUM_BINS[@]}; i++ )); do
+        labels+=("Chromium"); bins+=("${CHROMIUM_BINS[$i]}")
+    done
+
+    local seen="" bin label rp ver holders has_backup running state
+    for (( i = 0; i < ${#bins[@]}; i++ )); do
+        bin="${bins[$i]}"; label="${labels[$i]}"
+        [[ -f "$bin" ]] || continue
+        # Only patchable ELF binaries qualify - skips launcher shell scripts that
+        # some distros name "chromium"/"chromium-browser" beside the real ELF.
+        parse_elf "$bin" >/dev/null 2>&1 || continue
+        rp=$(readlink -f "$bin" 2>/dev/null || echo "$bin")
+        case " $seen " in *" $rp "*) continue ;; esac   # a distro may list a path twice
+        seen="$seen $rp"
         ver=$(chrome_version "$bin"); holders=$(proc_holders "$bin")
         if (( holders > 0 )); then running=true; else running=false; fi
         if [[ -f "${bin}.bak" ]]; then has_backup=true; else has_backup=false; fi
         state=$(elf_patch_state "$bin")
-        LNX_CHANNELS+=("${LINUX_CHANNELS[$i]}"); LNX_PATHS+=("$bin"); LNX_VERSIONS+=("$ver")
+        LNX_CHANNELS+=("$label"); LNX_PATHS+=("$bin"); LNX_VERSIONS+=("$ver")
         LNX_RUNNING+=("$running"); LNX_HOLDERS+=("$holders"); LNX_BACKUPS+=("$has_backup"); LNX_STATE+=("$state")
     done
 }
@@ -1638,7 +1730,7 @@ read_custom_path() {
 choose_linux_install() {
     local count=${#LNX_CHANNELS[@]}
     if (( count == 0 )); then
-        warnf "Couldn't find Chrome on this computer."
+        warnf "Couldn't find Chrome or Chromium on this computer."
         echo ""
         if read_custom_path; then TARGET_FILE="$CHOSEN_CUSTOM_PATH"; return 0; fi
         infof "No path entered - nothing was changed."
@@ -1695,7 +1787,7 @@ choose_linux_install() {
 choose_macos_install() {
     local count=${#MAC_APPS[@]} i
     if (( count == 0 )); then
-        warnf "Couldn't find Google Chrome on this Mac."
+        warnf "Couldn't find Google Chrome or Chromium on this Mac."
         echo "    Give the path, e.g. bash $0 patch \"/path/to/Google Chrome.app\""
         return 1
     fi
@@ -1738,7 +1830,7 @@ do_patch_elf() {
         warnf "This Chrome version isn't recognized - nothing was changed."
         return 1
     fi
-    if ! $BEST_FULL && (( BEST_TIES > 1 )); then
+    if (( BEST_TIES > 1 )); then
         warnf "Couldn't tell which Chrome version this is - nothing was changed."
         return 1
     fi
@@ -1800,7 +1892,7 @@ do_patch_elf() {
         warnf "This Chrome version isn't recognized."
         rm -f -- "$work_file"; WORK_FILE=""; return 1
     fi
-    if ! $BEST_FULL && (( BEST_TIES > 1 )); then
+    if (( BEST_TIES > 1 )); then
         warnf "Couldn't tell which Chrome version this is - nothing was changed."
         rm -f -- "$work_file"; WORK_FILE=""; return 1
     fi
@@ -1899,7 +1991,7 @@ do_check_elf() {
     probe_slice 0 "$target"
     if (( BEST_SATISFIED == 0 )); then
         warnf "This Chrome version isn't recognized yet."
-    elif ! $BEST_FULL && (( BEST_TIES > 1 )); then
+    elif (( BEST_TIES > 1 )); then
         warnf "Couldn't tell which Chrome version this is."
     else
         classify_flip_states_slice "$target" || { warnf "Chrome looks partly changed or damaged."; return 1; }
@@ -1935,7 +2027,7 @@ do_check_macho() {
         probe_slice "$idx" "$target"
         if (( BEST_SATISFIED == 0 )); then
             warnf "  ${c#macho-}: this Chrome version isn't recognized yet."
-        elif ! $BEST_FULL && (( BEST_TIES > 1 )); then
+        elif (( BEST_TIES > 1 )); then
             warnf "  ${c#macho-}: couldn't tell which Chrome version this is."
         else
             if classify_flip_states_slice "$target"; then
@@ -2140,9 +2232,9 @@ print_usage() {
     cat <<EOF
 Usage: bash chrome-mv2.sh [command] [path] [options]
 
-Turns Manifest V2 extension support back on in Google Chrome. Works on both
-Linux (the chrome binary) and macOS (Google Chrome.app). On macOS it also
-re-signs the app so it opens normally.
+Turns Manifest V2 extension support back on in Google Chrome or Chromium. Works
+on both Linux (the chrome/chromium binary) and macOS (Google Chrome.app or
+Chromium.app). On macOS it also re-signs the app so it opens normally.
 
 Commands:
   patch                  Turn Manifest V2 back on (default).
@@ -2150,8 +2242,8 @@ Commands:
   check                  Show the current status. Changes nothing.
 
 Arguments:
-  path                   Path to Chrome. On macOS, a Google Chrome.app also works.
-                         If left out, installed Chrome is found automatically.
+  path                   Path to Chrome/Chromium. On macOS a .app also works.
+                         If left out, an installed browser is found automatically.
 
 Options:
   -y, --yes              Close a running Chrome without asking.
@@ -2229,7 +2321,7 @@ main() {
         [[ -e "$target_path" ]] || { errf "That path doesn't exist: ${target_path}"; exit 1; }
         resolve_any_target "$target_path" || exit 1
     elif [[ "$(uname -s 2>/dev/null || echo)" == "Darwin" ]]; then
-        infof "Looking for Chrome..."
+        infof "Looking for Chrome or Chromium..."
         enumerate_macos_installs
         if $QUIET; then
             (( ${#MAC_APPS[@]} == 1 )) || { errf "With --quiet, give the path to the Chrome you want."; exit 1; }
@@ -2240,11 +2332,11 @@ main() {
         APP_PATH="${MAC_APPS[$CHOSEN_INDEX]}"; TARGET_CONTAINER="macho"
         resolve_framework_from_app "$APP_PATH" || { errf "Couldn't find Chrome inside ${APP_PATH}"; exit 1; }
     else
-        infof "Looking for Chrome..."
+        infof "Looking for Chrome or Chromium..."
         enumerate_linux_installs
         if $QUIET; then
             if (( ${#LNX_CHANNELS[@]} == 0 )); then
-                errf "Couldn't find Chrome on this computer."
+                errf "Couldn't find Chrome or Chromium on this computer."
                 echo "    Give the path, e.g. sudo bash $0 patch /path/to/chrome"; exit 1
             fi
             if (( ${#LNX_CHANNELS[@]} > 1 )); then

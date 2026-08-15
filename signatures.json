@@ -732,6 +732,101 @@
           "sig": "1F0900710C020054691641F96A224839283140B98A000037296940B93F050071"
         }
       ]
+    },
+    {
+      "name": "152-chromium-linux",
+      "container": "elf",
+      "sites": [
+        {
+          "name": "manifest_v2_util::IsExtensionAffected (free predicate)",
+          "kind": "short",
+          "jgRVA": "0x0923C9D9",
+          "jgOff": 3,
+          "expectedMatches": 1,
+          "sig": "83FF027F1D83FE087718B90A0100000FA3F1730E83FA050F95"
+        }
+      ]
+    },
+    {
+      "name": "152-chromium",
+      "container": "pe",
+      "sites": [
+        {
+          "name": "manifest_v2_util::IsExtensionAffected (free predicate)",
+          "kind": "short",
+          "jgRVA": "0x04723915",
+          "jgOff": 3,
+          "expectedMatches": 1,
+          "sig": "83F9027F1F83FA08771AB90A0100000FA3D173104183F8050F"
+        }
+      ]
+    },
+    {
+      "name": "152-chromium-macos-x64",
+      "container": "macho-x64",
+      "sites": [
+        {
+          "name": "manifest_v2_util::IsExtensionAffected (free predicate)",
+          "kind": "short",
+          "jgRVA": "0x04814269",
+          "jgOff": 3,
+          "expectedMatches": 1,
+          "sig": "83FF027F1D83FE087718B90A0100000FA3F1730E83FA050F95"
+        }
+      ]
+    },
+    {
+      "name": "151-chromium-linux",
+      "container": "elf",
+      "sites": [
+        {
+          "name": "manifest_v2_util::IsExtensionAffected (free predicate)",
+          "kind": "short",
+          "jgRVA": "0x09350E79",
+          "jgOff": 3,
+          "expectedMatches": 1,
+          "sig": "83FE027F1D83FA087718BE0A0100000FA3D6730E83F9050F95"
+        }
+      ]
+    },
+    {
+      "name": "151-chromium-linux-xtradeb",
+      "container": "elf",
+      "_comment": "Distro build (Ubuntu ppa:xtradeb/apps, 151.0.7922.108) - clang inlines the predicate, so this is a 4-site table (not the single free predicate of Google's build). Derived symbol-verified from the PPA's chromium-dbgsym; re-derive after an xtradeb rebuild.",
+      "sites": [
+        {
+          "name": "ManifestV2Handler::OnExtensionSystemReady",
+          "kind": "near",
+          "jgRVA": "0x07A64A55",
+          "jgOff": 4,
+          "expectedMatches": 1,
+          "sig": "837850020F8FD5000000488B90280200008B4A3080B8080200000075"
+        },
+        {
+          "name": "ManifestV2Handler::MaybeReEnableExtension",
+          "kind": "short",
+          "jgRVA": "0x07A65559",
+          "jgOff": 4,
+          "expectedMatches": 1,
+          "sig": "837B50027F2F488B8B280200008B413080BB08020000007512"
+        },
+        {
+          "name": "ManagementSetEnabledFunction::CheckManifestV2Deprecation (inlined predicate)",
+          "kind": "short",
+          "jgRVA": "0x07DAC2A3",
+          "jgOff": 3,
+          "expectedMatches": 1,
+          "sig": "83FA027F2083F908771BBA0A0100000FA3CA73118B403083F8"
+        },
+        {
+          "name": "StandardManagementPolicyProvider::MustRemainDisabled (inlined predicate)",
+          "kind": "short",
+          "jgRVA": "0x08C5DADA",
+          "jgOff": 3,
+          "expectedMatches": 1,
+          "sig": "83FA027F4683F9087741BA0A0100000FA3CA73378B40304531"
+        }
+      ]
     }
   ]
 }

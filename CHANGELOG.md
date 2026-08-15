@@ -1,5 +1,9 @@
 # Changelog
 
+## [1.5.0] - 2026-08-15
+
+- Chromium support.
+
 ## [1.4.0] - 2026-08-14
 
 - Linux ARM (arm64) support.

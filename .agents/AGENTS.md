@@ -66,7 +66,11 @@ The runtime scripts intentionally implement the same safety contract:
 - Mask only the jump opcode and displacement.
 - Require each site's exact `expectedMatches` count.
 - Choose the best milestone and decline ambiguous or incomplete layouts by
-  default.
+  default. Selection prefers a **full** match (every site satisfied) over any
+  partial one, and among full matches the one with the **most sites** (most
+  specific) - so Chrome and Chromium tables that share a container tag never
+  cross-match. A genuine equal-rank collision (two fulls of the same size)
+  declines.
 - Treat stock and already-patched opcodes as valid for idempotent reruns.
 - Verify prepared and written output.
 - Preserve a validated, build-specific stock backup.
@@ -108,7 +112,13 @@ See [`scripts/README.md`](../scripts/README.md) for the complete workflow.
 - `fetch_chrome_binary.py`: fetch and unwrap a stock `chrome.dll` (x64, x86, or
   arm64 `win-arm64` via the enterprise MSI), Linux `chrome`, or the macOS
   universal framework (`mac-x64`/`mac-arm64`) into `_scratch/`. Requires Python
-  and 7-Zip.
+  and 7-Zip. `--browser chromium` instead fetches an open-source Chromium
+  continuous-build snapshot (`--milestone`/`--position`, else trunk `LAST_CHANGE`;
+  no Linux-arm64 snapshot exists). Chromium is NOT PGO-built, so its MV2 gate is a
+  single shared `manifest_v2_util::IsExtensionAffected` predicate (not Chrome's
+  5-7 inlined sites) — derive it as a `<ver>-chromium` milestone (same container
+  tag). Snapshots are unstripped, so Linux/mac gates are symbol-named from the
+  binary itself.
 - `fetch_symbols.py`: fetch the matching PDB (Windows), `chrome.debug` (Linux),
   or stream the official dSYM's symtab (macOS) into `_scratch/`.
 - `symbols_from_pdb.py`: resolve Windows PDB symbols through `dbghelp`.

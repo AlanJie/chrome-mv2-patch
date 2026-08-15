@@ -1,13 +1,14 @@
 <#
 .SYNOPSIS
-    Google Chrome Manifest V2 Patcher - single-file, self-contained PowerShell
+    Chrome / Chromium Manifest V2 Patcher - single-file, self-contained PowerShell
     port for Windows (chrome.dll only; x64, x86, and arm64).
 
 .DESCRIPTION
-    Re-enables Manifest V2 extension support in Google Chrome by flipping the
-    inlined IsExtensionAffected manifest-version checks. Same milestone engine,
-    same match/decline semantics, same .bak handling. Handles x64/x86 (PE, PE32)
-    and Windows-on-ARM (PE32+ arm64, machine 0xAA64).
+    Re-enables Manifest V2 extension support in Google Chrome or Chromium (both
+    ship chrome.dll) by flipping the inlined IsExtensionAffected manifest-version
+    checks. Same milestone engine, same match/decline semantics, same .bak
+    handling. Handles x64/x86 (PE, PE32) and Windows-on-ARM (PE32+ arm64, machine
+    0xAA64).
 
     Self-contained: the Windows signature tables are EMBEDDED in this file
     ($EmbeddedSignatures below), so the script needs no signatures.json and no
@@ -116,7 +117,7 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$AppVersion      = '1.4.0'
+$AppVersion      = '1.5.0'
 $SignaturesFile  = 'signatures.json'
 $script:CsLoaded = $false
 
@@ -143,7 +144,8 @@ $EmbeddedSignatures = @'
     {"name":"151-x86","container":"pe32","sites":[{"name":"OnExtensionSystemReady startup loop","kind":"short","jgRVA":"0x00B20DB9","jgOff":4,"expectedMatches":1,"sig":"837928027F2C8B91640100008B421880B95401000000750C8B"},{"name":"MustRemainDisabled (inlined)","kind":"short","jgRVA":"0x0111E3EC","jgOff":3,"expectedMatches":1,"sig":"83FA027F728B491883F801756031DB83F905740583F90A752B"},{"name":"ShouldBlockExtensionEnable","kind":"short","jgRVA":"0x029E11BE","jgOff":3,"expectedMatches":1,"sig":"83FA027F2B8B491883F801751983F9050F95C283F90A0F95C0"},{"name":"IsExtensionAffected","kind":"short","jgRVA":"0x07022F9A","jgOff":4,"expectedMatches":1,"sig":"837A28027F368B8A640100008B411880BA540100000075088B"},{"name":"ShouldBlockExtensionInstallation","kind":"short","jgRVA":"0x07022FE7","jgOff":4,"expectedMatches":1,"sig":"837D08027F278B450C83F80175158B451083F8050F95C183F8"},{"name":"MaybeReEnableExtension","kind":"short","jgRVA":"0x0702310D","jgOff":4,"expectedMatches":1,"sig":"837E28027F248B8E640100008B411880BE540100000075088B"},{"name":"UserMayInstall (inlined)","kind":"short","jgRVA":"0x079D46E7","jgOff":3,"expectedMatches":1,"sig":"83FA027F338B491883F8010F85FD00000083F905742283F90A"}]},
     {"name":"152-x86","container":"pe32","sites":[{"name":"manifest_v2_util::IsExtensionAffected (free predicate; covers install thunk)","kind":"short","jgRVA":"0x06FB7547","jgOff":4,"expectedMatches":1,"sig":"837D08027F278B4D0C31C083F908771FBA0A0100000FA3CA73"},{"name":"ShouldBlockExtensionEnable / IsExtensionAffected (shared body)","kind":"short","jgRVA":"0x0299ED6A","jgOff":4,"expectedMatches":2,"sig":"837A28027F368B8A640100008B411880BA540100000075088B"},{"name":"OnExtensionSystemReady startup loop","kind":"short","jgRVA":"0x00A580A6","jgOff":4,"expectedMatches":1,"sig":"837928027F2C8B91640100008B421880B95401000000750C8B"},{"name":"MaybeReEnableExtension","kind":"short","jgRVA":"0x06FB736D","jgOff":4,"expectedMatches":1,"sig":"837E28027F248B8E640100008B411880BE540100000075088B"},{"name":"UserMayInstall (inlined)","kind":"short","jgRVA":"0x0791012F","jgOff":4,"expectedMatches":1,"sig":"837F28027F458B8F640100008B411880BF5401000000750C8B"},{"name":"MustRemainDisabled (inlined, near jg)","kind":"near","jgRVA":"0x010851A8","jgOff":4,"expectedMatches":1,"sig":"837B28020F8F840000008B8B640100008B411880BB54010000007508"}]},
     {"name":"151-win-arm64","container":"pe-arm64","sites":[{"name":"ManifestV2Handler::OnExtensionSystemReady","kind":"bcond","jgRVA":"0x01058388","jgOff":4,"expectedMatches":1,"sig":"3F0900718C010054091541F90A214839283140B98A000037296940B93F050071"},{"name":"StandardManagementPolicyProvider::MustRemainDisabled","kind":"bcond","jgRVA":"0x0125352C","jgOff":4,"expectedMatches":1,"sig":"5F0900716C050054293140B91F050071810400543F150071F4031F2A60000054"},{"name":"ManifestV2Handler::ShouldBlockExtensionEnable","kind":"bcond","jgRVA":"0x02C0729C","jgOff":4,"expectedMatches":1,"sig":"5F090071CC010054293140B91F050071E10000543F15007124194A7AE0079F1A"},{"name":"MV2DeprecationImpactChecker::IsExtensionAffected","kind":"bcond","jgRVA":"0x02C07334","jgOff":4,"expectedMatches":1,"sig":"1F0900710C020054291441F92A204839283140B98A000037296940B93F050071"},{"name":"ManifestV2Handler::ShouldBlockExtensionInstallation","kind":"bcond","jgRVA":"0x07836B6C","jgOff":4,"expectedMatches":1,"sig":"3F0800716C0100545F040071A10000547F14007164184A7AE0079F1AC0035FD6"},{"name":"ManifestV2Handler::MaybeReEnableExtension","kind":"bcond","jgRVA":"0x07836C94","jgOff":4,"expectedMatches":1,"sig":"1F0900710C020054691641F96A224839283140B98A000037296940B93F050071"},{"name":"StandardManagementPolicyProvider::UserMayInstall","kind":"bcond","jgRVA":"0x082F94F8","jgOff":4,"expectedMatches":1,"sig":"5F090071EC010054293140B91F050071610700543F150071400100543F290071"}]},
-    {"name":"152-win-arm64","container":"pe-arm64","sites":[{"name":"ManifestV2Handler::OnExtensionSystemReady","kind":"bcond","jgRVA":"0x01014CBC","jgOff":4,"expectedMatches":1,"sig":"3F0900718C010054091541F90A214839283140B98A000037296940B93F050071"},{"name":"StandardManagementPolicyProvider::MustRemainDisabled / StandardManagementPolicyProvider::UserMayInstall (shared body)","kind":"bcond","jgRVA":"0x013591BC","jgOff":4,"expectedMatches":2,"sig":"1F090071EC050054891641F98A224839283140B98A000037296940B93F050071"},{"name":"ManifestV2Handler::ShouldBlockExtensionEnable / ManifestV2Handler::IsExtensionAffected (shared body)","kind":"bcond","jgRVA":"0x02C1FD9C","jgOff":4,"expectedMatches":2,"sig":"1F0900710C020054291441F92A204839283140B98A000037296940B93F050071"},{"name":"ManifestV2Handler::MaybeReEnableExtension","kind":"bcond","jgRVA":"0x07702AEC","jgOff":4,"expectedMatches":1,"sig":"1F0900710C020054691641F96A224839283140B98A000037296940B93F050071"}]}
+    {"name":"152-win-arm64","container":"pe-arm64","sites":[{"name":"ManifestV2Handler::OnExtensionSystemReady","kind":"bcond","jgRVA":"0x01014CBC","jgOff":4,"expectedMatches":1,"sig":"3F0900718C010054091541F90A214839283140B98A000037296940B93F050071"},{"name":"StandardManagementPolicyProvider::MustRemainDisabled / StandardManagementPolicyProvider::UserMayInstall (shared body)","kind":"bcond","jgRVA":"0x013591BC","jgOff":4,"expectedMatches":2,"sig":"1F090071EC050054891641F98A224839283140B98A000037296940B93F050071"},{"name":"ManifestV2Handler::ShouldBlockExtensionEnable / ManifestV2Handler::IsExtensionAffected (shared body)","kind":"bcond","jgRVA":"0x02C1FD9C","jgOff":4,"expectedMatches":2,"sig":"1F0900710C020054291441F92A204839283140B98A000037296940B93F050071"},{"name":"ManifestV2Handler::MaybeReEnableExtension","kind":"bcond","jgRVA":"0x07702AEC","jgOff":4,"expectedMatches":1,"sig":"1F0900710C020054691641F96A224839283140B98A000037296940B93F050071"}]},
+    {"name":"152-chromium","container":"pe","sites":[{"name":"manifest_v2_util::IsExtensionAffected (free predicate)","kind":"short","jgRVA":"0x04723915","jgOff":3,"expectedMatches":1,"sig":"83F9027F1F83FA08771AB90A0100000FA3D173104183F8050F"}]}
   ]
 }
 '@
@@ -192,7 +194,7 @@ function Write-Rule    { Write-Host "$($C.Cyn)==================================
 
 function Write-Banner {
     Write-Rule
-    Write-Host "$($C.Bold)     Google Chrome Manifest V2 Patcher (PowerShell)        $($C.Reset)"
+    Write-Host "$($C.Bold)    Chrome / Chromium Manifest V2 Patcher (PowerShell)     $($C.Reset)"
     Write-Host "$($C.Dim)                    v$AppVersion                       $($C.Reset)"
     Write-Rule
 }
@@ -858,6 +860,13 @@ function Invoke-PatchMilestones {
         [bool]$Apply = $true
     )
 
+    # Ranking: a milestone whose EVERY site matched (full) always beats a partial
+    # one, regardless of raw satisfied count; among full matches the one with MORE
+    # sites wins (most specific), so a Chrome build's multi-site table is chosen
+    # over a coexisting single-site Chromium table (same container tag) and vice-
+    # versa. Among partials the most-satisfied wins. A genuine equal-rank collision
+    # (two fulls of the same size, or two equal partials) bumps $bestCount and the
+    # caller declines when $bestCount > 1.
     $best = $null
     $bestCount = 0
     foreach ($ms in $Milestones) {
@@ -871,18 +880,31 @@ function Invoke-PatchMilestones {
                 }
             }
         }
-        if ($null -eq $best -or $satisfied -gt $best.Satisfied) {
+        if ($satisfied -eq 0) { continue }
+        $total    = $ms.Sites.Count
+        $candFull = ($satisfied -eq $total)
+        $bestFull = ($null -ne $best -and $best.Satisfied -eq $best.Ms.Sites.Count)
+
+        $take = $false; $tie = $false
+        if ($null -eq $best) {
+            $take = $true                                  # first candidate
+        } elseif ($candFull -and -not $bestFull) {
+            $take = $true                                  # full beats partial
+        } elseif ($candFull -and $bestFull -and $total -gt $best.Ms.Sites.Count) {
+            $take = $true                                  # more specific full
+        } elseif (-not $candFull -and -not $bestFull -and $satisfied -gt $best.Satisfied) {
+            $take = $true                                  # more of a partial matched
+        } elseif (($candFull -and $bestFull -and $total -eq $best.Ms.Sites.Count) -or
+                  (-not $candFull -and -not $bestFull -and $satisfied -eq $best.Satisfied)) {
+            $tie = $true                                   # genuine equal-rank collision
+        }
+
+        if ($take) {
             $best = [pscustomobject]@{ Ms = $ms; Flips = $flips; Satisfied = $satisfied }
             $bestCount = 1
-        } elseif ($satisfied -eq $best.Satisfied -and $satisfied -gt 0) {
+        } elseif ($tie) {
             $bestCount++
         }
-        # Early exit: a milestone that satisfies EVERY site is the definitive
-        # match - no other milestone can beat 100%. Stop here so we do not scan
-        # .text again for the remaining milestone(s). On a relocated point
-        # release every site is a full-.text scan, so skipping the losing
-        # milestone's whole site set is the single biggest time saving here.
-        if ($best.Satisfied -eq $best.Ms.Sites.Count) { break }
     }
 
     $res = [pscustomobject]@{
@@ -897,7 +919,7 @@ function Invoke-PatchMilestones {
     $res.Total     = $best.Ms.Sites.Count
     $res.Full      = ($best.Satisfied -eq $best.Ms.Sites.Count)
 
-    if (-not $res.Full -and $bestCount -gt 1) {
+    if ($bestCount -gt 1) {
         $res.Reason = "$bestCount possible Chrome versions tied - can't tell which one this is"
         Write-Warn $res.Reason
         return $res
@@ -1372,6 +1394,7 @@ $WinChannels = @(
     @{ Name = 'Beta';   Subdir = 'Google\Chrome Beta' }
     @{ Name = 'Dev';    Subdir = 'Google\Chrome Dev' }
     @{ Name = 'Canary'; Subdir = 'Google\Chrome SxS' }   # SxS = Canary's side-by-side dir
+    @{ Name = 'Chromium'; Subdir = 'Chromium' }          # open-source Chromium keeps the chrome.dll name
 )
 
 # True for a Chrome version directory name like "151.0.7922.109" (>= 3 numeric
@@ -1643,7 +1666,7 @@ function Resolve-Target {
         return (Get-InstallDetails -TargetPath $TargetPath -Channel '')
     }
 
-    Write-Info 'Looking for Chrome...'
+    Write-Info 'Looking for Chrome or Chromium...'
     $installs = @(Get-ChromeInstalls)
 
     if ($installs.Count -eq 0) {

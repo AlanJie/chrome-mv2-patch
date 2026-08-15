@@ -6,15 +6,17 @@ Re-enables Manifest V2 extensions in Chrome by patching a few bytes. See [`mv2-r
 
 ### Operating Systems
 
-- ✅ Windows x64, x86, ARM
-- ✅ Linux x64, ARM
-- ✅ macOS x64, ARM
+- ✅ Windows x64, x86
+- ✅ Linux x64
+- 🧪 Windows ARM
+- 🧪 Linux ARM
+- 🧪 macOS x64, ARM
 
 ### Browsers
 
 - ✅ Chrome 151, 152
-- ❌ Chromium (soon)
-- ❌ Edge (soon)
+- 🧪 Chromium 151, 152
+- 🕔 Edge
 
 ## Usage
 
