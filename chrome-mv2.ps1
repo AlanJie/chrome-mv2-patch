@@ -194,8 +194,8 @@ function Write-Rule    { Write-Host "$($C.Cyn)==================================
 
 function Write-Banner {
     Write-Rule
-    Write-Host "$($C.Bold)    Chrome / Chromium Manifest V2 Patcher (PowerShell)     $($C.Reset)"
-    Write-Host "$($C.Dim)                    v$AppVersion                       $($C.Reset)"
+    Write-Host "$($C.Bold)             Chrome MV2 Patcher (PowerShell)              $($C.Reset)"
+    Write-Host "$($C.Dim)                          v$AppVersion                          $($C.Reset)"
     Write-Rule
 }
 
@@ -1447,6 +1447,20 @@ $WinChannels = @(
     @{ Name = 'Chromium'; Subdir = 'Chromium' }          # open-source Chromium keeps the chrome.dll name
 )
 
+# The channel label for a target we were handed as a bare path: an explicit
+# -Path, a typed custom path, or the elevated relaunch, which forwards only the
+# resolved path. Matched on whole path segments, because a plain substring test
+# reads "Google\Chrome Beta" as Stable - "Google\Chrome" is a prefix of it - and
+# so mislabels every non-Stable channel once elevation re-derives the label.
+function Get-ChannelFromPath {
+    param([string]$TargetPath)
+    $hay = '\' + ($TargetPath -replace '/', '\').Trim('\').ToLower() + '\'
+    foreach ($ch in $WinChannels) {
+        if ($hay.Contains('\' + $ch.Subdir.ToLower() + '\')) { return $ch.Name }
+    }
+    return 'Unknown'
+}
+
 # True for a Chrome version directory name like "151.0.7922.109" (>= 3 numeric
 # parts). Used to label the target and to skip non-version subdirectories.
 function Test-LooksLikeVersion {
@@ -1530,13 +1544,7 @@ function Get-InstallDetails {
     $running = ($holders.Count -gt 0)
     if (-not $running) { try { $running = Test-TargetLocked -TargetPath $TargetPath } catch { } }
 
-    if (-not $Channel) {
-        $lower = $TargetPath.ToLower()
-        foreach ($ch in $WinChannels) {
-            if ($lower.Contains($ch.Subdir.ToLower())) { $Channel = $ch.Name; break }
-        }
-        if (-not $Channel) { $Channel = 'Unknown' }
-    }
+    if (-not $Channel) { $Channel = Get-ChannelFromPath $TargetPath }
 
     return [pscustomobject]@{
         Channel   = $Channel

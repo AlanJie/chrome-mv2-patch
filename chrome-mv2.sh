@@ -179,8 +179,8 @@ rule()     { echo "${C_CYN}=====================================================
 
 banner() {
     rule
-    echo "${C_BOLD}    Chrome / Chromium Manifest V2 Patcher (bash, Unix)    ${C_RESET}"
-    echo "${C_DIM}                    v${APP_VERSION}                       ${C_RESET}"
+    echo "${C_BOLD}                Chrome MV2 Patcher (bash)                 ${C_RESET}"
+    echo "${C_DIM}                          v${APP_VERSION}                          ${C_RESET}"
     rule
 }
 
