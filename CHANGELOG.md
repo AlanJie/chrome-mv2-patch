@@ -1,5 +1,9 @@
 # Changelog
 
+## [1.5.1] - 2026-08-21
+
+- Windows fix self-elevation
+
 ## [1.5.0] - 2026-08-15
 
 - Chromium support.

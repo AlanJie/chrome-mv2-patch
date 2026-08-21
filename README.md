@@ -4,6 +4,8 @@ Re-enables Manifest V2 extensions in Chrome by patching a few bytes. See [`mv2-r
 
 ## Supported Versions
 
+✅ Tested, 🧪 Not verified, 🕔 Not needed yet
+
 ### Operating Systems
 
 - ✅ Windows x64, x86
@@ -14,8 +16,8 @@ Re-enables Manifest V2 extensions in Chrome by patching a few bytes. See [`mv2-r
 
 ### Browsers
 
-- ✅ Chrome 151, 152
-- 🧪 Chromium 151, 152
+- ✅ Chrome 151-153
+- 🧪 Chromium 151-153
 - 🕔 Edge
 
 ## Usage

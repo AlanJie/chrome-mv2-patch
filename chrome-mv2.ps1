@@ -117,7 +117,7 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$AppVersion      = '1.5.0'
+$AppVersion      = '1.5.1'
 $SignaturesFile  = 'signatures.json'
 $script:CsLoaded = $false
 
@@ -1187,36 +1187,103 @@ function Get-QuotedArg {
 }
 
 <#
+Recovers this file's own source text, needed when there is no script file to
+point -File at (`irm ... | iex`). $PSCommandPath is empty there, but every
+function in the file was compiled from ONE scriptblock spanning the whole file,
+so that scriptblock's AST hands the text back verbatim.
+
+Returns $null when the text cannot be trusted - notably when the body arrived in
+fragments (pasted into a console chunk by chunk), where the AST covers only the
+fragment that happened to define the function. Both ends of the file must be
+present for the copy to count as whole.
+#>
+function Get-SelfSourceText {
+    $src = $null
+    try { $src = ${function:Invoke-SelfElevate}.Ast.Extent.StartScriptPosition.GetFullScript() }
+    catch { return $null }
+    if (-not $src) { return $null }
+    # A fragment can still parse, and a whole file can still be broken, so check
+    # both: the two ends of the file must be there AND the text must parse. If
+    # either anchor below is ever edited away, the elevation test in
+    # scripts/test_windows.py fails rather than this silently refusing.
+    if ($src -notmatch '(?m)^function Invoke-Main\b') { return $null }
+    if ($src -notmatch '(?m)^exit \$exitCode\s*$') { return $null }
+    $parseErrors = $null
+    [void][System.Management.Automation.Language.Parser]::ParseInput($src, [ref]$null, [ref]$parseErrors)
+    if ($parseErrors -and $parseErrors.Count) { return $null }
+    return $src
+}
+
+<#
+Stages the recovered source in a private temp directory so the elevated child has
+a real file to run. Returns $null when the source could not be recovered.
+
+The staged copy is then held open on a READ handle (FileAccess Read, FileShare
+Read) for as long as the child runs. That combination lets the child open it for
+reading while denying write and delete to everything else, so the file cannot be
+swapped in the window between UAC consent and the elevated child loading it.
+Holding a WRITE handle instead would break the child: its own read open asks for
+a share mode that excludes writers, which our write access would violate.
+#>
+function New-SelfStage {
+    $src = Get-SelfSourceText
+    if (-not $src) { return $null }
+
+    $dir  = Join-Path ([IO.Path]::GetTempPath()) ('chrome-mv2-' + [Guid]::NewGuid().ToString('N'))
+    $path = Join-Path $dir 'chrome-mv2.ps1'
+    try {
+        [void][IO.Directory]::CreateDirectory($dir)
+        # BOM so the child reads it as UTF-8 whatever the host's default is.
+        [IO.File]::WriteAllText($path, $src, (New-Object Text.UTF8Encoding($true)))
+        $handle = [IO.File]::Open($path, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+        return @{ Path = $path; Dir = $dir; Handle = $handle }
+    } catch {
+        Remove-Item -LiteralPath $dir -Recurse -Force -ErrorAction SilentlyContinue
+        return $null
+    }
+}
+
+function Remove-SelfStage {
+    param($Stage)
+    if (-not $Stage) { return }
+    try { $Stage.Handle.Dispose() } catch { }
+    Remove-Item -LiteralPath $Stage.Dir -Recurse -Force -ErrorAction SilentlyContinue
+}
+
+<#
 Re-launches this script elevated via Start-Process -Verb RunAs, which raises the
 UAC consent dialog (a compiled exe would get the same effect from a
 requireAdministrator manifest). Returns the elevated child's
 exit code, or $null when elevation was declined/impossible so the caller can
 fall back to the plain "you need admin" message.
 
-There are TWO launch shapes to handle:
+The child is ALWAYS started as -File <script>, so there is one relaunch shape to
+reason about. Normally the script already is a file on disk ($PSCommandPath is
+set) and is used as-is; under `irm https://.../chrome-mv2.ps1 | iex` there is no
+file, so the source is staged to a temp one first (see New-SelfStage).
 
-  * FILE mode - the normal case: the script is a file on disk ($PSCommandPath is
-    set). Relaunch with -File <script> and the same bound parameters, plus
-    -Relaunched as the loop guard.
+Earlier versions instead replayed the process's own command line under RunAs,
+which meant parsing powershell.exe's argv to find the -Command payload and
+prefixing an `$env:MV2_RELAUNCHED='1';` guard into it. That only ever worked for
+a literal `-Command`/`-EncodedCommand` token: the documented one-liner
+`powershell "irm ...|iex"` puts the command in the implicit positional slot with
+no switch to find, and an abbreviation the host does accept (-Com, -Comm) missed
+too. Both failed with "cannot ask for administrator access this way".
 
-  * REPLAY mode - `irm https://.../chrome-mv2.ps1 | iex`: there is NO script file
-    ($PSCommandPath is empty and the body is not visible to itself), so -File is
-    impossible. Instead replay the process's own command line
-    ([Environment]::GetCommandLineArgs()) verbatim under RunAs, so the elevated
-    child re-fetches and re-runs exactly the same one-liner. The loop guard is
-    injected in-band by prefixing the -Command/-EncodedCommand payload with
-    `$env:MV2_RELAUNCHED='1';` - env vars are NOT reliably inherited across the
-    UAC boundary, so the marker has to live inside the replayed command itself.
+Staging removes that whole class of bug: the loop guard and the target are
+ordinary parameters (-Relaunched, positional path), so nothing has to survive the
+UAC boundary in-band - and env vars would NOT survive it. It also means the
+elevated run is the very code that just ran, instead of a second download.
 
-Details common to both:
+Details:
   * Arguments are quoted so a path with spaces ("C:\Program Files\...") stays one
     argument instead of splitting.
   * -WorkingDirectory is pinned to the current directory (an elevated process
     otherwise starts in system32), so a relative target path still resolves.
   * -Wait -PassThru is required for $p.ExitCode to be populated.
 
-NOTE: file mode forwards parameters explicitly - a new user-facing switch has to
-be added to the $argv list below or it is silently dropped on the elevated run.
+NOTE: parameters are forwarded explicitly - a new user-facing switch has to be
+added to the $argv list below or it is silently dropped on the elevated run.
 #>
 function Invoke-SelfElevate {
     param([string]$ResolvedTargetPath)
@@ -1224,10 +1291,21 @@ function Invoke-SelfElevate {
     $exe = (Get-Process -Id $PID).Path
     if (-not $exe) { $exe = if ($PSVersionTable.PSVersion.Major -ge 6) { 'pwsh.exe' } else { 'powershell.exe' } }
 
-    $fileMode = $PSCommandPath -and (Test-Path -LiteralPath $PSCommandPath -PathType Leaf)
+    $scriptPath = $PSCommandPath
+    $stage = $null
+    if (-not ($scriptPath -and (Test-Path -LiteralPath $scriptPath -PathType Leaf))) {
+        $stage = New-SelfStage
+        if (-not $stage) {
+            # Nothing runnable to hand the elevated child - refuse rather than
+            # risk a UAC loop.
+            Write-Warn 'Cannot ask for administrator access this way; re-run from an admin terminal.'
+            return $null
+        }
+        $scriptPath = $stage.Path
+    }
 
-    if ($fileMode) {
-        $argv = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', (Get-QuotedArg $PSCommandPath), $Command)
+    try {
+        $argv = @('-NoProfile', '-ExecutionPolicy', 'Bypass', '-File', (Get-QuotedArg $scriptPath), $Command)
         if ($ResolvedTargetPath)  { $argv += (Get-QuotedArg $ResolvedTargetPath) }
         if ($Yes)   { $argv += '-Yes' }
         if ($Quiet) { $argv += '-Quiet' }
@@ -1235,47 +1313,19 @@ function Invoke-SelfElevate {
         if ($ForceRestore) { $argv += '-ForceRestore' }
         if ($Signatures) { $argv += '-Signatures'; $argv += (Get-QuotedArg ([IO.Path]::GetFullPath($Signatures))) }
         $argv += '-Relaunched'
-        $argString = $argv -join ' '
-    } else {
-        # REPLAY mode: rebuild from this process's own argv, injecting the guard
-        # into the -Command / -EncodedCommand payload.
-        $raw = [Environment]::GetCommandLineArgs()
-        $targetB64 = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($ResolvedTargetPath))
-        $marker = "`$env:MV2_RELAUNCHED='1'; `$env:MV2_TARGET_B64='$targetB64'; "
-        $rebuilt = New-Object System.Collections.Generic.List[string]
-        $injected = $false
-        for ($i = 1; $i -lt $raw.Count; $i++) {
-            $tok = $raw[$i]
-            if (-not $injected -and $tok -match '^-(c|Command)$' -and ($i + 1) -lt $raw.Count) {
-                $rebuilt.Add($tok)
-                $rebuilt.Add((Get-QuotedArg ($marker + $raw[$i + 1])))
-                $i++; $injected = $true; continue
-            }
-            if (-not $injected -and $tok -match '^-(e|ec|EncodedCommand)$' -and ($i + 1) -lt $raw.Count) {
-                $decoded = [Text.Encoding]::Unicode.GetString([Convert]::FromBase64String($raw[$i + 1]))
-                $reenc   = [Convert]::ToBase64String([Text.Encoding]::Unicode.GetBytes($marker + $decoded))
-                $rebuilt.Add($tok); $rebuilt.Add($reenc)
-                $i++; $injected = $true; continue
-            }
-            $rebuilt.Add((Get-QuotedArg $tok))
-        }
-        if (-not $injected) {
-            # No command payload to guard - refuse rather than risk a UAC loop.
-            Write-Warn 'Cannot ask for administrator access this way; re-run from an admin terminal.'
+
+        Write-Info 'Asking for administrator access (you''ll see a Windows prompt)...'
+        try {
+            $p = Start-Process -FilePath $exe -ArgumentList ($argv -join ' ') -Verb RunAs `
+                               -WorkingDirectory (Get-Location).Path -Wait -PassThru -ErrorAction Stop
+            return $p.ExitCode
+        } catch {
+            # 1223 = ERROR_CANCELLED: the user dismissed the UAC dialog.
+            Write-Warn 'Admin access was declined - nothing was changed.'
             return $null
         }
-        $argString = $rebuilt -join ' '
-    }
-
-    Write-Info 'Asking for administrator access (you''ll see a Windows prompt)...'
-    try {
-        $p = Start-Process -FilePath $exe -ArgumentList $argString -Verb RunAs `
-                           -WorkingDirectory (Get-Location).Path -Wait -PassThru -ErrorAction Stop
-        return $p.ExitCode
-    } catch {
-        # 1223 = ERROR_CANCELLED: the user dismissed the UAC dialog.
-        Write-Warn 'Admin access was declined - nothing was changed.'
-        return $null
+    } finally {
+        Remove-SelfStage $stage
     }
 }
 
@@ -1931,16 +1981,10 @@ function Invoke-Main {
 
     Write-Banner
 
-    $effectivePath = $Path
-    if (-not $effectivePath -and $env:MV2_TARGET_B64) {
-        try { $effectivePath = [Text.Encoding]::Unicode.GetString([Convert]::FromBase64String($env:MV2_TARGET_B64)) }
-        catch { Write-Err 'Something went wrong starting with admin access.'; return 1 }
-    }
-
     # Resolve before elevation. Read-only checks never need admin, and an
     # offline/user-owned copy should not cause a UAC prompt merely because the
     # normal Program Files installation does.
-    $target = Resolve-Target -TargetPath $effectivePath -Interactive (-not $Quiet)
+    $target = Resolve-Target -TargetPath $Path -Interactive (-not $Quiet)
     if (-not $target) { return 1 }
 
     Write-Host "$script:TagOK Chrome: $($C.Cyn)$($target.Channel)$($C.Reset)"
@@ -1951,16 +1995,18 @@ function Invoke-Main {
 
     $needsElevation = -not (Test-TargetDirectoryWritable -TargetPath $target.Path)
     if ($needsElevation -and -not (Test-Elevated) -and -not $env:MV2_TEST_NO_ELEVATION) {
-        # Loop guard: -Relaunched (file mode) or the MV2_RELAUNCHED env marker
-        # (replay/irm|iex mode) means we ALREADY tried to elevate. If we are
+        # Loop guard: -Relaunched means we ALREADY tried to elevate. If we are
         # still not admin, report and stop instead of spawning again.
-        $alreadyTried = $Relaunched -or $env:MV2_RELAUNCHED
-        if (-not $alreadyTried) {
+        if (-not $Relaunched) {
             $childCode = Invoke-SelfElevate -ResolvedTargetPath ([IO.Path]::GetFullPath($target.Path))
             if ($null -ne $childCode) {
-                # The elevated child ran in its own window and already paused on
-                # any error of its own, so don't pause again here.
+                # The child did the work in its own window and held it open until
+                # the user dismissed it, so don't pause again here - but do say how
+                # it went, or this window's last line is still "asking for
+                # administrator access" as if nothing had happened.
                 $script:SuppressPause = $true
+                if ($childCode -eq 0) { Write-Ok 'Finished with administrator access.' }
+                else { Write-Err 'The run with administrator access did not succeed.' }
                 return $childCode
             }
             return 1
@@ -1973,17 +2019,41 @@ function Invoke-Main {
     return (Invoke-Patch -Target $target -AssumeYes $Yes.IsPresent)
 }
 
-# Set true when an elevated child ran: it owns its window and its own error pause.
+<#
+Whether to hold the window open before exiting.
+
+Two cases need it. A failure must not vanish with the window. And the elevated
+child needs it on ANY outcome, success included: that window was opened by
+Start-Process rather than by the user, and the child cannot write into the
+parent's window, so a successful patch would otherwise flash past and leave
+nothing on screen to read.
+
+Never pause when the caller asked for silence (-Quiet, scripting), when an
+elevated child has already done the pausing, or when input is redirected
+(piped/automation) - an unattended run must not hang waiting for a key.
+#>
+function Test-ShouldPause {
+    param(
+        [int]$ExitCode,
+        [bool]$IsElevatedChild,
+        [bool]$QuietMode,
+        [bool]$ChildAlreadyPaused,
+        [bool]$InputRedirected
+    )
+    if ($QuietMode -or $ChildAlreadyPaused -or $InputRedirected) { return $false }
+    return (($ExitCode -ne 0) -or $IsElevatedChild)
+}
+
+# Set true when an elevated child ran: it owns its window and its own pause.
 $script:SuppressPause = $false
 
 if ($env:MV2_TEST_LIBRARY_ONLY) { return }
 
 $exitCode = Invoke-Main
 
-# On failure, hold a double-clicked window open so the error stays visible. Skip
-# in -Quiet (scripting), when an elevated child already paused on its own error,
-# and when input is redirected (piped/automation) so an unattended run never hangs.
-if ($exitCode -ne 0 -and -not $Quiet -and -not $script:SuppressPause -and -not [Console]::IsInputRedirected) {
+if (Test-ShouldPause -ExitCode $exitCode -IsElevatedChild $Relaunched.IsPresent `
+                     -QuietMode $Quiet.IsPresent -ChildAlreadyPaused $script:SuppressPause `
+                     -InputRedirected ([Console]::IsInputRedirected)) {
     Write-Host ''
     Write-Host 'Press any key to exit...' -NoNewline
     try { [void]$Host.UI.RawUI.ReadKey('NoEcho,IncludeKeyDown') }

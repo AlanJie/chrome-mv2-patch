@@ -203,11 +203,159 @@ try {
     Assert-True (-not (Test-Path -LiteralPath "$armTarget.bak")) 'arm64 restore should remove the backup'
     $script:Signatures = $sigPath
 
+    # --- window pause decision -----------------------------------------------
+    # The elevated child owns a window the user never opened and cannot write
+    # into the parent's, so it must hold that window on SUCCESS too, not just on
+    # error. Silence/automation switches still win over both.
+    Assert-True (-not (Test-ShouldPause -ExitCode 0 -IsElevatedChild $false -QuietMode $false -ChildAlreadyPaused $false -InputRedirected $false)) 'ordinary success should not pause'
+    Assert-True (Test-ShouldPause -ExitCode 1 -IsElevatedChild $false -QuietMode $false -ChildAlreadyPaused $false -InputRedirected $false) 'failure should pause so the error stays visible'
+    Assert-True (Test-ShouldPause -ExitCode 0 -IsElevatedChild $true -QuietMode $false -ChildAlreadyPaused $false -InputRedirected $false) 'elevated child should pause even on success'
+    Assert-True (Test-ShouldPause -ExitCode 1 -IsElevatedChild $true -QuietMode $false -ChildAlreadyPaused $false -InputRedirected $false) 'elevated child should pause on failure'
+    Assert-True (-not (Test-ShouldPause -ExitCode 0 -IsElevatedChild $true -QuietMode $true -ChildAlreadyPaused $false -InputRedirected $false)) '-Quiet should suppress the elevated child pause'
+    Assert-True (-not (Test-ShouldPause -ExitCode 1 -IsElevatedChild $false -QuietMode $true -ChildAlreadyPaused $false -InputRedirected $false)) '-Quiet should suppress the failure pause'
+    Assert-True (-not (Test-ShouldPause -ExitCode 1 -IsElevatedChild $false -QuietMode $false -ChildAlreadyPaused $true -InputRedirected $false)) 'parent should not pause again after the child paused'
+    Assert-True (-not (Test-ShouldPause -ExitCode 0 -IsElevatedChild $true -QuietMode $false -ChildAlreadyPaused $false -InputRedirected $true)) 'redirected input must never hang an unattended run'
+
     Write-Host "PowerShell tests passed: $passed assertions"
 } finally {
     Remove-Item -LiteralPath $temp -Recurse -Force -ErrorAction SilentlyContinue
 }
 '''
+
+# Elevation regression test for the `irm ... | iex` launch shape.
+#
+# There is no script file there, so Invoke-SelfElevate has to recover its own
+# source, stage it, and relaunch with -File. It used to instead replay
+# powershell.exe's own argv and inject the loop guard into the -Command payload,
+# which refused outright ("Cannot ask for administrator access this way") for any
+# launch shape whose payload is not a literal -Command/-EncodedCommand token.
+#
+# The shape below matters: the driver is reached through an IMPLICIT positional
+# command (`powershell "iex ..."`, the documented one-liner), so there is no
+# -Command token in argv. A test that passed -Command explicitly would pass
+# against the old code too and catch nothing. Everything reaches the patcher
+# through iex, so $PSCommandPath stays empty all the way down and the staging
+# branch is the one under test.
+PS_ELEVATION_DRIVER = r'''
+$ErrorActionPreference = 'Stop'
+Set-StrictMode -Version Latest
+
+$src = [IO.File]::ReadAllText((Join-Path $env:MV2_REPO 'chrome-mv2.ps1'))
+$anchor = 'if ($env:MV2_TEST_LIBRARY_ONLY) { return }'
+if (-not $src.Contains($anchor)) { throw 'library-only anchor not found in chrome-mv2.ps1' }
+
+# Spliced in at the anchor so it runs in the patcher's own scope, where the
+# param() defaults ($Command, $Yes, ...) that Invoke-SelfElevate forwards live.
+$probe = @'
+Initialize-Colors
+$script:RelaunchArgs = ''
+$script:StagedPath = $null
+$script:StagedText = $null
+$script:SwapBlocked = $false
+$script:DeleteBlocked = $false
+$script:ChildExit = 7
+
+# A function shadows the cmdlet, so no elevated process is ever spawned.
+function Start-Process {
+    param(
+        [string]$FilePath, [string]$ArgumentList, [string]$Verb,
+        [string]$WorkingDirectory, [switch]$Wait, [switch]$PassThru,
+        [string]$ErrorAction
+    )
+    $script:RelaunchArgs = $ArgumentList
+    if ($ArgumentList -match '-File\s+"?([^"]+chrome-mv2\.ps1)"?') {
+        $script:StagedPath = $Matches[1]
+        # What the elevated child does: open the staged script for reading.
+        $fs = [IO.File]::Open($script:StagedPath, [IO.FileMode]::Open, [IO.FileAccess]::Read, [IO.FileShare]::Read)
+        $sr = New-Object IO.StreamReader($fs, $true)
+        $script:StagedText = $sr.ReadToEnd()
+        $sr.Dispose(); $fs.Dispose()
+        # What a same-user attacker does after UAC consent: swap the file.
+        try { [IO.File]::WriteAllText($script:StagedPath, 'swapped') } catch { $script:SwapBlocked = $true }
+        try { [IO.File]::Delete($script:StagedPath) } catch { $script:DeleteBlocked = $true }
+    }
+    return [pscustomobject]@{ ExitCode = $script:ChildExit }
+}
+
+$dll = 'C:\Program Files\Google\Chrome\Application\1.2.3.4\chrome.dll'
+$code = Invoke-SelfElevate -ResolvedTargetPath $dll
+
+$fail = @()
+if ($code -ne 7) { $fail += "did not elevate (returned '$code')" }
+if (-not $script:StagedPath) { $fail += 'relaunch args carried no -File staged copy' }
+elseif (-not $script:StagedPath.StartsWith([IO.Path]::GetTempPath(), 'OrdinalIgnoreCase')) {
+    $fail += "staged copy is not under TEMP: $($script:StagedPath)"
+}
+if ($script:RelaunchArgs -notmatch '(^|\s)-Relaunched(\s|$)') { $fail += 'loop guard -Relaunched not forwarded' }
+if ($script:RelaunchArgs -notmatch [regex]::Escape('"' + $dll + '"')) { $fail += 'target not forwarded as one quoted argument' }
+if ($script:StagedText -cne $global:MV2SplicedSource) { $fail += 'staged copy is not the source that actually ran' }
+if (-not $script:SwapBlocked) { $fail += 'staged copy could be overwritten while the child held it' }
+if (-not $script:DeleteBlocked) { $fail += 'staged copy could be deleted while the child held it' }
+if ($script:StagedPath -and (Test-Path -LiteralPath (Split-Path -Parent $script:StagedPath))) {
+    $fail += 'temp stage was not cleaned up'
+}
+
+# The parent window must not end on "asking for administrator access" as if
+# nothing had happened, so it reports the child's outcome. Target resolution and
+# the writability probe are stubbed out so this needs no installed Chrome and
+# touches no real file.
+function Resolve-Target {
+    param($TargetPath, $Interactive)
+    return [pscustomobject]@{ Path = 'C:\nonexistent\chrome.dll'; Channel = 'Test'; Version = '1.2.3.4'; Running = $false; Holders = 0 }
+}
+function Test-TargetDirectoryWritable { param($TargetPath) return $false }
+function Test-Elevated { return $false }
+$script:Reported = @()
+function Write-Ok  { param([string]$m) $script:Reported += "OK:$m" }
+function Write-Err { param([string]$m) $script:Reported += "ERR:$m" }
+
+$script:ChildExit = 0
+$rc = Invoke-Main
+if ($rc -ne 0) { $fail += "parent should hand back the child's exit code 0 (got '$rc')" }
+if (-not ($script:Reported -match '^OK:')) { $fail += 'parent stayed silent after a successful elevated run' }
+
+$script:Reported = @()
+$script:ChildExit = 1
+$rc = Invoke-Main
+if ($rc -ne 1) { $fail += "parent should hand back the child's exit code 1 (got '$rc')" }
+if (-not ($script:Reported -match '^ERR:')) { $fail += 'parent stayed silent after a failed elevated run' }
+
+$global:MV2ElevationFailures = $fail
+return
+'@
+
+$global:MV2SplicedSource = $src.Replace($anchor, $probe)
+$global:MV2ElevationFailures = $null
+Invoke-Expression $global:MV2SplicedSource
+
+if ($null -eq $global:MV2ElevationFailures) {
+    Write-Host 'ELEVATION TEST FAILED: probe never ran'
+    exit 1
+}
+if ($global:MV2ElevationFailures.Count) {
+    Write-Host ('ELEVATION TEST FAILED: ' + ($global:MV2ElevationFailures -join '; '))
+    exit 1
+}
+Write-Host 'PowerShell elevation staging tests passed: 12 assertions'
+exit 0
+'''
+
+
+def _run_ps(host, body, env, positional=False):
+    """Run a PowerShell body from a temp .ps1. With positional=True the file is
+    reached through an implicit positional command and iex, so the code under test
+    sees no script file at all (the `irm ... | iex` shape)."""
+    with tempfile.NamedTemporaryFile("w", suffix=".ps1", delete=False, encoding="utf-8") as f:
+        f.write(body)
+        ps_path = f.name
+    try:
+        if positional:
+            argv = [host, "-NoProfile", "iex (gc -Raw '%s')" % ps_path]
+        else:
+            argv = [host, "-NoProfile", "-File", ps_path]
+        return subprocess.run(argv, env=env, capture_output=True, text=True)
+    finally:
+        os.unlink(ps_path)
 
 
 def main():
@@ -221,15 +369,22 @@ def main():
     if not pwsh:
         print("PowerShell tests skipped: no pwsh/powershell on PATH")
         return 0
-    with tempfile.NamedTemporaryFile("w", suffix=".ps1", delete=False, encoding="utf-8") as f:
-        f.write(PS_TEST)
-        ps_path = f.name
     env = dict(os.environ, MV2_REPO=str(REPO))
-    try:
-        r = subprocess.run([pwsh, "-NoProfile", "-File", ps_path], env=env,
-                           capture_output=True, text=True)
-    finally:
-        os.unlink(ps_path)
+
+    r = _run_ps(pwsh, PS_TEST, env)
+    sys.stdout.write(r.stdout)
+    if r.returncode != 0:
+        sys.stderr.write(r.stderr)
+        sys.exit(r.returncode)
+
+    # Windows PowerShell specifically: only powershell.exe accepts a command in
+    # the implicit positional slot (pwsh treats a bare argument as -File), and
+    # that slot is what the documented one-liner and the old bug both used.
+    ps51 = shutil.which("powershell")
+    if not ps51:
+        print("PowerShell elevation staging tests skipped: no powershell.exe on PATH")
+        return 0
+    r = _run_ps(ps51, PS_ELEVATION_DRIVER, env, positional=True)
     sys.stdout.write(r.stdout)
     if r.returncode != 0:
         sys.stderr.write(r.stderr)
