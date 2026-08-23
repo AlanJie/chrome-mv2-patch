@@ -45,7 +45,7 @@
 
 set -euo pipefail
 
-readonly APP_VERSION="1.5.0"
+readonly APP_VERSION="1.6.0"
 
 # ============================================================================
 # Embedded signature tables (pre-tokenized so the default path needs no python3
@@ -136,6 +136,36 @@ S|StandardManagementPolicyProvider::MustRemainDisabled|bcond|0x02218740|4|1|1F09
 S|ManifestV2Handler::OnExtensionSystemReady|bcond|0x0320635C|4|1|1F090071AC0100542A1541F9483140B929214839C9000037496940B93F050071
 S|ManifestV2Handler::IsExtensionAffected|bcond|0x03FFBD84|4|1|1F090071CC010054291441F9283140B92A204839CA000037296940B93F050071
 S|ManifestV2Handler::ShouldBlockExtensionInstallation / StandardManagementPolicyProvider::UserMayInstall (shared body)|bcond|0x066F0E38|4|2|1F090071AC010054691641F9283140B96A224839CA000037296940B93F050071
+E
+M|154-linux|elf
+S|manifest_v2_util::IsExtensionAffected (free predicate; covers the ShouldBlockExtensionInstallation thunk, which tail-jumps here)|short|0x0991AA29|3|1|83FF027F1D83FE087718B90A0100000FA3F1730E83FA050F95
+S|ManifestV2Handler::IsExtensionAffected / ShouldBlockExtensionEnable (shared body; also covers OnExtensionSystemReady and MaybeReEnableExtensions calls out to it)|short|0x0991A6D4|4|1|837E50027F2F554889E5488B8E280200008B413080BE080200
+S|ManifestV2Handler::MaybeReEnableExtension (inlined)|short|0x0991A818|4|1|837B50027F30488B8B280200008B413080BB08020000007508
+S|StandardManagementPolicyProvider::UserMayInstall (inlined, near jg; Load-Unpacked gate)|near|0x0A37E1CA|4|1|837B50020F8FD1000000488B8B280200008B413080BB080200000075
+S|StandardManagementPolicyProvider::MustRemainDisabled (inlined, near jg)|near|0x05AB5FFA|4|1|837E50020F8F8E000000498B8E280200008B41304180BE0802000000
+S|IsExtensionAffected / ShouldBlockExtensionEnable (member, 2nd body)|short|0x053B0E40|4|1|837950027F2D488B91280200008B423080B90802000000750C
+E
+M|154-linux-arm64|elf-arm64
+S|ManifestV2Handler::MaybeReEnableExtension (shared body)|bcond|0x05E87478|4|2|1F0900712C020054691641F96A224839283140B98A000037296940B93F050071
+S|ManifestV2Handler::IsExtensionAffected / ShouldBlockExtensionEnable (shared body)|bcond|0x05E8763C|4|1|1F0900710C020054091441F90A204839283140B98A000037296940B93F050071
+S|StandardManagementPolicyProvider::MustRemainDisabled / UserMayInstall (shared body)|bcond|0x0609B370|4|2|1F0900718C010054891641F98A224839283140B98A000037296940B93F050071
+S|ManifestV2Handler::OnExtensionSystemReady (shared body)|bcond|0x06AB7470|4|1|3F0900718C010054091541F90A214839283140B98A000037296940B93F050071
+S|ManifestV2Handler member gate (additional inlined copy; +0x228/+0x208)|bcond|0x09B77244|4|1|7F0900718C0100544B1541F94C2148396A3140B98C0000376B6940B97F050071
+E
+M|154-macos-x64|macho-x64
+S|StandardManagementPolicyProvider::MustRemainDisabled|short|0x01CD2151|4|1|837E50027F6F498B8E280200008B41304180BE080200000075
+S|ManifestV2Handler::OnExtensionSystemReady|short|0x0322BD39|4|1|837950027F2D488B91280200008B423080B90802000000750C
+S|ManifestV2Handler::IsExtensionAffected|short|0x0497FD04|4|1|837E50027F2F554889E5488B8E280200008B413080BE080200
+S|ManifestV2Handler::ShouldBlockExtensionInstallation|short|0x07789FB8|4|1|837B50027F30488B8B280200008B413080BB08020000007508
+S|ManifestV2Handler::ShouldBlockExtensionInstallation (2)|short|0x0778A1B9|3|1|83FF027F1D83FE087718B90A0100000FA3F1730E83FA050F95
+S|StandardManagementPolicyProvider::UserMayInstall|near|0x081B49B0|4|1|837B50020F8FB7000000488B8B280200008B413080BB080200000075
+S|IsExtensionAffected (type!=PLATFORM_APP variant)|short|0x028F0E51|4|1|837F50027F34488B45A880B808020000000F852D010000488B
+E
+M|154-macos-arm64|macho-arm64
+S|StandardManagementPolicyProvider::MustRemainDisabled|bcond|0x02276C2C|4|1|1F090071EC040054891641F9283140B98A2248398A000037296940B93F050071
+S|ManifestV2Handler::OnExtensionSystemReady|bcond|0x0321963C|4|1|1F090071AC0100542A1541F9483140B929214839C9000037496940B93F050071
+S|ManifestV2Handler::IsExtensionAffected|bcond|0x0401B428|4|1|1F090071CC010054291441F9283140B92A204839CA000037296940B93F050071
+S|ManifestV2Handler::ShouldBlockExtensionInstallation / StandardManagementPolicyProvider::UserMayInstall (shared body)|bcond|0x068652D4|4|2|1F090071AC010054691641F9283140B96A224839CA000037296940B93F050071
 E
 '
 

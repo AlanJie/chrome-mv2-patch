@@ -827,6 +827,338 @@
           "sig": "83FA027F4683F9087741BA0A0100000FA3CA73378B40304531"
         }
       ]
+    },
+    {
+      "name": "154",
+      "container": "pe",
+      "sites": [
+        {
+          "name": "manifest_v2_util::IsExtensionAffected (free predicate; covers install thunk)",
+          "kind": "short",
+          "jgRVA": "0x08E81945",
+          "jgOff": 3,
+          "expectedMatches": 1,
+          "sig": "83F9027F1F83FA08771AB90A0100000FA3D173104183F805"
+        },
+        {
+          "name": "ShouldBlockExtensionEnable / IsExtensionAffected (shared body)",
+          "kind": "short",
+          "jgRVA": "0x036B5704",
+          "jgOff": 4,
+          "expectedMatches": 1,
+          "sig": "837A50027F34488B8A280200008B413080BA080200000075"
+        },
+        {
+          "name": "OnExtensionSystemReady startup loop",
+          "kind": "short",
+          "jgRVA": "0x028891C3",
+          "jgOff": 4,
+          "expectedMatches": 1,
+          "sig": "837950027F2D488B91280200008B423080B90802000000750C"
+        },
+        {
+          "name": "MaybeReEnableExtension",
+          "kind": "short",
+          "jgRVA": "0x08E81726",
+          "jgOff": 4,
+          "expectedMatches": 1,
+          "sig": "837E50027F2D488B8E280200008B413080BE08020000007508"
+        },
+        {
+          "name": "UserMayInstall (inlined)",
+          "kind": "short",
+          "jgRVA": "0x0994F021",
+          "jgOff": 4,
+          "expectedMatches": 1,
+          "sig": "837F50027F4E488B8F280200008B413080BF0802000000750C"
+        },
+        {
+          "name": "MustRemainDisabled (inlined, near jg)",
+          "kind": "near",
+          "jgRVA": "0x01663F71",
+          "jgOff": 4,
+          "expectedMatches": 1,
+          "sig": "837F50020F8F8B000000488B8F280200008B413080BF080200000075"
+        },
+        {
+          "name": "ShouldBlockExtensionEnable / IsExtensionAffected (shared body, 2nd copy, diverged reg)",
+          "kind": "short",
+          "jgRVA": "0x036B5784",
+          "jgOff": 4,
+          "expectedMatches": 1,
+          "sig": "837950027F34488B91280200008B423080B908020000007508"
+        },
+        {
+          "name": "IsExtensionAffected (type!=PLATFORM_APP variant; +0x208 flag then +0x228 manifest)",
+          "kind": "short",
+          "jgRVA": "0x01C21E3F",
+          "jgOff": 4,
+          "expectedMatches": 1,
+          "sig": "837F50027F2C80BF08020000000F857E010000488B87280200"
+        }
+      ]
+    },
+    {
+      "name": "154-x86",
+      "container": "pe32",
+      "sites": [
+        {
+          "name": "manifest_v2_util::IsExtensionAffected (free predicate; covers install thunk)",
+          "kind": "short",
+          "jgRVA": "0x08BBA217",
+          "jgOff": 4,
+          "expectedMatches": 1,
+          "sig": "837D08027F278B4D0C31C083F908771FBA0A0100000FA3CA73"
+        },
+        {
+          "name": "ShouldBlockExtensionEnable / IsExtensionAffected (shared body)",
+          "kind": "short",
+          "jgRVA": "0x031C47CA",
+          "jgOff": 4,
+          "expectedMatches": 2,
+          "sig": "837A28027F368B8A640100008B411880BA540100000075088B"
+        },
+        {
+          "name": "OnExtensionSystemReady startup loop",
+          "kind": "short",
+          "jgRVA": "0x01B51743",
+          "jgOff": 4,
+          "expectedMatches": 2,
+          "sig": "837928027F288B91640100008B421880B95401000000750C8B"
+        },
+        {
+          "name": "MaybeReEnableExtension",
+          "kind": "short",
+          "jgRVA": "0x08BBA108",
+          "jgOff": 4,
+          "expectedMatches": 1,
+          "sig": "837E28027F248B8E640100008B411880BE540100000075088B"
+        },
+        {
+          "name": "UserMayInstall (inlined)",
+          "kind": "short",
+          "jgRVA": "0x093997BF",
+          "jgOff": 4,
+          "expectedMatches": 1,
+          "sig": "837F28027F458B8F640100008B411880BF5401000000750C8B"
+        },
+        {
+          "name": "MustRemainDisabled (inlined, near jg)",
+          "kind": "near",
+          "jgRVA": "0x01205788",
+          "jgOff": 4,
+          "expectedMatches": 1,
+          "sig": "837B28020F8F840000008B8B640100008B411880BB54010000007508"
+        },
+        {
+          "name": "IsExtensionAffected (type!=PLATFORM_APP variant)",
+          "kind": "short",
+          "jgRVA": "0x014E0239",
+          "jgOff": 4,
+          "expectedMatches": 1,
+          "sig": "837928027F268B45D480B8540100000075628B45D48B806401"
+        }
+      ]
+    },
+    {
+      "name": "154-linux",
+      "container": "elf",
+      "sites": [
+        {
+          "name": "manifest_v2_util::IsExtensionAffected (free predicate; covers the ShouldBlockExtensionInstallation thunk, which tail-jumps here)",
+          "kind": "short",
+          "jgRVA": "0x0991AA29",
+          "jgOff": 3,
+          "expectedMatches": 1,
+          "sig": "83FF027F1D83FE087718B90A0100000FA3F1730E83FA050F95"
+        },
+        {
+          "name": "ManifestV2Handler::IsExtensionAffected / ShouldBlockExtensionEnable (shared body; also covers OnExtensionSystemReady and MaybeReEnableExtension's calls out to it)",
+          "kind": "short",
+          "jgRVA": "0x0991A6D4",
+          "jgOff": 4,
+          "expectedMatches": 1,
+          "sig": "837E50027F2F554889E5488B8E280200008B413080BE080200"
+        },
+        {
+          "name": "ManifestV2Handler::MaybeReEnableExtension (inlined)",
+          "kind": "short",
+          "jgRVA": "0x0991A818",
+          "jgOff": 4,
+          "expectedMatches": 1,
+          "sig": "837B50027F30488B8B280200008B413080BB08020000007508"
+        },
+        {
+          "name": "StandardManagementPolicyProvider::UserMayInstall (inlined, near jg; Load-Unpacked gate)",
+          "kind": "near",
+          "jgRVA": "0x0A37E1CA",
+          "jgOff": 4,
+          "expectedMatches": 1,
+          "sig": "837B50020F8FD1000000488B8B280200008B413080BB080200000075"
+        },
+        {
+          "name": "StandardManagementPolicyProvider::MustRemainDisabled (inlined, near jg)",
+          "kind": "near",
+          "jgRVA": "0x05AB5FFA",
+          "jgOff": 4,
+          "expectedMatches": 1,
+          "sig": "837E50020F8F8E000000498B8E280200008B41304180BE0802000000"
+        },
+        {
+          "name": "IsExtensionAffected / ShouldBlockExtensionEnable (member, 2nd body)",
+          "kind": "short",
+          "jgRVA": "0x053B0E40",
+          "jgOff": 4,
+          "expectedMatches": 1,
+          "sig": "837950027F2D488B91280200008B423080B90802000000750C"
+        }
+      ]
+    },
+    {
+      "name": "154-macos-x64",
+      "container": "macho-x64",
+      "sites": [
+        {
+          "name": "StandardManagementPolicyProvider::MustRemainDisabled",
+          "kind": "short",
+          "jgRVA": "0x01CD2151",
+          "jgOff": 4,
+          "expectedMatches": 1,
+          "sig": "837E50027F6F498B8E280200008B41304180BE080200000075"
+        },
+        {
+          "name": "ManifestV2Handler::OnExtensionSystemReady",
+          "kind": "short",
+          "jgRVA": "0x0322BD39",
+          "jgOff": 4,
+          "expectedMatches": 1,
+          "sig": "837950027F2D488B91280200008B423080B90802000000750C"
+        },
+        {
+          "name": "ManifestV2Handler::IsExtensionAffected",
+          "kind": "short",
+          "jgRVA": "0x0497FD04",
+          "jgOff": 4,
+          "expectedMatches": 1,
+          "sig": "837E50027F2F554889E5488B8E280200008B413080BE080200"
+        },
+        {
+          "name": "ManifestV2Handler::ShouldBlockExtensionInstallation",
+          "kind": "short",
+          "jgRVA": "0x07789FB8",
+          "jgOff": 4,
+          "expectedMatches": 1,
+          "sig": "837B50027F30488B8B280200008B413080BB08020000007508"
+        },
+        {
+          "name": "ManifestV2Handler::ShouldBlockExtensionInstallation (2)",
+          "kind": "short",
+          "jgRVA": "0x0778A1B9",
+          "jgOff": 3,
+          "expectedMatches": 1,
+          "sig": "83FF027F1D83FE087718B90A0100000FA3F1730E83FA050F95"
+        },
+        {
+          "name": "StandardManagementPolicyProvider::UserMayInstall",
+          "kind": "near",
+          "jgRVA": "0x081B49B0",
+          "jgOff": 4,
+          "expectedMatches": 1,
+          "sig": "837B50020F8FB7000000488B8B280200008B413080BB080200000075"
+        },
+        {
+          "name": "IsExtensionAffected (type!=PLATFORM_APP variant)",
+          "kind": "short",
+          "jgRVA": "0x028F0E51",
+          "jgOff": 4,
+          "expectedMatches": 1,
+          "sig": "837F50027F34488B45A880B808020000000F852D010000488B"
+        }
+      ]
+    },
+    {
+      "name": "154-macos-arm64",
+      "container": "macho-arm64",
+      "sites": [
+        {
+          "name": "StandardManagementPolicyProvider::MustRemainDisabled",
+          "kind": "bcond",
+          "jgRVA": "0x02276C2C",
+          "jgOff": 4,
+          "expectedMatches": 1,
+          "sig": "1F090071EC040054891641F9283140B98A2248398A000037296940B93F050071"
+        },
+        {
+          "name": "ManifestV2Handler::OnExtensionSystemReady",
+          "kind": "bcond",
+          "jgRVA": "0x0321963C",
+          "jgOff": 4,
+          "expectedMatches": 1,
+          "sig": "1F090071AC0100542A1541F9483140B929214839C9000037496940B93F050071"
+        },
+        {
+          "name": "ManifestV2Handler::IsExtensionAffected",
+          "kind": "bcond",
+          "jgRVA": "0x0401B428",
+          "jgOff": 4,
+          "expectedMatches": 1,
+          "sig": "1F090071CC010054291441F9283140B92A204839CA000037296940B93F050071"
+        },
+        {
+          "name": "ManifestV2Handler::ShouldBlockExtensionInstallation / StandardManagementPolicyProvider::UserMayInstall (shared body)",
+          "kind": "bcond",
+          "jgRVA": "0x068652D4",
+          "jgOff": 4,
+          "expectedMatches": 2,
+          "sig": "1F090071AC010054691641F9283140B96A224839CA000037296940B93F050071"
+        }
+      ]
+    },
+    {
+      "name": "154-linux-arm64",
+      "container": "elf-arm64",
+      "sites": [
+        {
+          "name": "ManifestV2Handler::MaybeReEnableExtension (shared body)",
+          "kind": "bcond",
+          "jgRVA": "0x05E87478",
+          "jgOff": 4,
+          "expectedMatches": 2,
+          "sig": "1F0900712C020054691641F96A224839283140B98A000037296940B93F050071"
+        },
+        {
+          "name": "ManifestV2Handler::IsExtensionAffected / ShouldBlockExtensionEnable (shared body)",
+          "kind": "bcond",
+          "jgRVA": "0x05E8763C",
+          "jgOff": 4,
+          "expectedMatches": 1,
+          "sig": "1F0900710C020054091441F90A204839283140B98A000037296940B93F050071"
+        },
+        {
+          "name": "StandardManagementPolicyProvider::MustRemainDisabled / UserMayInstall (shared body)",
+          "kind": "bcond",
+          "jgRVA": "0x0609B370",
+          "jgOff": 4,
+          "expectedMatches": 2,
+          "sig": "1F0900718C010054891641F98A224839283140B98A000037296940B93F050071"
+        },
+        {
+          "name": "ManifestV2Handler::OnExtensionSystemReady (shared body)",
+          "kind": "bcond",
+          "jgRVA": "0x06AB7470",
+          "jgOff": 4,
+          "expectedMatches": 1,
+          "sig": "3F0900718C010054091541F90A214839283140B98A000037296940B93F050071"
+        },
+        {
+          "name": "ManifestV2Handler member gate (additional inlined copy; +0x228/+0x208)",
+          "kind": "bcond",
+          "jgRVA": "0x09B77244",
+          "jgOff": 4,
+          "expectedMatches": 1,
+          "sig": "7F0900718C0100544B1541F94C2148396A3140B98C0000376B6940B97F050071"
+        }
+      ]
     }
   ]
 }

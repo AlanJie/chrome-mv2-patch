@@ -1,5 +1,9 @@
 # Changelog
 
+## [1.6.0] - 2026-08-23
+
+- Chrome 154 support.
+
 ## [1.5.1] - 2026-08-21
 
 - Windows script bug fixes.
