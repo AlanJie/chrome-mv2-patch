@@ -207,6 +207,24 @@ errf()     { echo "${TAG_ERR} $*"; }
 successf() { echo "${TAG_SUCCESS} $*"; }
 rule()     { echo "${C_CYN}==========================================================${C_RESET}"; }
 
+# Read one line of user input into the named variable. When this script is
+# delivered as `curl … | sudo bash`, fd 0 carries the *script text* being fed to
+# bash, not the keyboard - so a plain `read` sees EOF and every interactive menu
+# cancels instantly (the reported "drops back to the shell without asking" bug).
+# When fd 0 is not a terminal but a controlling one exists, read the keyboard via
+# /dev/tty instead; this is how curl-pipe installers (rustup, nvm, brew) all stay
+# interactive. A normal `bash chrome-mv2.sh` run keeps fd 0 (a tty) untouched -
+# identical to before. With no tty at all (headless/CI), fall through to fd 0 so
+# read still returns EOF and the caller's `|| return 1` cancels cleanly instead
+# of hanging. `2>/dev/null` hides a warning if the /dev/tty open races or ENXIOs.
+prompt_read() {
+    if [[ ! -t 0 && -r /dev/tty ]]; then
+        read -r "$1" 2>/dev/null </dev/tty
+    else
+        read -r "$1"
+    fi
+}
+
 banner() {
     rule
     echo "${C_BOLD}                Chrome MV2 Patcher (bash)                 ${C_RESET}"
@@ -1527,7 +1545,7 @@ quit_chrome() {
     (( $(proc_holders_app "$app") == 0 )) && return 0
     if ! $assume_yes && ! $QUIET; then
         echo -n "${C_BOLD}Chrome ($(basename "$app")) is open. Close it to continue? [y/N]: ${C_RESET}"
-        local line; read -r line || return 1
+        local line; prompt_read line || return 1
         case "$line" in y|Y) ;; *) infof "Cancelled - nothing was changed."; return 1 ;; esac
     fi
     command -v osascript >/dev/null 2>&1 && osascript -e "quit app \"$app\"" 2>/dev/null || true
@@ -1636,7 +1654,7 @@ confirm_force_close() {
     echo "     I need to close it to make the change. Any unsaved tabs will be lost."
     while true; do
         echo -n "${C_BOLD}Close Chrome ${channel} and continue? [y/N]: ${C_RESET}"
-        local line; read -r line || return 1
+        local line; prompt_read line || return 1
         case "$line" in
             y|Y) return 0 ;;
             ""|n|N) infof "Cancelled - nothing was changed."; return 1 ;;
@@ -1740,7 +1758,7 @@ print_linux_install_row() {
 read_custom_path() {
     while true; do
         echo -n "${C_BOLD}Enter the full path to the Chrome file, or leave blank to cancel: ${C_RESET}"
-        local line; read -r line || return 1
+        local line; prompt_read line || return 1
         line="${line#"${line%%[![:space:]]*}"}"
         line="${line%"${line##*[![:space:]]}"}"
         if (( ${#line} >= 2 )); then
@@ -1780,7 +1798,7 @@ choose_linux_install() {
         else
             echo -n "${C_BOLD}Which Chrome do you want to patch? [1-${count}, r=restore, c=custom path, q=quit]: ${C_RESET}"
         fi
-        local line; read -r line || return 1
+        local line; prompt_read line || return 1
         if [[ "$line" == "q" || "$line" == "Q" ]]; then return 1; fi
         if [[ "$line" == "c" || "$line" == "C" ]]; then
             if read_custom_path; then TARGET_FILE="$CHOSEN_CUSTOM_PATH"; return 0; fi
@@ -1792,7 +1810,7 @@ choose_linux_install() {
             echo ""; echo "${TAG_INFO} Restore selected. Which Chrome do you want to restore?"
             while true; do
                 echo -n "${C_BOLD}Which Chrome do you want to restore? [1-${count}, c=custom path, q=cancel]: ${C_RESET}"
-                local restore_line; read -r restore_line || return 1
+                local restore_line; prompt_read restore_line || return 1
                 if [[ "$restore_line" == "q" || "$restore_line" == "Q" ]]; then infof "Restore cancelled."; return 1; fi
                 if [[ "$restore_line" == "c" || "$restore_line" == "C" ]]; then
                     if read_custom_path; then TARGET_FILE="$CHOSEN_CUSTOM_PATH"; return 0; fi
@@ -1830,7 +1848,7 @@ choose_macos_install() {
     done
     while true; do
         echo -n "${C_BOLD}Which install? [1-${count}, q=quit]: ${C_RESET}"
-        local line; read -r line || return 1
+        local line; prompt_read line || return 1
         [[ "$line" == q || "$line" == Q ]] && return 1
         if [[ "$line" =~ ^[0-9]+$ ]] && (( line >= 1 && line <= count )); then CHOSEN_INDEX=$(( line - 1 )); return 0; fi
         errf "Enter a number between 1 and ${count}, or q."
