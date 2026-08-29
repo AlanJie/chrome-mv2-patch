@@ -45,7 +45,7 @@
 
 set -euo pipefail
 
-readonly APP_VERSION="1.6.0"
+readonly APP_VERSION="1.6.1"
 
 # ============================================================================
 # Embedded signature tables (pre-tokenized so the default path needs no python3
@@ -227,9 +227,32 @@ prompt_read() {
 
 banner() {
     rule
-    echo "${C_BOLD}                Chrome MV2 Patcher (bash)                 ${C_RESET}"
-    echo "${C_DIM}                          v${APP_VERSION}                          ${C_RESET}"
+    echo "${C_BOLD}                    MV2 Patcher v${APP_VERSION}                    ${C_RESET}"
     rule
+}
+
+# Menu display name: the Google channels get the "Chrome " prefix; Chromium and
+# anything else (custom path) is shown as-is.
+display_name() {
+    case "$1" in
+        Stable|Beta|Dev|Canary) echo "Chrome $1" ;;
+        *)                      echo "$1" ;;
+    esac
+}
+
+# One numbered row of the browser table:
+#   "  1  Chrome Stable    152.0.7977.65       Patched"
+print_table_row() {
+    local idx="$1" name="$2" ver="$3" state="$4" status=""
+    case "$state" in
+        patched)        status="${C_GRN}Patched${C_RESET}" ;;
+        "not patched")  status="${C_DIM}Not patched${C_RESET}" ;;
+    esac
+    printf '  %-2s %-17s%-20s%s\n' "$idx" "$name" "$ver" "$status"
+}
+
+print_table_header() {
+    echo "${C_BOLD}  #  Browser          Version             Status${C_RESET}"
 }
 
 # ============================================================================
@@ -1119,7 +1142,6 @@ apply_flips_slice() {
             printf "\\x$(printf '%02X' "$newb")" | dd of="$file" bs=1 seek="$offset" count=1 conv=notrunc 2>/dev/null
             applied=$(( applied + 1 ))
         fi
-        okf "    Change ${applied} of ${#FLIP_OFFSETS[@]} applied."
     done
     SLICE_FLIPS=$applied; SLICE_ALREADY=$already
     _hexcache_flush   # the dd writes above dirtied the file; drop the stale slice
@@ -1613,6 +1635,39 @@ chrome_version() {
     fi
 }
 
+# Best-effort display version for an explicitly given target. Package lookups
+# run ONLY for the known install paths, so a scratch copy of the binary is never
+# mislabeled by an unrelated distro package - it asks the binary itself instead.
+# Empty output means unknown; callers then fall back to the milestone's name.
+detect_target_version() {
+    local bin="$1" b
+    local known=()
+    for b in "${LINUX_DIRS[@]}"; do known+=("${b}/chrome"); done
+    known+=("${CHROMIUM_BINS[@]}")
+    for b in "${known[@]}"; do
+        if [[ "$bin" == "$b" ]]; then chrome_version "$b"; return; fi
+    done
+    if [[ -x "$bin" ]]; then
+        "$bin" --version 2>/dev/null | grep -o -E '[0-9]+\.[0-9]+\.[0-9]+\.[0-9]+' | head -1 || true
+    fi
+}
+
+# The "Chrome X" string for output. A milestone table's name says which gate set
+# matched, NOT which browser this is - a 153/154 build whose gates are unchanged
+# legitimately matches the 152 table - so show the detected version when we have
+# one, noting the matched table when its milestone differs; the table name alone
+# otherwise.
+chrome_label() {
+    local milestone="$1" ver="${TARGET_VERSION:-}"
+    if [[ -z "$ver" ]]; then echo "$milestone"; return; fi
+    local major="${ver%%.*}"
+    if [[ "$milestone" == "$major"* ]]; then
+        echo "$ver"
+    else
+        echo "${ver} (using the Chrome ${milestone} changes)"
+    fi
+}
+
 proc_holders() {
     local bin="$1" want
     want=$(readlink -f "$bin" 2>/dev/null || echo "$bin")
@@ -1685,6 +1740,10 @@ request_target_close() {
 LNX_CHANNELS=(); LNX_PATHS=(); LNX_VERSIONS=(); LNX_RUNNING=(); LNX_HOLDERS=(); LNX_BACKUPS=(); LNX_STATE=()
 CHOSEN_INDEX=-1
 CHOSEN_CUSTOM_PATH=""
+# Display-only detected version of the chosen target ('' = unknown; output then
+# falls back to the matched milestone table's name). Set by main() after target
+# resolution, read by chrome_label().
+TARGET_VERSION=""
 
 # Cheap patched/stock hint for the install list. Runs the FAST probe only (the
 # recorded-RVA check, never the full .text scan), so it costs a handful of
@@ -1739,20 +1798,20 @@ enumerate_linux_installs() {
 
 print_linux_install_row() {
     local idx="$1" i="$2"
-    echo -n "  ${C_BOLD}${idx})${C_RESET} ${C_CYN}${LNX_CHANNELS[$i]}${C_RESET}"
-    if [[ -n "${LNX_VERSIONS[$i]}" ]]; then echo -n "  ${LNX_VERSIONS[$i]}"; fi
-    if ${LNX_RUNNING[$i]}; then
-        echo -n "  ${C_YEL}[open]${C_RESET}"
-    else
-        echo -n "  ${C_GRN}[closed]${C_RESET}"
-    fi
-    case "${LNX_STATE[$i]:-}" in
-        patched)       echo -n "  ${C_GRN}[patched]${C_RESET}" ;;
-        "not patched") echo -n "  ${C_DIM}[not patched]${C_RESET}" ;;
-    esac
-    if ${LNX_BACKUPS[$i]}; then echo -n " ${C_DIM}(backup saved)${C_RESET}"; fi
+    print_table_row "$idx" "$(display_name "${LNX_CHANNELS[$i]}")" "${LNX_VERSIONS[$i]}" "${LNX_STATE[$i]:-}"
+}
+
+# The "Select command:" block under the browser table. verb: Patch|Restore|Check.
+print_command_menu() {
+    local count="$1" verb="$2" allow_restore="$3" range
+    if (( count == 1 )); then range="1"; else range="1-${count}"; fi
     echo ""
-    echo "      ${C_DIM}${LNX_PATHS[$i]}${C_RESET}"
+    echo "${C_BOLD}Select command:${C_RESET}"
+    echo ""
+    echo "  [${range}]  ${verb} browser"
+    $allow_restore && echo "  [r]    Restore patched"
+    echo "  [c]    Use custom path"
+    echo "  [q]    Quit"
 }
 
 read_custom_path() {
@@ -1785,41 +1844,40 @@ choose_linux_install() {
         return 1
     fi
     if (( count == 1 )); then
-        okf "Found one Chrome:"; print_linux_install_row 1 0
+        infof "Found 1 browser."
     else
-        echo ""; echo "${TAG_INFO} Found ${count} Chrome versions:"
-        local j
-        for (( j = 0; j < count; j++ )); do print_linux_install_row $(( j + 1 )) "$j"; done
-        echo ""; echo "${TAG_INFO} Only the one you pick is changed; the others are left alone."
+        infof "Found ${count} browsers."
     fi
+    echo ""
+    print_table_header
+    local j
+    for (( j = 0; j < count; j++ )); do print_linux_install_row $(( j + 1 )) "$j"; done
+
+    local verb="Patch" allow_restore=true
+    [[ "$cmd" == "restore" ]] && { verb="Restore"; allow_restore=false; }
+    [[ "$cmd" == "check" ]]   && { verb="Check";   allow_restore=false; }
+    print_command_menu "$count" "$verb" "$allow_restore"
+
     while true; do
-        if (( count == 1 )); then
-            echo -n "${C_BOLD}Patch this Chrome? [Enter=yes, r=restore, c=custom path, q=quit]: ${C_RESET}"
-        else
-            echo -n "${C_BOLD}Which Chrome do you want to patch? [1-${count}, r=restore, c=custom path, q=quit]: ${C_RESET}"
-        fi
+        echo -n "${C_BOLD}Choice: ${C_RESET}"
         local line; prompt_read line || return 1
         if [[ "$line" == "q" || "$line" == "Q" ]]; then return 1; fi
         if [[ "$line" == "c" || "$line" == "C" ]]; then
             if read_custom_path; then TARGET_FILE="$CHOSEN_CUSTOM_PATH"; return 0; fi
             continue
         fi
-        if [[ "$line" == "r" || "$line" == "R" ]]; then
+        if $allow_restore && [[ "$line" == "r" || "$line" == "R" ]]; then
             cmd="restore"
             if (( count == 1 )); then CHOSEN_INDEX=0; return 0; fi
-            echo ""; echo "${TAG_INFO} Restore selected. Which Chrome do you want to restore?"
+            # Restore targets a specific browser, so ask which one.
             while true; do
-                echo -n "${C_BOLD}Which Chrome do you want to restore? [1-${count}, c=custom path, q=cancel]: ${C_RESET}"
+                echo -n "${C_BOLD}Restore which browser? [1-${count}, q=cancel]: ${C_RESET}"
                 local restore_line; prompt_read restore_line || return 1
                 if [[ "$restore_line" == "q" || "$restore_line" == "Q" ]]; then infof "Restore cancelled."; return 1; fi
-                if [[ "$restore_line" == "c" || "$restore_line" == "C" ]]; then
-                    if read_custom_path; then TARGET_FILE="$CHOSEN_CUSTOM_PATH"; return 0; fi
-                    continue
-                fi
                 if [[ "$restore_line" =~ ^[0-9]+$ ]] && (( restore_line >= 1 && restore_line <= count )); then
                     CHOSEN_INDEX=$(( restore_line - 1 )); return 0
                 fi
-                errf "Enter a number between 1 and ${count}, c for custom path, or q to cancel."
+                errf "Enter a number between 1 and ${count}, or q to cancel."
             done
         fi
         if (( count == 1 )) && [[ -z "$line" ]]; then CHOSEN_INDEX=0; return 0; fi
@@ -1839,17 +1897,28 @@ choose_macos_install() {
         echo "    Give the path, e.g. bash $0 patch \"/path/to/Google Chrome.app\""
         return 1
     fi
-    echo ""; echo "${TAG_INFO} Found ${count} Chrome install(s):"
+    if (( count == 1 )); then
+        infof "Found 1 browser."
+    else
+        infof "Found ${count} browsers."
+    fi
+    echo ""
+    print_table_header
     for (( i = 0; i < count; i++ )); do
-        echo -n "  ${C_BOLD}$(( i + 1 ))${C_RESET}) ${C_CYN}${MAC_LABELS[$i]}${C_RESET}"
-        [[ -n "${MAC_VERSIONS[$i]}" ]] && echo -n "  ${MAC_VERSIONS[$i]}"
-        ${MAC_RUNNING[$i]} && echo -n "  ${C_YEL}[open]${C_RESET}" || echo -n "  ${C_GRN}[closed]${C_RESET}"
-        echo ""; echo "      ${C_DIM}${MAC_APPS[$i]}${C_RESET}"
+        # No cheap patch-state probe for .app bundles - leave Status blank.
+        print_table_row $(( i + 1 )) "$(display_name "${MAC_LABELS[$i]}")" "${MAC_VERSIONS[$i]}" ""
     done
+
+    local verb="Patch" allow_restore=false
+    [[ "$cmd" == "restore" ]] && verb="Restore"
+    [[ "$cmd" == "check" ]]   && verb="Check"
+    print_command_menu "$count" "$verb" "$allow_restore"
+
     while true; do
-        echo -n "${C_BOLD}Which install? [1-${count}, q=quit]: ${C_RESET}"
+        echo -n "${C_BOLD}Choice: ${C_RESET}"
         local line; prompt_read line || return 1
         [[ "$line" == q || "$line" == Q ]] && return 1
+        if (( count == 1 )) && [[ -z "$line" ]]; then CHOSEN_INDEX=0; return 0; fi
         if [[ "$line" =~ ^[0-9]+$ ]] && (( line >= 1 && line <= count )); then CHOSEN_INDEX=$(( line - 1 )); return 0; fi
         errf "Enter a number between 1 and ${count}, or q."
     done
@@ -1861,9 +1930,9 @@ choose_macos_install() {
 # ============================================================================
 do_patch_elf() {
     local target="$1" assume_yes="$2" allow_partial="$3"
+    infof "Checking $(basename "$target")..."
     local fsize; fsize=$(file_size "$target")
     (( fsize > 0 )) || { errf "That file is empty."; return 1; }
-    okf "Read Chrome from ${target}."
 
     parse_elf "$target" || return 1
     local target_id target_hash
@@ -1871,7 +1940,7 @@ do_patch_elf() {
     target_hash=$(file_sha256 "$target")
     [[ -n "$target_id" ]] || { errf "This doesn't look like a valid Chrome file."; return 1; }
 
-    infof "Checking your Chrome version..."
+    infof "Searching for MV2 signatures..."
     probe_slice 0 "$target"
     if (( BEST_SATISFIED == 0 )); then
         report_layout_candidates "$target"
@@ -1882,6 +1951,7 @@ do_patch_elf() {
         warnf "Couldn't tell which Chrome version this is - nothing was changed."
         return 1
     fi
+    okf "Found matching signatures (${BEST_MS_NAME%%-*}, ${BEST_SATISFIED} gates)."
     classify_flip_states_slice "$target" || { errf "Chrome looks partly changed or damaged - nothing was changed."; return 1; }
 
     local backup="${target}.bak"
@@ -1892,7 +1962,7 @@ do_patch_elf() {
         # already on, so report that rather than the scary "not untouched" decline.
         if $BEST_FULL && (( STATE_STOCK == 0 && STATE_PATCHED > 0 )); then
             rm -f -- "$work_file"; WORK_FILE=""
-            successf "Chrome is already patched - Manifest V2 is already on (Chrome ${BEST_MS_NAME})."
+            successf "Chrome is already patched - Manifest V2 is already on."
             echo "          There's no backup here, so 'restore' isn't available."
             echo "          Reinstall Chrome if you want a clean, restorable copy."
             return 0
@@ -1902,10 +1972,9 @@ do_patch_elf() {
             echo "    Reinstall Chrome first so we can save a clean backup."
             rm -f -- "$work_file"; WORK_FILE=""; return 1
         fi
-        infof "Saving a backup..."
+        infof "Creating backup..."
         save_backup_snapshot "$target" "$backup" "$target" "$target_id" || { rm -f -- "$work_file"; WORK_FILE=""; return 1; }
         validate_backup_snapshot "$backup" || { errf "The backup couldn't be verified."; rm -f -- "$work_file"; WORK_FILE=""; return 1; }
-        okf "Backup saved."
     else
         validate_backup_snapshot "$backup" || { errf "The backup couldn't be verified, so I won't overwrite it."; rm -f -- "$work_file"; WORK_FILE=""; return 1; }
         parse_elf "$backup" || { rm -f -- "$work_file"; WORK_FILE=""; return 1; }
@@ -1926,10 +1995,8 @@ do_patch_elf() {
             infof "Chrome was updated - saving a fresh backup..."
             save_backup_snapshot "$target" "$backup" "$target" "$target_id" || { rm -f -- "$work_file"; WORK_FILE=""; return 1; }
             validate_backup_snapshot "$backup" || { errf "The new backup couldn't be verified."; rm -f -- "$work_file"; WORK_FILE=""; return 1; }
-            okf "Backup updated."
         elif $BACKUP_LEGACY; then
             save_backup_snapshot "$target" "$backup" "$backup" "$BACKUP_BUILD_ID" || { rm -f -- "$work_file"; WORK_FILE=""; return 1; }
-            okf "Backup checked and updated."
         fi
     fi
     cp -- "$backup" "$work_file"
@@ -1949,7 +2016,7 @@ do_patch_elf() {
         rm -f -- "$work_file"; WORK_FILE=""; return 1
     fi
 
-    infof "Found Chrome ${BEST_MS_NAME}. Applying ${#FLIP_OFFSETS[@]} change(s)..."
+    infof "Applying patch..."
     apply_flips_slice "$work_file"
 
     # Verify the prepared image is fully flipped and unambiguous.
@@ -1981,23 +2048,21 @@ do_patch_elf() {
     # write_target verified the copy against prepared_hash before the atomic mv,
     # so the target now equals the prepared image - no post-write re-read needed.
 
-    rule
+    okf "Patch applied successfully."
     if $BEST_FULL; then
-        successf "Done. Manifest V2 re-enabled."
-        echo "          Your older extensions will work again (Chrome ${BEST_MS_NAME}). Restart Chrome."
+        okf "Manifest V2 is enabled."
     else
-        echo "${TAG_WARNING} Only part of the change was applied (Chrome ${BEST_MS_NAME}, ${BEST_SATISFIED}/${BEST_TOTAL})."
+        echo "${TAG_WARNING} Only part of the change was applied (${BEST_SATISFIED}/${BEST_TOTAL})."
         echo "          $((BEST_TOTAL - BEST_SATISFIED)) part(s) couldn't be found, so this may not fully work."
         echo "          Please report your Chrome version. To undo: sudo bash $0 restore"
     fi
-    rule
     return 0
 }
 
 do_restore_elf() {
     local target="$1" assume_yes="$2" force_restore="$3"
     local backup="${target}.bak"
-    infof "Restoring the original Chrome..."
+    infof "Checking backup..."
     [[ -f "$backup" ]] || { errf "No backup found, so there's nothing to restore."; return 1; }
     validate_backup_snapshot "$backup" || { errf "The backup couldn't be verified."; return 1; }
     parse_elf "$backup" || return 1
@@ -2006,7 +2071,7 @@ do_restore_elf() {
     if (( BEST_SATISFIED == 0 || BEST_TIES != 1 || STATE_PATCHED != 0 )); then
         errf "The backup doesn't look like an untouched Chrome."; return 1
     fi
-    okf "Backup looks good (Chrome ${BEST_MS_NAME})."
+    okf "Backup found."
     parse_elf "$target" || return 1
     local target_id target_hash
     target_id=$(get_elf_build_id "$target")
@@ -2025,10 +2090,14 @@ do_restore_elf() {
     fi
     request_target_close "$target" "$assume_yes" || return 1
     if (( $(proc_holders "$target") > 0 )); then errf "Chrome reopened before we could finish - nothing was changed."; return 1; fi
+    infof "Restoring $(basename "$target")..."
     write_target "$target" "$backup" "$target_hash" "$BACKUP_HASH" || return 1
-    successf "Done. Your original Chrome is back."
+    okf "Restore complete."
     rm -f -- "$backup" "$(backup_meta_path "$backup")"
-    infof "Backup removed - Chrome is back to normal."
+
+    echo ""
+    okf "Original file restored."
+    okf "Manifest V2 patch removed."
     return 0
 }
 
@@ -2046,7 +2115,7 @@ do_check_elf() {
         local state="already patched"
         (( STATE_STOCK > 0 && STATE_PATCHED == 0 )) && state="not patched yet"
         (( STATE_STOCK > 0 && STATE_PATCHED > 0 )) && state="partly patched"
-        okf "This is Chrome ${BEST_MS_NAME} - ${state}."
+        okf "This is Chrome $(chrome_label "$BEST_MS_NAME") - ${state}."
     fi
     local backup="${target}.bak"
     if [[ -f "$backup" ]]; then
@@ -2082,7 +2151,7 @@ do_check_macho() {
                 local state="not patched yet"
                 if (( STATE_PATCHED > 0 && STATE_STOCK == 0 )); then state="already patched"
                 elif (( STATE_PATCHED > 0 && STATE_STOCK > 0 )); then state="partly patched"; fi
-                okf "  ${c#macho-}: Chrome ${BEST_MS_NAME} - ${state}."
+                okf "  ${c#macho-}: Chrome $(chrome_label "$BEST_MS_NAME") - ${state}."
             else
                 warnf "  ${c#macho-}: looks partly changed or damaged."
             fi
@@ -2110,14 +2179,14 @@ remove_macho_backup() {
 
 do_restore_macho() {
     local target="$1" app_path="$2" assume_yes="$3" force_restore="$4"
-    infof "Restoring the original Chrome..."
+    infof "Checking backup..."
     parse_macho "$target" >/dev/null || return 1
     compute_identity "$target"; local target_id="$IDENTITY_UUIDS"
     TARGET_TOKEN=$(identity_token)                 # backup dir is keyed by this
     local backup; backup=$(backup_path)
     [[ -f "$backup" ]] || { errf "No backup found, so there's nothing to restore."; return 1; }
     validate_backup_snapshot "$backup" || { errf "The backup couldn't be verified."; return 1; }
-    okf "Backup looks good."
+    okf "Backup found."
 
     local target_hash; target_hash=$(file_sha256 "$target")
     if [[ "$target_id" != "$BACKUP_IDENTITY" ]] && ! $force_restore; then
@@ -2132,34 +2201,39 @@ do_restore_macho() {
     fi
 
     if [[ -n "$app_path" ]]; then quit_chrome "$app_path" "$assume_yes" || return 1; fi
+    infof "Restoring $(basename "$target")..."
     write_target "$target" "$backup" "$target_hash" "$BACKUP_HASH" || return 1
     if [[ -n "$app_path" ]] && have_codesign; then
         resign_inside_out "$FRAMEWORK_BUNDLE" "$app_path" || warnf "Re-signing failed. Try again: bash $0 restore \"$app_path\""
     fi
-    successf "Done. Your original Chrome is back."
+    okf "Restore complete."
     remove_macho_backup "$backup"
-    infof "Backup removed - Chrome is back to normal."
+
+    echo ""
+    okf "Original file restored."
+    okf "Manifest V2 patch removed."
     return 0
 }
 
 do_patch_macho() {
     local target="$1" app_path="$2" assume_yes="$3" allow_partial="$4"
+    infof "Checking $(basename "$target")..."
     local size; size=$(file_size "$target")
     (( size > 0 )) || { errf "That file is empty."; return 1; }
-    okf "Read Chrome from ${target}."
     parse_macho "$target" || return 1
     compute_identity "$target"; local target_id="$IDENTITY_UUIDS"
     TARGET_TOKEN=$(identity_token)                 # backup dir is keyed by this
     local target_hash; target_hash=$(file_sha256 "$target")
 
     # Decide which slices we will patch (probe each against the live target).
+    infof "Searching for MV2 signatures..."
     local idx to_patch=() ic=() any=false default_declined=false
     for (( idx = 0; idx < NUM_SLICES; idx++ )); do
         local c="${SLICE_CONTAINER[$idx]}"
         probe_slice "$idx" "$target"
         if slice_decision "$c" "$allow_partial"; then
             to_patch+=("$idx"); ic+=("$c"); any=true
-            infof "  ${c#macho-}: found Chrome ${BEST_MS_NAME} - will patch."
+            okf "  ${c#macho-}: found matching signatures (${BEST_MS_NAME%%-*}, ${BEST_SATISFIED} gates)."
         else
             warnf "  ${c#macho-}: skipped (${SKIP_REASON})."
             [[ "$c" == "macho-x64" ]] && default_declined=true
@@ -2169,7 +2243,7 @@ do_patch_macho() {
 
     local backup; backup=$(backup_path)
     if [[ ! -f "$backup" ]]; then
-        infof "Saving a backup..."
+        infof "Creating backup..."
         save_backup_snapshot "$target" "$backup" "$target" "$target_id" || return 1
         validate_backup_snapshot "$backup" || { errf "The backup couldn't be verified."; return 1; }
     else
@@ -2242,7 +2316,8 @@ do_patch_macho() {
     fi
 
     rule
-    successf "Done. Manifest V2 re-enabled."
+    okf "Patch applied successfully."
+    okf "Manifest V2 is enabled."
     [[ -n "$app_path" ]] && echo "          Restart Chrome. To undo: bash $0 restore \"$app_path\""
     rule
     return 0
@@ -2315,11 +2390,12 @@ cleanup() {
     for t in "${WORK_FILE:-}" "${WRITE_TMP:-}" "${META_TMP:-}"; do
         [[ -n "$t" && -f "$t" ]] && rm -f -- "$t"
     done
-    # On failure, hold a double-clicked terminal open so the error stays visible.
-    # Skip when scripting (--quiet) or with no interactive terminal (CI/pipes/tests).
-    if (( rc != 0 )) && ! ${QUIET:-false} && [[ -t 0 && -t 1 ]]; then
+    # Hold a double-clicked terminal open so the result stays visible - on any
+    # outcome, success included. Skip when scripting (--quiet) or with no
+    # interactive terminal (CI/pipes/tests).
+    if ! ${QUIET:-false} && [[ -t 0 && -t 1 ]]; then
         echo
-        read -n 1 -s -r -p "Press any key to exit..." || true
+        read -r -p "Press Enter to exit." _ || true
         echo
     fi
     return "$rc"
@@ -2368,8 +2444,14 @@ main() {
     if [[ -n "$target_path" ]]; then
         [[ -e "$target_path" ]] || { errf "That path doesn't exist: ${target_path}"; exit 1; }
         resolve_any_target "$target_path" || exit 1
+        # Best-effort display version for the chosen target ('' = unknown).
+        if [[ "$TARGET_CONTAINER" == "macho" ]]; then
+            if [[ -n "$APP_PATH" ]]; then TARGET_VERSION="$(app_version "$APP_PATH" || true)"; fi
+        else
+            TARGET_VERSION="$(detect_target_version "$TARGET_FILE" || true)"
+        fi
     elif [[ "$(uname -s 2>/dev/null || echo)" == "Darwin" ]]; then
-        infof "Looking for Chrome or Chromium..."
+        infof "Searching for supported browsers..."
         enumerate_macos_installs
         if $QUIET; then
             (( ${#MAC_APPS[@]} == 1 )) || { errf "With --quiet, give the path to the Chrome you want."; exit 1; }
@@ -2378,9 +2460,10 @@ main() {
             choose_macos_install || exit 0
         fi
         APP_PATH="${MAC_APPS[$CHOSEN_INDEX]}"; TARGET_CONTAINER="macho"
+        TARGET_VERSION="${MAC_VERSIONS[$CHOSEN_INDEX]}"
         resolve_framework_from_app "$APP_PATH" || { errf "Couldn't find Chrome inside ${APP_PATH}"; exit 1; }
     else
-        infof "Looking for Chrome or Chromium..."
+        infof "Searching for supported browsers..."
         enumerate_linux_installs
         if $QUIET; then
             if (( ${#LNX_CHANNELS[@]} == 0 )); then
@@ -2388,8 +2471,11 @@ main() {
                 echo "    Give the path, e.g. sudo bash $0 patch /path/to/chrome"; exit 1
             fi
             if (( ${#LNX_CHANNELS[@]} > 1 )); then
-                errf "Found ${#LNX_CHANNELS[@]} Chrome versions, and --quiet can't ask which one."
-                local j; for (( j = 0; j < ${#LNX_CHANNELS[@]}; j++ )); do print_linux_install_row $(( j + 1 )) "$j"; done
+                errf "Found ${#LNX_CHANNELS[@]} browsers, and --quiet can't ask which one."
+                local j
+                for (( j = 0; j < ${#LNX_CHANNELS[@]}; j++ )); do
+                    echo "      ${LNX_PATHS[$j]}"
+                done
                 echo "    Re-run with the path of the one you want."; exit 1
             fi
             CHOSEN_INDEX=0
@@ -2398,20 +2484,36 @@ main() {
         fi
         if [[ -z "$TARGET_FILE" ]]; then TARGET_FILE="${LNX_PATHS[$CHOSEN_INDEX]}"; fi
         TARGET_CONTAINER="elf"
+        # A picked install knows its version; a custom path ('c') has to ask.
+        if (( $CHOSEN_INDEX >= 0 )); then
+            TARGET_VERSION="${LNX_VERSIONS[$CHOSEN_INDEX]}"
+        else
+            TARGET_VERSION="$(detect_target_version "$TARGET_FILE" || true)"
+        fi
     fi
+    # A chosen install name for the "Selected browser" line below.
+    local sel_name="" sel_ver="${TARGET_VERSION:-}"
     if [[ "$TARGET_CONTAINER" == "macho" ]]; then
         detect_host_container
         infof "Your Mac: $(host_arch_label)."
-        okf "File: ${TARGET_FILE}"
         if [[ -n "$APP_PATH" ]]; then
-            okf "App: ${APP_PATH}"
-        elif [[ "$cmd" != "check" ]]; then
-            warnf "No app found - the re-signing step will be skipped."
+            if (( CHOSEN_INDEX >= 0 && ${#MAC_LABELS[@]:-0} > 0 )); then
+                sel_name="$(display_name "${MAC_LABELS[$CHOSEN_INDEX]}")"
+            else
+                sel_name="$(basename "$APP_PATH" .app)"
+            fi
+        else
+            sel_name="$(basename "$TARGET_FILE")"
+            [[ "$cmd" != "check" ]] && warnf "No app found - the re-signing step will be skipped."
         fi
     else
-        okf "Chrome: ${C_CYN}$(basename "$(dirname "$TARGET_FILE")")${C_RESET}"
-        okf "File: ${TARGET_FILE}"
+        if (( CHOSEN_INDEX >= 0 )); then
+            sel_name="$(display_name "${LNX_CHANNELS[$CHOSEN_INDEX]}")"
+        else
+            sel_name="$(basename "$(dirname "$TARGET_FILE")")"
+        fi
     fi
+    okf "Selected browser: ${sel_name}${sel_ver:+ ${sel_ver}}"
 
     # Check is read-only. Patch/restore need write access to the target and its
     # directory for the atomic replace/backup, but a user-owned offline copy

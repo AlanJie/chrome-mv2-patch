@@ -117,7 +117,7 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$AppVersion      = '1.6.0'
+$AppVersion      = '1.6.1'
 $SignaturesFile  = 'signatures.json'
 $script:CsLoaded = $false
 
@@ -158,6 +158,12 @@ $EmbeddedSignatures = @'
 # ============================================================================
 
 $script:C = @{}
+# Set for the elevated relaunch (Invoke-Main): Initialize-Colors then bakes a
+# black background into every ANSI code it emits. Under Windows Terminal the
+# window background comes from the terminal profile - Windows PowerShell's is
+# the classic blue - and a plain reset ($e[0m) would fall back to it around
+# the text, leaving blue behind the words.
+$script:ForceBlackBg = $false
 
 # Decides once whether to emit ANSI colour, then builds $C and the [+]/[!] tags.
 # Must run before any output: the tags are empty until it does.
@@ -171,9 +177,12 @@ function Initialize-Colors {
 
     if ($vt) {
         $e = [char]27
+        # 24-bit black background, appended to every colour code (and Reset) so
+        # no write ever falls back to the terminal profile's background.
+        $bg = if ($script:ForceBlackBg) { ';48;2;0;0;0' } else { '' }
         $script:C = @{
-            Reset = "$e[0m"; Red = "$e[91m"; Grn = "$e[92m"
-            Yel   = "$e[93m"; Cyn = "$e[96m"; Dim = "$e[90m"; Bold = "$e[1m"
+            Reset = "$e[0${bg}m"; Red = "$e[91${bg}m"; Grn = "$e[92${bg}m"
+            Yel   = "$e[93${bg}m"; Cyn = "$e[96${bg}m"; Dim = "$e[90${bg}m"; Bold = "$e[1m"
         }
     } else {
         $script:C = @{ Reset=''; Red=''; Grn=''; Yel=''; Cyn=''; Dim=''; Bold='' }
@@ -196,8 +205,7 @@ function Write-Rule    { Write-Host "$($C.Cyn)==================================
 
 function Write-Banner {
     Write-Rule
-    Write-Host "$($C.Bold)             Chrome MV2 Patcher (PowerShell)              $($C.Reset)"
-    Write-Host "$($C.Dim)                          v$AppVersion                          $($C.Reset)"
+    Write-Host "$($C.Bold)                    MV2 Patcher v$AppVersion                    $($C.Reset)"
     Write-Rule
 }
 
@@ -218,9 +226,6 @@ function Format-HexUpper {
 
 function Initialize-NativeHelpers {
     if ($script:CsLoaded) { return }
-    Write-Info 'Getting ready...'
-    $sw = [Diagnostics.Stopwatch]::StartNew()
-
     Add-Type -TypeDefinition @'
 using System;
 using System.Collections.Generic;
@@ -353,9 +358,7 @@ public static class Mv2Native
     }
 }
 '@
-    $sw.Stop()
     $script:CsLoaded = $true
-    Write-Ok 'Ready.'
 }
 
 # ============================================================================
@@ -689,7 +692,7 @@ function Write-AtomicFile {
 
         if ($ExpectedCurrentHash) {
             if (-not (Test-Path -LiteralPath $full -PathType Leaf)) { throw 'The file went missing before we could update it.' }
-            $now = (Get-FileHash -LiteralPath $full -Algorithm SHA256).Hash.ToLowerInvariant()
+            $now = Get-ByteHash ([IO.File]::ReadAllBytes($full))
             if ($now -ne $ExpectedCurrentHash.ToLowerInvariant()) {
                 throw 'Chrome changed while we were working - nothing was changed. Try again.'
             }
@@ -859,7 +862,8 @@ function Invoke-PatchMilestones {
         $Img,
         [array]$Milestones,
         [bool]$AllowPartial = $false,
-        [bool]$Apply = $true
+        [bool]$Apply = $true,
+        [string]$Version = ''    # display-only: the target's detected version
     )
 
     # Ranking: a milestone whose EVERY site matched (full) always beats a partial
@@ -932,7 +936,8 @@ function Invoke-PatchMilestones {
         return $res
     }
 
-    Write-Info ("Found Chrome {0}. Applying {1} change(s)..." -f $best.Ms.Name, $best.Flips.Count)
+    $label = Get-ChromeLabel -Version $Version -Milestone $best.Ms.Name
+    Write-Info "Applying $($best.Flips.Count) change(s)..."
 
     # Three cases per site: already flipped (counted, nothing written), stock jg
     # (flip it), anything else (left alone with a warning - never guess).
@@ -945,7 +950,6 @@ function Invoke-PatchMilestones {
         if ($f.Site.Kind -eq 0) {
             $cur = $Buf[$f.JgRaw]
             if ($cur -eq 0xEB) {
-                Write-Host '    [i] One change was already applied.'
                 $already++; $res.Already++
                 $res.Written += [pscustomobject]@{ RVA = $jgRVA; Bytes = [byte[]]@(0xEB) }
                 continue
@@ -961,7 +965,6 @@ function Invoke-PatchMilestones {
         } elseif ($f.Site.Kind -eq 1) {
             $o0 = $Buf[$f.JgRaw]; $o1 = $Buf[$f.JgRaw + 1]
             if ($o0 -eq 0x90 -and $o1 -eq 0xE9) {
-                Write-Host '    [i] One change was already applied.'
                 $already++; $res.Already++
                 $res.Written += [pscustomobject]@{ RVA = $jgRVA; Bytes = [byte[]]@(0x90, 0xE9) }
                 continue
@@ -985,7 +988,6 @@ function Invoke-PatchMilestones {
             $cond    = $cur -band 0x0F
             $patched = [byte](($cur -band 0xF0) -bor 0x0E)
             if ($cond -eq 0x0E) {
-                Write-Host '    [i] One change was already applied.'
                 $already++; $res.Already++
                 $res.Written += [pscustomobject]@{ RVA = $jgRVA; Bytes = [byte[]]@($patched) }
                 continue
@@ -999,18 +1001,12 @@ function Invoke-PatchMilestones {
             $applied++; $res.Flips++
             $res.Written += [pscustomobject]@{ RVA = $jgRVA; Bytes = [byte[]]@($patched) }
         }
-
-        if ($Apply) {
-            Write-Host ("    {0} Change {1} of {2} applied." -f $script:TagOK, $applied, $best.Flips.Count)
-        } else {
-            Write-Host ("    {0} Change {1} of {2} found." -f $script:TagOK, $applied, $best.Flips.Count)
-        }
     }
     $res.Flips += $already   # count already-applied sites toward the flip total
 
     if (-not $res.Full) {
-        Write-Host ("    {0} {1} change(s) couldn't be found for Chrome {2}, so this may not fully work. Please report this Chrome version." -f `
-            $script:TagWarn, ($res.Total - $res.Located), $best.Ms.Name)
+        Write-Host ("    {0} {1} of {2} change(s) couldn't be found for Chrome {3}, so this may not fully work. Please report this Chrome version." -f `
+            $script:TagWarn, ($res.Total - $res.Located), $res.Total, $label)
     }
 
     $res.Status = if ($applied -gt 0) { 1 } else { 2 }
@@ -1316,7 +1312,7 @@ function Invoke-SelfElevate {
         if ($Signatures) { $argv += '-Signatures'; $argv += (Get-QuotedArg ([IO.Path]::GetFullPath($Signatures))) }
         $argv += '-Relaunched'
 
-        Write-Info 'Asking for administrator access (you''ll see a Windows prompt)...'
+        Write-Info 'Asking for admin access...'
         try {
             $p = Start-Process -FilePath $exe -ArgumentList ($argv -join ' ') -Verb RunAs `
                                -WorkingDirectory (Get-Location).Path -Wait -PassThru -ErrorAction Stop
@@ -1489,6 +1485,35 @@ function Compare-Version {
 
 function Get-BackupPath { param([string]$Target) return "$Target.bak" }
 
+# Best-effort display version of the target: the PE version resource first
+# (present in every chrome.dll, works for a loose copy in any folder), then the
+# install's version-looking parent directory name. Display-only - '' means
+# unknown, and output then falls back to the matched milestone table's name.
+function Get-ChromeVersion {
+    param($Target)
+
+    $ver = ''
+    try   { $ver = ([Diagnostics.FileVersionInfo]::GetVersionInfo($Target.Path)).FileVersion.Trim() }
+    catch { }
+    if ($ver) { return $ver }
+    if ($Target.PSObject.Properties['Version']) { return [string]$Target.Version }
+    return ''
+}
+
+# The "Chrome X" string for output. A milestone table's name says which gate
+# set matched, NOT which browser this is - a 153/154 build whose gates are
+# unchanged legitimately matches the 152 table - so show the detected version
+# when we have one, noting the matched table when its milestone differs; the
+# table name alone otherwise.
+function Get-ChromeLabel {
+    param([string]$Version, [string]$Milestone)
+
+    if (-not $Version) { return $Milestone }
+    $major = ($Version -split '\.')[0]
+    if ($Milestone -match "^$major(\D|$)") { return $Version }
+    return "$Version (using the Chrome $Milestone changes)"
+}
+
 # Returns the chrome.dll under the highest-numbered version subdirectory, or one
 # sitting directly in the Application dir.
 function Find-DllUnderApplication {
@@ -1591,23 +1616,29 @@ function Get-ChromeInstalls {
 # from stdin - see Confirm-CloseConsent and Resolve-Target.
 # ============================================================================
 
-# One numbered line per channel: "3) Beta 152.0.7444.20 [RUNNING, 8 process(es)]".
+# Menu display name: the Google channels get the "Chrome " prefix; Chromium and
+# anything else (custom path, local file) is shown as-is.
+function Get-BrowserDisplayName {
+    param([string]$Channel)
+    if ($Channel -in 'Stable', 'Beta', 'Dev', 'Canary') { return "Chrome $Channel" }
+    return $Channel
+}
+
+# One numbered row of the browser table:
+#   "  1  Chrome Stable    152.0.7977.65       Patched".
 function Show-InstallRow {
     param([int]$Index, $Inst)
-    $line = "  $($C.Bold)$Index)$($C.Reset) $($C.Cyn)$($Inst.Channel)$($C.Reset)"
-    if ($Inst.Version) { $line += "  $($Inst.Version)" }
-    if ($Inst.Running) {
-        $line += "  $($C.Yel)[open]$($C.Reset)"
-    } else {
-        $line += "  $($C.Grn)[closed]$($C.Reset)"
-    }
-    if ($Inst.PSObject.Properties['State']) {
-        if     ($Inst.State -eq 'patched')     { $line += "  $($C.Grn)[patched]$($C.Reset)" }
-        elseif ($Inst.State -eq 'not patched') { $line += "  $($C.Dim)[not patched]$($C.Reset)" }
-    }
-    if ($Inst.HasBackup) { $line += " $($C.Dim)(backup saved)$($C.Reset)" }
-    Write-Host $line
-    Write-Host "      $($C.Dim)$($Inst.Path)$($C.Reset)"
+    $status = if ($Inst.State -eq 'patched') { "$($C.Grn)Patched$($C.Reset)" }
+              elseif ($Inst.State -eq 'not patched') { "$($C.Dim)Not patched$($C.Reset)" }
+              else { '' }
+    Write-Host ("  {0,-2} {1,-17}{2,-20}{3}" -f $Index, (Get-BrowserDisplayName $Inst.Channel), [string]$Inst.Version, $status)
+}
+
+function Show-InstallTable {
+    param([array]$Installs)
+    Write-Host ''
+    Write-Host "$($C.Bold)  #  Browser          Version             Status$($C.Reset)"
+    for ($i = 0; $i -lt $Installs.Count; $i++) { Show-InstallRow ($i + 1) $Installs[$i] }
 }
 
 # Prompts for a chrome.dll path until one exists, or $null if the user gives up.
@@ -1627,53 +1658,49 @@ function Read-CustomPath {
     }
 }
 
-# Lists the channels and returns the chosen one, or $null on quit. With exactly
-# one install, Enter accepts it; otherwise a number is required.
+# Lists the browsers as a table and returns the chosen one, or $null on quit.
+# With exactly one install, Enter accepts it; otherwise a number is required.
 function Select-Install {
     param([array]$Installs)
 
-    if ($Installs.Count -eq 1) {
-        Write-Ok 'Found one Chrome:'
-        Show-InstallRow 1 $Installs[0]
-    } else {
-        Write-Host "`n$script:TagInfo Found $($Installs.Count) Chrome versions:"
-        for ($i = 0; $i -lt $Installs.Count; $i++) { Show-InstallRow ($i + 1) $Installs[$i] }
-        Write-Host "`n$script:TagInfo Only the one you pick is changed; the others are left alone."
-    }
+    $count = $Installs.Count
+    Write-Info ("Found {0} browser{1}." -f $count, $(if ($count -ne 1) { 's' }))
+    Show-InstallTable $Installs
 
     # 'check' is read-only and must never turn into a write, so it neither offers
     # nor honors the restore switch; only 'patch' may divert to restore. The verb
-    # keeps the prompt honest for whichever command is actually running.
+    # keeps the menu honest for whichever command is actually running.
     $verb = switch ($script:Command) { 'check' { 'Check' } 'restore' { 'Restore' } default { 'Patch' } }
-    $verbLower = $verb.ToLower()
     $allowRestore = ($script:Command -eq 'patch')
+    $range = if ($count -eq 1) { '1' } else { "1-$count" }
+
+    Write-Host ''
+    Write-Host "$($C.Bold)Select command:$($C.Reset)"
+    Write-Host ''
+    Write-Host "  [$range]  $verb browser"
+    if ($allowRestore) { Write-Host '  [r]    Restore patched' }
+    Write-Host '  [c]    Use custom path'
+    Write-Host '  [q]    Quit'
 
     while ($true) {
-        $restoreOpt = if ($allowRestore) { 'r=restore, ' } else { '' }
-        $prompt = if ($Installs.Count -eq 1) {
-            "$verb this Chrome? [Enter=yes, ${restoreOpt}c=custom path, q=quit]"
-        } else {
-            "Which Chrome do you want to ${verbLower}? [1-$($Installs.Count), ${restoreOpt}c=custom path, q=quit]"
-        }
-        $line = (Read-Host "`n$prompt").Trim()
+        $line = (Read-Host "`nChoice").Trim()
 
         if ($line -in 'q', 'Q') { return $null }
         if ($allowRestore -and $line -in 'r', 'R') {
             $script:Command = 'restore'
-            if ($Installs.Count -eq 1) { return $Installs[0] }
-            # Show restore-specific prompt for multiple channels
-            Write-Host "`n$script:TagInfo Restore selected. Which Chrome do you want to restore?"
+            if ($count -eq 1) { return $Installs[0] }
+            # Restore targets a specific browser, so ask which one.
             while ($true) {
-                $restoreLine = (Read-Host "`nWhich Chrome do you want to restore? [1-$($Installs.Count), q=cancel]").Trim()
+                $restoreLine = (Read-Host "`nRestore which browser? [1-$count, q=cancel]").Trim()
                 if ($restoreLine -in 'q', 'Q') {
                     Write-Info 'Restore cancelled.'
                     return $null
                 }
                 $rn = 0
-                if ([int]::TryParse($restoreLine, [ref]$rn) -and $rn -ge 1 -and $rn -le $Installs.Count) {
+                if ([int]::TryParse($restoreLine, [ref]$rn) -and $rn -ge 1 -and $rn -le $count) {
                     return $Installs[$rn - 1]
                 }
-                Write-Err "Enter a number between 1 and $($Installs.Count), or q to cancel."
+                Write-Err "Enter a number between 1 and $count, or q to cancel."
             }
         }
         if ($line -in 'c', 'C') {
@@ -1681,16 +1708,16 @@ function Select-Install {
             if ($pick) { return $pick }
             continue
         }
-        if ($Installs.Count -eq 1 -and $line -eq '') { return $Installs[0] }
+        if ($count -eq 1 -and $line -eq '') { return $Installs[0] }
         $n = 0
-        if ([int]::TryParse($line, [ref]$n) -and $n -ge 1 -and $n -le $Installs.Count) {
+        if ([int]::TryParse($line, [ref]$n) -and $n -ge 1 -and $n -le $count) {
             return $Installs[$n - 1]
         }
         $restoreHint = if ($allowRestore) { 'r to restore, ' } else { '' }
-        if ($Installs.Count -eq 1) {
+        if ($count -eq 1) {
             Write-Err "Press Enter to accept, ${restoreHint}c for a custom path, or q to quit."
         } else {
-            Write-Err "Enter a number between 1 and $($Installs.Count), ${restoreHint}c for a custom path, or q to quit."
+            Write-Err "Enter a number between 1 and $count, ${restoreHint}c for a custom path, or q to quit."
         }
     }
 }
@@ -1726,7 +1753,7 @@ function Resolve-Target {
         return (Get-InstallDetails -TargetPath $TargetPath -Channel '')
     }
 
-    Write-Info 'Looking for Chrome or Chromium...'
+    Write-Info 'Searching for supported browsers...'
     $installs = @(Get-ChromeInstalls)
 
     if ($installs.Count -eq 0) {
@@ -1742,8 +1769,11 @@ function Resolve-Target {
         return $null
     }
     if (-not $Interactive -and $installs.Count -gt 1) {
-        Write-Err "Found $($installs.Count) Chrome versions, and -Quiet can't ask which one."
-        for ($i = 0; $i -lt $installs.Count; $i++) { Show-InstallRow ($i + 1) $installs[$i] }
+        Write-Err "Found $($installs.Count) browsers, and -Quiet can't ask which one."
+        Show-InstallTable $installs
+        for ($i = 0; $i -lt $installs.Count; $i++) {
+            Write-Host "      $($C.Dim)$($installs[$i].Path)$($C.Reset)"
+        }
         Write-Host '    Re-run with the path of the one you want.'
         return $null
     }
@@ -1759,20 +1789,32 @@ function Resolve-Target {
 function Invoke-Patch {
     param($Target, [bool]$AssumeYes)
 
+    Write-Info 'Checking chrome.dll...'
     $buf = [IO.File]::ReadAllBytes($Target.Path)
     if ($buf.Length -eq 0) { Write-Err 'That file is empty.'; return 1 }
-    Write-Ok "Read Chrome from $($Target.Path)."
 
     $img = Open-Image $buf
+    $chromeVer = Get-ChromeVersion -Target $Target
     $targetIdentity = Get-PeIdentity -Buf $buf -Img $img
     $targetHash = $targetIdentity.SHA256
 
     $milestones = @(Import-Milestones | Where-Object { $_.Container -eq $img.Format })
-    Write-Info 'Getting Chrome ready...'
     if ($milestones.Count -eq 0) {
         Write-Warn "This kind of Chrome isn't supported yet - nothing was changed."
         Show-LayoutCandidates -Buf $buf -Img $img
         return 1
+    }
+
+    # Recognize the build up front so the signature table it uses is reported
+    # before the backup policy runs. The matcher accepts stock and already-
+    # patched bytes alike, so this works whether or not the target is patched.
+    # Declines (unrecognized / tied / partial without -AllowPartial) stay silent
+    # here - the backup policy and the apply pass below print their own reasons.
+    Write-Info 'Searching for MV2 signatures...'
+    $recognized = Invoke-PatchMilestones -Buf $buf -Img $img -Milestones $milestones `
+        -AllowPartial $AllowPartial.IsPresent -Apply $false 6>$null
+    if ($recognized.Status -ne 0 -and -not $recognized.Reason) {
+        Write-Ok ("Found matching signatures ({0}, {1} gates)." -f $recognized.Milestone, $recognized.Located)
     }
 
     # Backups are accepted only when they parse as clean stock and describe the
@@ -1790,10 +1832,9 @@ function Invoke-Patch {
             Write-Err "There's no backup yet, and this doesn't look like an untouched Chrome."
             return 1
         }
-        Write-Info 'Saving a backup...'
+        Write-Info 'Creating backup...'
         Save-BackupSnapshot -TargetPath $Target.Path -BackupPath $backupPath -Buf $buf -Identity $targetIdentity
         $backup = Read-ValidatedBackup $backupPath
-        Write-Ok 'Backup saved.'
     } else {
         try {
             $backup = Read-ValidatedBackup $backupPath
@@ -1827,28 +1868,24 @@ function Invoke-Patch {
             Write-Info 'Chrome was updated - saving a fresh backup...'
             Save-BackupSnapshot -TargetPath $Target.Path -BackupPath $backupPath -Buf $buf -Identity $targetIdentity
             $backup = Read-ValidatedBackup $backupPath
-            Write-Ok 'Backup updated.'
         } elseif ($backup.Legacy) {
             Save-BackupSnapshot -TargetPath $Target.Path -BackupPath $backupPath -Buf $backup.Buf -Identity $backup.Identity
-            Write-Ok 'Backup checked and updated.'
         }
     }
 
     $buf = [byte[]]$backup.Buf.Clone()
     $img = Open-Image $buf
 
-    Write-Info 'Checking your Chrome version...'
+    Write-Info 'Applying patch...'
     $patch = Invoke-PatchMilestones -Buf $buf -Img $img -Milestones $milestones `
-        -AllowPartial $AllowPartial.IsPresent -Apply $true
+        -AllowPartial $AllowPartial.IsPresent -Apply $true -Version $chromeVer 6>$null
     if ($patch.Status -eq 0) {
-        Show-LayoutCandidates -Buf $buf -Img $img
-        Write-Warn "This Chrome version isn't recognized."
-        Write-Host '    Nothing was changed. It may be too new - please report your Chrome version.'
+        Write-Err 'Something went wrong while preparing the change - nothing was changed.'
         return 1
     }
 
-    $msg = if ($patch.Status -eq 1) { 'patched.' } else { 'was already patched (no change needed).' }
-    Write-Info "Chrome $($patch.Milestone) $msg"
+    $msg = if ($patch.Status -eq 1) { 'Patch applied successfully.' } else { 'Chrome was already patched (no change needed).' }
+    Write-Ok $msg
 
     Complete-Image -Img $img -Buf $buf
     if (-not (Test-PatchOutput -Buf $buf -Img $img -Patch $patch)) {
@@ -1876,16 +1913,13 @@ function Invoke-Patch {
     # prepared image on success - no post-write re-read/re-hash is needed.
     Write-Target -TargetPath $Target.Path -Buf $buf -ExpectedCurrentHash $targetHash -KnownBufHash $preparedHash
 
-    Write-Rule
     if ($patch.Full) {
-        Write-Success 'Done. Manifest V2 re-enabled.'
-        Write-Host "          Your older extensions will work again (Chrome $($patch.Milestone)). Restart Chrome."
+        Write-Ok 'Manifest V2 is enabled.'
     } else {
-        Write-Host "$script:TagWarning Only part of the change was applied (Chrome $($patch.Milestone), $($patch.Located)/$($patch.Total))."
+        Write-Host "$script:TagWarning Only part of the change was applied ($($patch.Located)/$($patch.Total))."
         Write-Host "          $($patch.Total - $patch.Located) part(s) couldn't be found, so this may not fully work."
         Write-Host '          Please report your Chrome version. To undo: .\chrome-mv2.ps1 restore'
     }
-    Write-Rule
     return 0
 }
 
@@ -1894,7 +1928,7 @@ function Invoke-Patch {
 function Invoke-Restore {
     param($Target, [bool]$AssumeYes)
 
-    Write-Info 'Restoring the original Chrome...'
+    Write-Info 'Checking backup...'
     $backupPath = Get-BackupPath $Target.Path
     if (-not (Test-Path -LiteralPath $backupPath -PathType Leaf)) {
         Write-Err "No backup found, so there's nothing to restore."
@@ -1912,7 +1946,7 @@ function Invoke-Restore {
         Write-Err "The backup doesn't look like an untouched Chrome."
         return 1
     }
-    Write-Ok ("Backup looks good (Chrome {0})." -f $backupLayout.Probe.Milestone)
+    Write-Ok 'Backup found.'
 
     $current = [IO.File]::ReadAllBytes($Target.Path)
     $currentImg = Open-Image $current
@@ -1937,10 +1971,14 @@ function Invoke-Restore {
     }
     # As in Invoke-Patch: Write-AtomicFile verifies the read-back against the
     # backup's known hash before the atomic Replace, so no post-write re-read.
+    Write-Info 'Restoring chrome.dll...'
     Write-Target -TargetPath $Target.Path -Buf $backup.Buf -ExpectedCurrentHash $currentIdentity.SHA256 -KnownBufHash $backup.Identity.SHA256
-    Write-Success 'Done. Your original Chrome is back.'
+    Write-Ok 'Restore complete.'
     Remove-BackupFiles $backupPath
-    Write-Info 'Backup removed - Chrome is back to normal.'
+
+    Write-Host ''
+    Write-Ok 'Original file restored.'
+    Write-Ok 'Manifest V2 patch removed.'
     return 0
 }
 
@@ -1949,16 +1987,17 @@ function Invoke-Check {
     $buf = [IO.File]::ReadAllBytes($Target.Path)
     if ($buf.Length -eq 0) { Write-Err 'That file is empty.'; return 1 }
     $img = Open-Image $buf
+    $chromeVer = Get-ChromeVersion -Target $Target
     $identity = Get-PeIdentity -Buf $buf -Img $img
 
     $milestones = @(Import-Milestones | Where-Object { $_.Container -eq $img.Format })
-    $probe = Invoke-PatchMilestones -Buf $buf -Img $img -Milestones $milestones -AllowPartial $true -Apply $false 6>$null
+    $probe = Invoke-PatchMilestones -Buf $buf -Img $img -Milestones $milestones -AllowPartial $true -Apply $false -Version $chromeVer 6>$null
     if ($probe.Status -eq 0) {
         if ($probe.Reason -match 'tied') { Write-Warn "Couldn't tell which Chrome version this is." }
         else { Write-Warn "This Chrome version isn't recognized yet." }
     } else {
         $state = if ($probe.Stock -gt 0 -and $probe.Already -gt 0) { 'partly patched' } elseif ($probe.Stock -gt 0) { 'not patched yet' } else { 'already patched' }
-        Write-Ok "This is Chrome $($probe.Milestone) - $state."
+        Write-Ok ("This is Chrome {0} - {1}." -f (Get-ChromeLabel -Version $chromeVer -Milestone $probe.Milestone), $state)
     }
 
     $backupPath = Get-BackupPath $Target.Path
@@ -1985,9 +2024,27 @@ function Invoke-Check {
 # the process exit code; MV2_TEST_NO_ELEVATION=1 bypasses the admin gate so an
 # unelevated run can be tested against a scratch copy of a chrome.dll.
 function Invoke-Main {
+    # Must run BEFORE Initialize-Colors: the flag is read while the ANSI color
+    # table is built, so setting it any later has no effect on this run.
+    if ($Relaunched) { $script:ForceBlackBg = $true }
     Initialize-Colors
 
     if ($Version) { Write-Host "chrome-mv2-patch (PowerShell) $AppVersion"; return 0 }
+
+    # The elevated child opens its own console window - give that window a black
+    # background for the run. Windows PowerShell consoles start blue, and BOTH
+    # color stores must be set: $Host.UI.RawUI is what Write-Host paints with,
+    # while [Console] covers .NET writes and the Clear-Host repaint. Skipped for
+    # non-console hosts, where Clear-Host is not meaningful.
+    if ($Relaunched) {
+        try {
+            $Host.UI.RawUI.BackgroundColor = 'Black'
+            $Host.UI.RawUI.ForegroundColor = 'Gray'
+            [Console]::BackgroundColor = [ConsoleColor]::Black
+            [Console]::ForegroundColor = [ConsoleColor]::Gray
+            Clear-Host
+        } catch { }
+    }
 
     Write-Banner
 
@@ -1997,9 +2054,10 @@ function Invoke-Main {
     $target = Resolve-Target -TargetPath $Path -Interactive (-not $Quiet)
     if (-not $target) { return 1 }
 
-    Write-Host "$script:TagOK Chrome: $($C.Cyn)$($target.Channel)$($C.Reset)"
-    Write-Host "$script:TagOK File: $($target.Path)"
-    if ($target.Version) { Write-Host "$script:TagOK Version: $($target.Version)" }
+    $selName = Get-BrowserDisplayName $target.Channel
+    $selVer = Get-ChromeVersion -Target $target
+    if ($selVer) { Write-Ok "Selected browser: $selName $selVer" }
+    else         { Write-Ok "Selected browser: $selName" }
 
     if ($Command -eq 'check') { return (Invoke-Check -Target $target) }
 
@@ -2032,15 +2090,11 @@ function Invoke-Main {
 <#
 Whether to hold the window open before exiting.
 
-Two cases need it. A failure must not vanish with the window. And the elevated
-child needs it on ANY outcome, success included: that window was opened by
-Start-Process rather than by the user, and the child cannot write into the
-parent's window, so a successful patch would otherwise flash past and leave
-nothing on screen to read.
-
-Never pause when the caller asked for silence (-Quiet, scripting), when an
-elevated child has already done the pausing, or when input is redirected
-(piped/automation) - an unattended run must not hang waiting for a key.
+An interactive run always pauses - the window is often opened by a double-click,
+so both failures and successes need a "Press Enter to exit." hold. Skipped when
+the caller asked for silence (-Quiet, scripting), when an elevated child has
+already done the pausing, or when input is redirected (piped/automation) - an
+unattended run must not hang waiting for a key.
 #>
 function Test-ShouldPause {
     param(
@@ -2051,7 +2105,7 @@ function Test-ShouldPause {
         [bool]$InputRedirected
     )
     if ($QuietMode -or $ChildAlreadyPaused -or $InputRedirected) { return $false }
-    return (($ExitCode -ne 0) -or $IsElevatedChild)
+    return $true
 }
 
 # Set true when an elevated child ran: it owns its window and its own pause.
@@ -2065,9 +2119,8 @@ if (Test-ShouldPause -ExitCode $exitCode -IsElevatedChild $Relaunched.IsPresent 
                      -QuietMode $Quiet.IsPresent -ChildAlreadyPaused $script:SuppressPause `
                      -InputRedirected ([Console]::IsInputRedirected)) {
     Write-Host ''
-    Write-Host 'Press any key to exit...' -NoNewline
-    try { [void]$Host.UI.RawUI.ReadKey('NoEcho,IncludeKeyDown') }
-    catch { Read-Host | Out-Null }
+    Write-Host 'Press Enter to exit.' -NoNewline
+    try { [void](Read-Host) } catch { }
     Write-Host ''
 }
 exit $exitCode

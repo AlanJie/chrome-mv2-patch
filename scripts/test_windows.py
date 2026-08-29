@@ -204,10 +204,11 @@ try {
     $script:Signatures = $sigPath
 
     # --- window pause decision -----------------------------------------------
-    # The elevated child owns a window the user never opened and cannot write
-    # into the parent's, so it must hold that window on SUCCESS too, not just on
-    # error. Silence/automation switches still win over both.
-    Assert-True (-not (Test-ShouldPause -ExitCode 0 -IsElevatedChild $false -QuietMode $false -ChildAlreadyPaused $false -InputRedirected $false)) 'ordinary success should not pause'
+    # An interactive run always holds the window open ("Press Enter to exit."),
+    # success included - the window is often opened by a double-click, so a
+    # successful patch must not flash past. Silence/automation switches still win
+    # over both.
+    Assert-True (Test-ShouldPause -ExitCode 0 -IsElevatedChild $false -QuietMode $false -ChildAlreadyPaused $false -InputRedirected $false) 'ordinary success should pause'
     Assert-True (Test-ShouldPause -ExitCode 1 -IsElevatedChild $false -QuietMode $false -ChildAlreadyPaused $false -InputRedirected $false) 'failure should pause so the error stays visible'
     Assert-True (Test-ShouldPause -ExitCode 0 -IsElevatedChild $true -QuietMode $false -ChildAlreadyPaused $false -InputRedirected $false) 'elevated child should pause even on success'
     Assert-True (Test-ShouldPause -ExitCode 1 -IsElevatedChild $true -QuietMode $false -ChildAlreadyPaused $false -InputRedirected $false) 'elevated child should pause on failure'

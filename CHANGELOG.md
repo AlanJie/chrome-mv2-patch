@@ -1,5 +1,9 @@
 # Changelog
 
+## [1.6.1] - 2026-08-29
+
+- New menu UI.
+
 ## [1.6.0] - 2026-08-23
 
 - Chrome 154 support.
