@@ -59,10 +59,15 @@
     Target chrome.dll. Omitted: installed channels are listed to pick from.
 
 .PARAMETER Yes
-    Force close a running Chrome without asking.
+    Allow closing a running Chrome under -Quiet. An interactive run needs no
+    permission: it closes the selected browser and reopens it with the same tabs.
 
     .PARAMETER Quiet
     Do not pause on error ('Press any key to exit') (for scripting).
+
+    .PARAMETER NoReopen
+    Leave the browser closed after the change instead of reopening it with the
+    tabs it had.
 
     .PARAMETER AllowPartial
     Developer-only override which permits writing a milestone when only some of
@@ -105,6 +110,8 @@ param(
 
     [switch]$ForceRestore,
 
+    [switch]$NoReopen,
+
     [string]$Signatures,
 
     [Alias('v')]
@@ -117,7 +124,7 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$AppVersion      = '1.6.1'
+$AppVersion      = '1.7.0'
 $SignaturesFile  = 'signatures.json'
 $script:CsLoaded = $false
 
@@ -147,7 +154,9 @@ $EmbeddedSignatures = @'
     {"name":"152-win-arm64","container":"pe-arm64","sites":[{"name":"ManifestV2Handler::OnExtensionSystemReady","kind":"bcond","jgRVA":"0x01014CBC","jgOff":4,"expectedMatches":1,"sig":"3F0900718C010054091541F90A214839283140B98A000037296940B93F050071"},{"name":"StandardManagementPolicyProvider::MustRemainDisabled / StandardManagementPolicyProvider::UserMayInstall (shared body)","kind":"bcond","jgRVA":"0x013591BC","jgOff":4,"expectedMatches":2,"sig":"1F090071EC050054891641F98A224839283140B98A000037296940B93F050071"},{"name":"ManifestV2Handler::ShouldBlockExtensionEnable / ManifestV2Handler::IsExtensionAffected (shared body)","kind":"bcond","jgRVA":"0x02C1FD9C","jgOff":4,"expectedMatches":2,"sig":"1F0900710C020054291441F92A204839283140B98A000037296940B93F050071"},{"name":"ManifestV2Handler::MaybeReEnableExtension","kind":"bcond","jgRVA":"0x07702AEC","jgOff":4,"expectedMatches":1,"sig":"1F0900710C020054691641F96A224839283140B98A000037296940B93F050071"}]},
     {"name":"152-chromium","container":"pe","sites":[{"name":"manifest_v2_util::IsExtensionAffected (free predicate)","kind":"short","jgRVA":"0x04723915","jgOff":3,"expectedMatches":1,"sig":"83F9027F1F83FA08771AB90A0100000FA3D173104183F8050F"}]},
     {"name":"154","container":"pe","sites":[{"name":"manifest_v2_util::IsExtensionAffected (free predicate; covers install thunk)","kind":"short","jgRVA":"0x08E81945","jgOff":3,"expectedMatches":1,"sig":"83F9027F1F83FA08771AB90A0100000FA3D173104183F805"},{"name":"ShouldBlockExtensionEnable / IsExtensionAffected (shared body)","kind":"short","jgRVA":"0x036B5704","jgOff":4,"expectedMatches":1,"sig":"837A50027F34488B8A280200008B413080BA080200000075"},{"name":"OnExtensionSystemReady startup loop","kind":"short","jgRVA":"0x028891C3","jgOff":4,"expectedMatches":1,"sig":"837950027F2D488B91280200008B423080B90802000000750C"},{"name":"MaybeReEnableExtension","kind":"short","jgRVA":"0x08E81726","jgOff":4,"expectedMatches":1,"sig":"837E50027F2D488B8E280200008B413080BE08020000007508"},{"name":"UserMayInstall (inlined)","kind":"short","jgRVA":"0x0994F021","jgOff":4,"expectedMatches":1,"sig":"837F50027F4E488B8F280200008B413080BF0802000000750C"},{"name":"MustRemainDisabled (inlined, near jg)","kind":"near","jgRVA":"0x01663F71","jgOff":4,"expectedMatches":1,"sig":"837F50020F8F8B000000488B8F280200008B413080BF080200000075"},{"name":"ShouldBlockExtensionEnable / IsExtensionAffected (shared body, 2nd copy, diverged reg)","kind":"short","jgRVA":"0x036B5784","jgOff":4,"expectedMatches":1,"sig":"837950027F34488B91280200008B423080B908020000007508"},{"name":"IsExtensionAffected (type!=PLATFORM_APP variant; +0x208 flag then +0x228 manifest)","kind":"short","jgRVA":"0x01C21E3F","jgOff":4,"expectedMatches":1,"sig":"837F50027F2C80BF08020000000F857E010000488B87280200"}]},
-    {"name":"154-x86","container":"pe32","sites":[{"name":"manifest_v2_util::IsExtensionAffected (free predicate; covers install thunk)","kind":"short","jgRVA":"0x08BBA217","jgOff":4,"expectedMatches":1,"sig":"837D08027F278B4D0C31C083F908771FBA0A0100000FA3CA73"},{"name":"ShouldBlockExtensionEnable / IsExtensionAffected (shared body)","kind":"short","jgRVA":"0x031C47CA","jgOff":4,"expectedMatches":2,"sig":"837A28027F368B8A640100008B411880BA540100000075088B"},{"name":"OnExtensionSystemReady startup loop","kind":"short","jgRVA":"0x01B51743","jgOff":4,"expectedMatches":2,"sig":"837928027F288B91640100008B421880B95401000000750C8B"},{"name":"MaybeReEnableExtension","kind":"short","jgRVA":"0x08BBA108","jgOff":4,"expectedMatches":1,"sig":"837E28027F248B8E640100008B411880BE540100000075088B"},{"name":"UserMayInstall (inlined)","kind":"short","jgRVA":"0x093997BF","jgOff":4,"expectedMatches":1,"sig":"837F28027F458B8F640100008B411880BF5401000000750C8B"},{"name":"MustRemainDisabled (inlined, near jg)","kind":"near","jgRVA":"0x01205788","jgOff":4,"expectedMatches":1,"sig":"837B28020F8F840000008B8B640100008B411880BB54010000007508"},{"name":"IsExtensionAffected (type!=PLATFORM_APP variant)","kind":"short","jgRVA":"0x014E0239","jgOff":4,"expectedMatches":1,"sig":"837928027F268B45D480B8540100000075628B45D48B806401"}]}
+    {"name":"154-x86","container":"pe32","sites":[{"name":"manifest_v2_util::IsExtensionAffected (free predicate; covers install thunk)","kind":"short","jgRVA":"0x08BBA217","jgOff":4,"expectedMatches":1,"sig":"837D08027F278B4D0C31C083F908771FBA0A0100000FA3CA73"},{"name":"ShouldBlockExtensionEnable / IsExtensionAffected (shared body)","kind":"short","jgRVA":"0x031C47CA","jgOff":4,"expectedMatches":2,"sig":"837A28027F368B8A640100008B411880BA540100000075088B"},{"name":"OnExtensionSystemReady startup loop","kind":"short","jgRVA":"0x01B51743","jgOff":4,"expectedMatches":2,"sig":"837928027F288B91640100008B421880B95401000000750C8B"},{"name":"MaybeReEnableExtension","kind":"short","jgRVA":"0x08BBA108","jgOff":4,"expectedMatches":1,"sig":"837E28027F248B8E640100008B411880BE540100000075088B"},{"name":"UserMayInstall (inlined)","kind":"short","jgRVA":"0x093997BF","jgOff":4,"expectedMatches":1,"sig":"837F28027F458B8F640100008B411880BF5401000000750C8B"},{"name":"MustRemainDisabled (inlined, near jg)","kind":"near","jgRVA":"0x01205788","jgOff":4,"expectedMatches":1,"sig":"837B28020F8F840000008B8B640100008B411880BB54010000007508"},{"name":"IsExtensionAffected (type!=PLATFORM_APP variant)","kind":"short","jgRVA":"0x014E0239","jgOff":4,"expectedMatches":1,"sig":"837928027F268B45D480B8540100000075628B45D48B806401"}]},
+    {"name":"155","container":"pe","sites":[{"name":"OnExtensionSystemReady startup loop","kind":"short","jgRVA":"0x0155EB53","jgOff":4,"expectedMatches":1,"sig":"837950027F30488B91280200008B425080B90802000000750F"},{"name":"MustRemainDisabled (inlined, near jg)","kind":"near","jgRVA":"0x016CB234","jgOff":4,"expectedMatches":1,"sig":"837F50020F8F8E000000488B8F280200008B415080BF080200000075"},{"name":"IsExtensionAffected (type!=PLATFORM_APP variant; +0x208 flag then +0x228 manifest)","kind":"short","jgRVA":"0x01C91ED1","jgOff":4,"expectedMatches":1,"sig":"837F50027F2F80BF08020000000F8501010000488B87280200"},{"name":"ShouldBlockExtensionEnable / IsExtensionAffected (shared body)","kind":"short","jgRVA":"0x03269A44","jgOff":4,"expectedMatches":2,"sig":"837A50027F37488B8A280200008B415080BA0802000000750B"},{"name":"MaybeReEnableExtension","kind":"short","jgRVA":"0x084DEA66","jgOff":4,"expectedMatches":1,"sig":"837E50027F30488B8E280200008B415080BE0802000000750B"},{"name":"manifest_v2_util::IsExtensionAffected (free predicate; covers install thunk)","kind":"short","jgRVA":"0x084DEC85","jgOff":3,"expectedMatches":1,"sig":"83F9027F1F83FA08771AB90A0100000FA3D173104183F8050F"},{"name":"UserMayInstall (inlined)","kind":"short","jgRVA":"0x090A7931","jgOff":4,"expectedMatches":1,"sig":"837F50027F51488B8F280200008B415080BF0802000000750F"}]},
+    {"name":"155-x86","container":"pe32","sites":[{"name":"MustRemainDisabled (inlined, near jg)","kind":"near","jgRVA":"0x011D9EB8","jgOff":4,"expectedMatches":1,"sig":"837B28020F8F840000008B8B640100008B412880BB54010000007508"},{"name":"IsExtensionAffected (type!=PLATFORM_APP variant)","kind":"short","jgRVA":"0x014BC549","jgOff":4,"expectedMatches":1,"sig":"837928027F268B45D480B8540100000075628B45D48B806401"},{"name":"OnExtensionSystemReady startup loop","kind":"short","jgRVA":"0x01AFBEF3","jgOff":4,"expectedMatches":2,"sig":"837928027F288B91640100008B422880B95401000000750C8B"},{"name":"ShouldBlockExtensionEnable / IsExtensionAffected (shared body)","kind":"short","jgRVA":"0x032F125A","jgOff":4,"expectedMatches":2,"sig":"837A28027F368B8A640100008B412880BA540100000075088B"},{"name":"MaybeReEnableExtension","kind":"short","jgRVA":"0x08F66848","jgOff":4,"expectedMatches":1,"sig":"837E28027F248B8E640100008B412880BE540100000075088B"},{"name":"manifest_v2_util::IsExtensionAffected (free predicate; covers install thunk)","kind":"short","jgRVA":"0x08F66957","jgOff":4,"expectedMatches":1,"sig":"837D08027F278B4D0C31C083F908771FBA0A0100000FA3CA73"},{"name":"UserMayInstall (inlined)","kind":"short","jgRVA":"0x097626DF","jgOff":4,"expectedMatches":1,"sig":"837F28027F458B8F640100008B412880BF5401000000750C8B"}]}
   ]
 }
 '@
@@ -213,6 +222,90 @@ function Write-Banner {
 function Format-HexUpper {
     param([byte[]]$Bytes)
     ($Bytes | ForEach-Object { '{0:X2}' -f $_ }) -join ' '
+}
+
+# ============================================================================
+# Console QuickEdit
+#
+# QuickEdit turns a click in the console window into a text selection, and while
+# one is open conhost SUSPENDS the console app: output stops mid-line and typing
+# does nothing until Enter (copy) or Esc clears it. Clicking back into the window
+# after switching away is enough to trigger it, so a run that closed the browser
+# can sit frozen with the file half written and no sign of why.
+#
+# It is on by default per-executable - HKCU\Console\<exe>\QuickEdit overrides the
+# global HKCU\Console\QuickEdit - so the setting cannot be assumed off, and the
+# elevated child gets a brand new console that reads those same keys. Clearing
+# the bit for the duration of the run is the only reliable fix; the original mode
+# is put back on exit so the user's console keeps whatever they chose. Windows
+# Terminal does its own selection, which does not suspend anything, so nothing is
+# lost there either.
+#
+# ENABLE_EXTENDED_FLAGS must be set in the same call: without it SetConsoleMode
+# ignores the QuickEdit/insert bits entirely.
+# ============================================================================
+
+$script:SavedConsoleMode = $null
+
+function Initialize-ConsoleMode {
+    if (('Mv2ConsoleMode' -as [type])) { return }
+    Add-Type -TypeDefinition @'
+using System;
+using System.Runtime.InteropServices;
+
+public static class Mv2ConsoleMode
+{
+    const int  STD_INPUT_HANDLE        = -10;
+    const uint ENABLE_QUICK_EDIT_MODE  = 0x0040;
+    const uint ENABLE_EXTENDED_FLAGS   = 0x0080;
+
+    [DllImport("kernel32.dll", SetLastError = true)]
+    static extern IntPtr GetStdHandle(int nStdHandle);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    static extern bool GetConsoleMode(IntPtr hConsoleHandle, out uint lpMode);
+    [DllImport("kernel32.dll", SetLastError = true)]
+    static extern bool SetConsoleMode(IntPtr hConsoleHandle, uint dwMode);
+
+    // Returns the mode that was in effect so the caller can restore it, or -1
+    // when there is no console input to change (redirected, or a non-console
+    // host) - not an error, just nothing to do.
+    public static long DisableQuickEdit()
+    {
+        IntPtr h = GetStdHandle(STD_INPUT_HANDLE);
+        if (h == IntPtr.Zero || h == new IntPtr(-1)) return -1;
+        uint mode;
+        if (!GetConsoleMode(h, out mode)) return -1;
+        uint wanted = (mode | ENABLE_EXTENDED_FLAGS) & ~ENABLE_QUICK_EDIT_MODE;
+        if (!SetConsoleMode(h, wanted)) return -1;
+        return (long)mode;
+    }
+
+    public static void RestoreMode(long mode)
+    {
+        if (mode < 0) return;
+        IntPtr h = GetStdHandle(STD_INPUT_HANDLE);
+        if (h == IntPtr.Zero || h == new IntPtr(-1)) return;
+        SetConsoleMode(h, (uint)mode | ENABLE_EXTENDED_FLAGS);
+    }
+}
+'@
+}
+
+# Best effort throughout: a console whose mode cannot be read or set is one where
+# the freeze cannot happen either, and no failure here is worth aborting a patch.
+function Disable-ConsoleQuickEdit {
+    if ([Console]::IsInputRedirected) { return }
+    try {
+        Initialize-ConsoleMode
+        $prev = [Mv2ConsoleMode]::DisableQuickEdit()
+        if ($prev -ge 0) { $script:SavedConsoleMode = $prev }
+    } catch { }
+}
+
+function Restore-ConsoleQuickEdit {
+    if ($null -eq $script:SavedConsoleMode) { return }
+    try { [Mv2ConsoleMode]::RestoreMode($script:SavedConsoleMode) } catch { }
+    $script:SavedConsoleMode = $null
 }
 
 # ============================================================================
@@ -1161,6 +1254,55 @@ public static class Mv2Win32
         int err = Marshal.GetLastWin32Error();
         return err == ERROR_SHARING_VIOLATION || err == ERROR_LOCK_VIOLATION;
     }
+
+    delegate bool EnumWindowsProc(IntPtr hWnd, IntPtr lParam);
+    [DllImport("user32.dll")]
+    static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, IntPtr lParam);
+    [DllImport("user32.dll")]
+    static extern uint GetWindowThreadProcessId(IntPtr hWnd, out uint pid);
+    [DllImport("user32.dll")]
+    static extern bool IsWindowVisible(IntPtr hWnd);
+    [DllImport("user32.dll", CharSet = CharSet.Unicode)]
+    static extern bool PostMessageW(IntPtr hWnd, uint msg, IntPtr wParam, IntPtr lParam);
+
+    const uint WM_CLOSE = 0x0010;
+
+    // Asks every visible top-level window these processes own to close - the
+    // same request the window's X button sends, which is what makes Chrome shut
+    // down cleanly and write its session out, so the tabs can come back.
+    // Returns how many windows were asked. Process.CloseMainWindow is NOT
+    // equivalent: it reaches one window per process, and a Chrome session
+    // normally has several.
+    public static int CloseWindows(int[] pids)
+    {
+        var want = new List<uint>();
+        foreach (int p in pids) want.Add((uint)p);
+        int asked = 0;
+        EnumWindows(delegate(IntPtr hWnd, IntPtr lParam) {
+            uint owner; GetWindowThreadProcessId(hWnd, out owner);
+            if (want.Contains(owner) && IsWindowVisible(hWnd)
+                && PostMessageW(hWnd, WM_CLOSE, IntPtr.Zero, IntPtr.Zero)) asked++;
+            return true;
+        }, IntPtr.Zero);
+        return asked;
+    }
+
+    // How many visible top-level windows these processes still have. Chrome with
+    // "keep running in the background" on answers WM_CLOSE by closing its windows
+    // and staying alive, so a caller waiting for the file to be released needs to
+    // know the difference between "still shutting down" and "not going to exit".
+    public static int CountWindows(int[] pids)
+    {
+        var want = new List<uint>();
+        foreach (int p in pids) want.Add((uint)p);
+        int n = 0;
+        EnumWindows(delegate(IntPtr hWnd, IntPtr lParam) {
+            uint owner; GetWindowThreadProcessId(hWnd, out owner);
+            if (want.Contains(owner) && IsWindowVisible(hWnd)) n++;
+            return true;
+        }, IntPtr.Zero);
+        return n;
+    }
 }
 '@
 }
@@ -1309,6 +1451,7 @@ function Invoke-SelfElevate {
         if ($Quiet) { $argv += '-Quiet' }
         if ($AllowPartial) { $argv += '-AllowPartial' }
         if ($ForceRestore) { $argv += '-ForceRestore' }
+        if ($NoReopen) { $argv += '-NoReopen' }
         if ($Signatures) { $argv += '-Signatures'; $argv += (Get-QuotedArg ([IO.Path]::GetFullPath($Signatures))) }
         $argv += '-Relaunched'
 
@@ -1333,6 +1476,46 @@ function Test-TargetLocked {
     return [Mv2Win32]::IsFileLocked($TargetPath)
 }
 
+# True while the selected browser is running. Identified by process, not by the
+# holder list: Restart Manager also reports whatever else happens to have the
+# file open (an antivirus scanning it, the shell, a backup agent), and treating
+# those as "the browser is running" is what makes a close look like it never
+# worked.
+function Test-BrowserRunning {
+    param($Target)
+    return ((@(Get-BrowserProcesses -TargetPath $Target.Path)).Count -gt 0)
+}
+
+# Polls until the file can be replaced: nothing holds it against a write, and no
+# browser process of this install is left. TimeoutMs 0 = check once.
+#
+# The lock probe is the gate that matters, because it asks the one question the
+# write needs answered. It is NOT a holder-list check: a process can have
+# chrome.dll open for reading (every scanner does) without stopping the replace.
+function Wait-TargetUnlocked {
+    param([string]$TargetPath, [int]$TimeoutMs)
+    $deadline = [Environment]::TickCount + $TimeoutMs
+    while ($true) {
+        if (-not (Test-TargetLocked -TargetPath $TargetPath) -and
+            (@(Get-BrowserProcesses -TargetPath $TargetPath)).Count -eq 0) { return $true }
+        if ([Environment]::TickCount -ge $deadline) { return $false }
+        Start-Sleep -Milliseconds 250
+    }
+}
+
+# Polls until the browser has the file mapped again - how a reopen is confirmed
+# rather than assumed (the shell hand-off in Start-AsDesktopUser is fire and
+# forget, so the launch itself reports nothing).
+function Wait-BrowserRunning {
+    param($Target, [int]$TimeoutMs)
+    $deadline = [Environment]::TickCount + $TimeoutMs
+    while ($true) {
+        if (Test-BrowserRunning -Target $Target) { return $true }
+        if ([Environment]::TickCount -ge $deadline) { return $false }
+        Start-Sleep -Milliseconds 250
+    }
+}
+
 # Unpacks the "pid|starttime|appname" rows from Mv2Win32.GetFileHolders. Empty
 # when nothing holds the file (or Restart Manager refused the query).
 function Get-FileHolders {
@@ -1348,65 +1531,126 @@ function Get-FileHolders {
     return $out
 }
 
-# Force-closes only the processes holding this file, validating each PID still
-# refers to the process RM saw (PIDs recycle) before killing it.
+# The processes to close: the browser and its children. Identified by image path
+# when there is a chrome.exe next to the target, and otherwise by Restart Manager,
+# whose PIDs are validated against the process start time it saw (PIDs recycle).
+#
+# Anything else RM reports is NEVER returned, so it is never terminated. An
+# antivirus scanning chrome.dll, the shell, a backup agent - killing a stranger's
+# process to patch a browser is not a trade this tool makes, and the write does
+# not need it: those hold the file for reading, which does not block the replace.
+function Get-BrowserProcesses {
+    param([string]$TargetPath)
+
+    $exe = Get-BrowserExePath -TargetPath $TargetPath
+    $found = @{}
+    if ($exe) {
+        foreach ($p in @(Get-Process -Name 'chrome', 'chromium' -ErrorAction SilentlyContinue)) {
+            try { if ($p.Path -and $p.Path -eq $exe) { $found[$p.Id] = $p } } catch { }
+        }
+    }
+    foreach ($h in @(Get-FileHolders -TargetPath $TargetPath)) {
+        if ($found.ContainsKey($h.Pid)) { continue }
+        try {
+            $p = Get-Process -Id $h.Pid -ErrorAction Stop
+            if ($h.StartTime -ne 0 -and [uint64]$p.StartTime.ToFileTime() -ne $h.StartTime) { continue }
+            if ($p.ProcessName -notin 'chrome', 'chromium') { continue }
+            if ($exe -and $p.Path -and $p.Path -ne $exe) { continue }   # a different install
+            $found[$p.Id] = $p
+        } catch { }
+    }
+    return @($found.Values)
+}
+
+# Force-closes only the browser processes tied to this file.
+#
+# Graceful first: WM_CLOSE to their windows, which Chrome answers by shutting
+# down normally and saving its session - that saved session is what
+# --restore-last-session brings back afterwards (see Start-BrowserSession).
+# Only what is still there after that is terminated, which costs the last
+# unflushed history/cookie writes but not the tabs, since the session is written
+# when the windows close.
+#
+# Two things stop the graceful route from finishing on its own, and both end in
+# the same place - waiting longer will not help:
+#   * "Keep Chrome running in the background" (or a background app): the windows
+#     go, the browser process stays, and the file stays mapped forever.
+#   * A page answering "leave site?": the window never closes at all.
+# The first is detected by the windows being gone while the file is still held,
+# and gets a short grace period for a normal exit before the hard close. The
+# second just runs out the clock.
 function Close-FileHolders {
     param([string]$TargetPath)
 
-    $holders = @(Get-FileHolders -TargetPath $TargetPath)
-    if ($holders.Count -gt 0) {
-        Write-Warn "Closing $($holders.Count) Chrome process(es)..."
-    }
-    foreach ($h in $holders) {
-        try {
-            $p = Get-Process -Id $h.Pid -ErrorAction Stop
-            if ($h.StartTime -ne 0) {
-                $seen = [uint64]$p.StartTime.ToFileTime()
-                if ($seen -ne $h.StartTime) { continue }   # recycled PID - not our process
-            }
-            $name = if ($h.AppName) { $h.AppName } else { 'process' }
-            $p.Kill()
-            $p.WaitForExit(5000) | Out-Null
-            Write-Host "    $script:TagOK Closed $name."
-        } catch { }
-    }
+    $live = @(Get-BrowserProcesses -TargetPath $TargetPath)
+    if ($live.Count -eq 0) { return (Wait-TargetUnlocked -TargetPath $TargetPath -TimeoutMs 0) }
 
-    # Chrome tears down asynchronously; re-check the file itself.
-    for ($i = 0; $i -lt 20; $i++) {
-        if (-not (Test-TargetLocked -TargetPath $TargetPath)) { return $true }
+    Initialize-Win32
+    $ids = @($live | ForEach-Object { $_.Id })
+    [void][Mv2Win32]::CloseWindows($ids)
+
+    $deadline = [Environment]::TickCount + 15000
+    $windowsGoneAt = 0
+    while ($true) {
+        if (Wait-TargetUnlocked -TargetPath $TargetPath -TimeoutMs 0) { return $true }
+        if ([Environment]::TickCount -ge $deadline) { break }
+        if ([Mv2Win32]::CountWindows($ids) -eq 0) {
+            if ($windowsGoneAt -eq 0) { $windowsGoneAt = [Environment]::TickCount }
+            elseif ([Environment]::TickCount - $windowsGoneAt -ge 3000) { break }
+        } else {
+            $windowsGoneAt = 0
+        }
         Start-Sleep -Milliseconds 250
     }
-    return $false
+
+    # Re-query rather than reuse the list from before the wait: Chrome retires and
+    # spawns processes as it shuts down, and a browser that relaunched itself in
+    # the meantime (a staged update does that) is not in the old snapshot at all.
+    Write-Warn 'Chrome is not closing on its own - closing it the hard way.'
+    foreach ($p in @(Get-BrowserProcesses -TargetPath $TargetPath)) {
+        try {
+            if ($p.HasExited) { continue }
+            $p.Kill()
+            $p.WaitForExit(5000) | Out-Null
+        } catch { }
+    }
+    return (Wait-TargetUnlocked -TargetPath $TargetPath -TimeoutMs 5000)
 }
 
-# Performs a fresh lock/holder check and obtains consent in the same operation.
+# Closes the selected browser so its file can be replaced. No question asked:
+# the browser is put back with the same tabs when the work is done, so this is a
+# restart rather than a loss (Start-BrowserSession, called from Invoke-Main).
+# -Quiet still refuses without -Yes - an unattended run must not close a browser
+# nobody agreed to close.
+#
 # A process which starts after this returns is handled by the atomic replace
-# failing; it is never killed without going through this consent gate.
+# failing; it is never closed without going through the gate below.
 function Request-TargetUnlock {
     param($Target, [bool]$AssumeYes)
 
-    $holders = @(Get-FileHolders -TargetPath $Target.Path)
-    $locked = Test-TargetLocked -TargetPath $Target.Path
-    if ($holders.Count -eq 0 -and -not $locked) { return $true }
+    if (Wait-TargetUnlocked -TargetPath $Target.Path -TimeoutMs 0) { return $true }
 
-    $current = [pscustomobject]@{
-        Channel = $Target.Channel; Path = $Target.Path; Running = $true
-        Holders = $holders.Count
-    }
-    if ($AssumeYes) {
-        Write-Warn "Chrome $($Target.Channel) is open and will be closed (-Yes)."
-    } elseif ($Quiet) {
-        Write-Err "Chrome $($Target.Channel) is open."
+    $label = Get-TargetLabel -Target $Target
+    if ($Quiet -and -not $AssumeYes) {
+        Write-Err "Can't make the change while $label is open."
         Write-Host '    Close it, or add -Yes to close it automatically.'
         return $false
-    } elseif (-not (Confirm-ForceClose $current)) {
-        return $false
     }
 
+    if ($NoReopen) { Write-Info "Closing $label to make the change..." }
+    else { Write-Info "Closing $label - it reopens with the same tabs when this is done..." }
+
     if (Close-FileHolders -TargetPath $Target.Path) {
-        Write-Ok 'Chrome is closed. Your other Chrome channels are still running.'
+        Write-Ok "Closed $label. Your other browsers are still running."
         return $true
     }
+    # Name what is in the way. It is not always the browser: a scanner or backup
+    # agent with the file open for write shows up here too, and the answer to
+    # that one is to wait a moment and run this again.
+    $stuck = @(Get-FileHolders -TargetPath $Target.Path |
+               ForEach-Object { if ($_.AppName) { $_.AppName } else { "pid $($_.Pid)" } } |
+               Select-Object -Unique)
+    if ($stuck.Count -gt 0) { Write-Host ("    Still holding the file: " + ($stuck -join ', ')) }
     return $false
 }
 
@@ -1430,6 +1674,163 @@ function Test-TargetDirectoryWritable {
 function Write-Target {
     param([string]$TargetPath, [byte[]]$Buf, [string]$ExpectedCurrentHash = '', [string]$KnownBufHash = '')
     Write-AtomicFile -TargetPath $TargetPath -Buf $Buf -ExpectedCurrentHash $ExpectedCurrentHash -PreserveMetadataFrom $TargetPath -KnownBufHash $KnownBufHash
+}
+
+# ============================================================================
+# Putting the browser back. The write needs chrome.dll unmapped, so the browser
+# has to go down for it; everything here is about making that a restart the user
+# does not have to think about, instead of a browser that vanished.
+# ============================================================================
+
+# The launcher for a chrome.dll target. Chrome's layout is
+# <Application>\<version>\chrome.dll with chrome.exe one level up in
+# <Application>; some Chromium packages keep both in the same directory. Empty
+# when there is no chrome.exe in either place (a bare/offline copy of the dll),
+# which is also the signal that there is nothing to reopen.
+function Get-BrowserExePath {
+    param([string]$TargetPath)
+    try {
+        $verDir = Split-Path -Parent ([IO.Path]::GetFullPath($TargetPath))
+        foreach ($dir in @($verDir, (Split-Path -Parent $verDir))) {
+            if (-not $dir) { continue }
+            $exe = Join-Path $dir 'chrome.exe'
+            if (Test-Path -LiteralPath $exe -PathType Leaf) { return $exe }
+        }
+    } catch { }
+    return ''
+}
+
+# The flags the running browser was started with, so the restart keeps them - a
+# --profile-directory or --user-data-dir especially, without which the reopened
+# browser would come up on the wrong profile and restore nothing.
+#
+# Read from the browser process only: every other chrome.exe of an install is a
+# child process carrying --type=..., and none of those command lines describe how
+# the user starts Chrome. Empty when nothing could be read, and the restart then
+# passes --restore-last-session alone.
+function Get-BrowserRelaunchArgs {
+    param([string]$ExePath)
+    if (-not $ExePath) { return '' }
+    $want = ''
+    try { $want = ([IO.Path]::GetFullPath($ExePath)).ToLower() } catch { return '' }
+    try {
+        foreach ($proc in @(Get-CimInstance -ClassName Win32_Process -Filter "Name='chrome.exe'" -ErrorAction Stop)) {
+            $img = [string]$proc.ExecutablePath
+            if (-not $img -or $img.ToLower() -ne $want) { continue }
+            $cl = [string]$proc.CommandLine
+            if (-not $cl -or $cl -match '--type=') { continue }
+            # Drop the leading image path (quoted or bare); keep the flags verbatim.
+            if ($cl -match '^\s*"[^"]*"\s*(.*)$') { return (Select-BrowserUserArgs $Matches[1]) }
+            if ($cl -match '^\s*\S+\s*(.*)$')     { return (Select-BrowserUserArgs $Matches[1]) }
+        }
+    } catch { }
+    return ''
+}
+
+<#
+Keeps the switches that say how the user starts this browser, and drops the ones
+that only describe the launch being replaced:
+
+  --restart, --original-process-start-time=...  Chrome relaunching itself (after
+      an update, or the Relaunch button). Carried forward they describe a process
+      that no longer exists.
+  --flag-switches-begin ... --flag-switches-end  Chrome echoing back the
+      chrome://flags choices it re-applies from Local State on every start, so
+      replaying them adds nothing.
+  --no-startup-window  would bring the browser back with no window at all.
+  --restore-last-session  the caller adds it; never twice.
+  positional arguments  a URL or file opened once, not part of how Chrome starts.
+
+Tokenized so a quoted value keeps its spaces: --user-data-dir="C:\Some Dir" is
+one argument, not two.
+#>
+function Select-BrowserUserArgs {
+    param([string]$Arguments)
+    if (-not $Arguments) { return '' }
+
+    $keep = @()
+    $inFlagBlock = $false
+    foreach ($m in [regex]::Matches($Arguments, '(?:[^\s"]|"[^"]*")+')) {
+        $tok = $m.Value
+        if ($tok -eq '--flag-switches-begin') { $inFlagBlock = $true; continue }
+        if ($tok -eq '--flag-switches-end')   { $inFlagBlock = $false; continue }
+        if ($inFlagBlock) { continue }
+        if (-not $tok.StartsWith('-')) { continue }
+        if ($tok -in '--restart', '--no-startup-window', '--restore-last-session') { continue }
+        if ($tok -like '--original-process-start-time=*') { continue }
+        $keep += $tok
+    }
+    return ($keep -join ' ')
+}
+
+<#
+Starts a program as the logged-on user from an elevated process, by asking the
+desktop shell to open a shortcut that carries the arguments: explorer.exe hands
+the request to the already-running shell, which creates the process with ITS
+token, so the child runs at the normal integrity level. Returns $false when the
+shortcut or the hand-off could not be made.
+
+Chrome must NOT inherit our admin token. A browser holding the profile's
+singleton at high integrity cannot be reached by the user's next ordinary Chrome
+launch - UIPI blocks the rendezvous with its message window - and that surfaces
+as "profile in use" on a browser they can see running. So there is no
+"launch it elevated anyway" fallback here; the caller says so instead.
+#>
+function Start-AsDesktopUser {
+    param([string]$FilePath, [string]$Arguments)
+
+    $lnk = Join-Path ([IO.Path]::GetTempPath()) ('chrome-mv2-reopen-' + [Guid]::NewGuid().ToString('N') + '.lnk')
+    try {
+        $shell = New-Object -ComObject WScript.Shell
+        $sc = $shell.CreateShortcut($lnk)
+        $sc.TargetPath = $FilePath
+        $sc.Arguments = $Arguments
+        $sc.WorkingDirectory = Split-Path -Parent $FilePath
+        $sc.Save()
+    } catch { return $false }
+
+    $ok = $true
+    try { Start-Process -FilePath 'explorer.exe' -ArgumentList (Get-QuotedArg $lnk) -ErrorAction Stop }
+    catch { $ok = $false }
+    # The shell opens the shortcut on its own schedule, so the file has to outlive
+    # this call by a moment. Cleanup is best effort - it lives in TEMP.
+    if ($ok) { Start-Sleep -Seconds 2 }
+    Remove-Item -LiteralPath $lnk -Force -ErrorAction SilentlyContinue
+    return $ok
+}
+
+# Reopens the browser that was closed for the write, with the session it had.
+# --restore-last-session is what brings the tabs back after the clean shutdown
+# Close-FileHolders asks for; the captured flags go with it so the profile and
+# any user flags survive the restart.
+function Start-BrowserSession {
+    param($Target, [string]$ExePath, [string]$Arguments)
+
+    $label = Get-TargetLabel -Target $Target
+    if (-not $ExePath) {
+        Write-Warn "Left $label closed - start it again when you want it."
+        return
+    }
+
+    $argLine = $Arguments
+    if ($argLine -notmatch '(?i)(^|\s)--restore-last-session(\s|$)') {
+        $argLine = if ($argLine) { "$argLine --restore-last-session" } else { '--restore-last-session' }
+    }
+
+    Write-Info "Reopening $label with your tabs..."
+    $started = $false
+    if (Test-Elevated) {
+        $started = Start-AsDesktopUser -FilePath $ExePath -Arguments $argLine
+    } else {
+        try { Start-Process -FilePath $ExePath -ArgumentList $argLine -ErrorAction Stop; $started = $true } catch { }
+    }
+
+    if ($started -and (Wait-BrowserRunning -Target $Target -TimeoutMs 15000)) {
+        Write-Ok "Reopened $label with your tabs."
+        return
+    }
+    Write-Warn "Couldn't reopen $label - start it yourself."
+    Write-Host '    Your tabs are under History > Recently closed.'
 }
 
 # ============================================================================
@@ -1613,7 +2014,8 @@ function Get-ChromeInstalls {
 
 # ============================================================================
 # Interactive prompts. All of these are skipped under -Quiet, which never reads
-# from stdin - see Confirm-CloseConsent and Resolve-Target.
+# from stdin - see Resolve-Target. Closing the browser asks nothing: it is
+# reopened with the same tabs when the work is done (Request-TargetUnlock).
 # ============================================================================
 
 # Menu display name: the Google channels get the "Chrome " prefix; Chromium and
@@ -1622,6 +2024,16 @@ function Get-BrowserDisplayName {
     param([string]$Channel)
     if ($Channel -in 'Stable', 'Beta', 'Dev', 'Canary') { return "Chrome $Channel" }
     return $Channel
+}
+
+# The same name in a sentence ("Closing Chrome Beta..."). A target handed over as
+# a bare path has no channel to name, and "Unknown is closed" reads like a fault,
+# so those get the generic wording instead.
+function Get-TargetLabel {
+    param($Target)
+    $name = Get-BrowserDisplayName $Target.Channel
+    if (-not $name -or $name -eq 'Unknown') { return 'the browser' }
+    return $name
 }
 
 # One numbered row of the browser table:
@@ -1719,19 +2131,6 @@ function Select-Install {
         } else {
             Write-Err "Enter a number between 1 and $count, ${restoreHint}c for a custom path, or q to quit."
         }
-    }
-}
-
-function Confirm-ForceClose {
-    param($Inst)
-    Write-Host "`n$($C.Bold)$($C.Yel)  Chrome $($Inst.Channel) is open.$($C.Reset)"
-    Write-Host '     I need to close it to make the change. Any unsaved tabs will be lost.'
-    Write-Host "     $($C.Dim)Your other Chrome versions won't be touched.$($C.Reset)"
-
-    while ($true) {
-        $line = (Read-Host "`nClose Chrome $($Inst.Channel) and continue? [y/N]").Trim()
-        if ($line -in 'y', 'Y') { return $true }
-        if ($line -eq '' -or $line -in 'n', 'N') { Write-Info 'Cancelled - nothing was changed.'; return $false }
     }
 }
 
@@ -2083,10 +2482,33 @@ function Invoke-Main {
         return 1
     }
 
-    if ($Command -eq 'restore') { return (Invoke-Restore -Target $target -AssumeYes $Yes.IsPresent) }
-    return (Invoke-Patch -Target $target -AssumeYes $Yes.IsPresent)
-}
+    # Patch and restore close the browser themselves, right before the write.
+    # What it takes to put it back has to be read BEFORE that: the launcher next
+    # to the target, and the flags the running browser was started with. Done
+    # here rather than in the parent of an elevated run, so the reopen happens in
+    # the process that did the closing - the parent is still waiting on this one.
+    $wasRunning = $false
+    $reopenExe = ''
+    $reopenArgs = ''
+    if (-not $NoReopen) {
+        $wasRunning = Test-BrowserRunning -Target $target
+        if ($wasRunning) {
+            $reopenExe = Get-BrowserExePath -TargetPath $target.Path
+            $reopenArgs = Get-BrowserRelaunchArgs -ExePath $reopenExe
+        }
+    }
 
+    $code = if ($Command -eq 'restore') { Invoke-Restore -Target $target -AssumeYes $Yes.IsPresent }
+            else { Invoke-Patch -Target $target -AssumeYes $Yes.IsPresent }
+
+    # Reopen only what this run actually closed. A browser still holding the file
+    # was never closed (nothing needed writing, or the close was refused), and a
+    # run that never saw it running has nothing to put back.
+    if ($wasRunning -and -not (Test-BrowserRunning -Target $target)) {
+        Start-BrowserSession -Target $target -ExePath $reopenExe -Arguments $reopenArgs
+    }
+    return $code
+}
 <#
 Whether to hold the window open before exiting.
 
@@ -2113,14 +2535,22 @@ $script:SuppressPause = $false
 
 if ($env:MV2_TEST_LIBRARY_ONLY) { return }
 
-$exitCode = Invoke-Main
+# Wraps everything that talks to the user, including the pause: a click in the
+# window must not be able to suspend the run at any point, and the console's
+# own setting is put back before this process exits either way.
+Disable-ConsoleQuickEdit
+try {
+    $exitCode = Invoke-Main
 
-if (Test-ShouldPause -ExitCode $exitCode -IsElevatedChild $Relaunched.IsPresent `
-                     -QuietMode $Quiet.IsPresent -ChildAlreadyPaused $script:SuppressPause `
-                     -InputRedirected ([Console]::IsInputRedirected)) {
-    Write-Host ''
-    Write-Host 'Press Enter to exit.' -NoNewline
-    try { [void](Read-Host) } catch { }
-    Write-Host ''
+    if (Test-ShouldPause -ExitCode $exitCode -IsElevatedChild $Relaunched.IsPresent `
+                         -QuietMode $Quiet.IsPresent -ChildAlreadyPaused $script:SuppressPause `
+                         -InputRedirected ([Console]::IsInputRedirected)) {
+        Write-Host ''
+        Write-Host 'Press Enter to exit.' -NoNewline
+        try { [void](Read-Host) } catch { }
+        Write-Host ''
+    }
+} finally {
+    Restore-ConsoleQuickEdit
 }
 exit $exitCode

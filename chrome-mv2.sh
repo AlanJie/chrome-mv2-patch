@@ -45,7 +45,7 @@
 
 set -euo pipefail
 
-readonly APP_VERSION="1.6.1"
+readonly APP_VERSION="1.7.0"
 
 # ============================================================================
 # Embedded signature tables (pre-tokenized so the default path needs no python3
@@ -166,6 +166,39 @@ S|StandardManagementPolicyProvider::MustRemainDisabled|bcond|0x02276C2C|4|1|1F09
 S|ManifestV2Handler::OnExtensionSystemReady|bcond|0x0321963C|4|1|1F090071AC0100542A1541F9483140B929214839C9000037496940B93F050071
 S|ManifestV2Handler::IsExtensionAffected|bcond|0x0401B428|4|1|1F090071CC010054291441F9283140B92A204839CA000037296940B93F050071
 S|ManifestV2Handler::ShouldBlockExtensionInstallation / StandardManagementPolicyProvider::UserMayInstall (shared body)|bcond|0x068652D4|4|2|1F090071AC010054691641F9283140B96A224839CA000037296940B93F050071
+E
+M|155-linux|elf
+S|IsExtensionAffected / ShouldBlockExtensionEnable (member, 2nd body)|short|0x041AAAE0|4|1|837950027F30488B91280200008B425080B90802000000750F
+S|IsExtensionAffected (type!=PLATFORM_APP variant)|short|0x0644CEE2|4|1|837F50027F324180BC2408020000000F85D6000000498B8424
+S|StandardManagementPolicyProvider::MustRemainDisabled (inlined, near jg)|near|0x06835F7D|4|1|837E50020F8F91000000498B8E280200008B41504180BE0802000000
+S|ManifestV2Handler::IsExtensionAffected / ShouldBlockExtensionEnable (shared body; also covers OnExtensionSystemReady and MaybeReEnableExtensions calls out to it)|short|0x099272C4|4|1|837E50027F32554889E5488B8E280200008B415080BE080200
+S|ManifestV2Handler::MaybeReEnableExtension (inlined)|short|0x09927408|4|1|837B50027F33488B8B280200008B415080BB0802000000750B
+S|manifest_v2_util::IsExtensionAffected (free predicate; covers the ShouldBlockExtensionInstallation thunk, which tail-jumps here)|short|0x09927619|3|1|83FF027F1D83FE087718B90A0100000FA3F1730E83FA050F95
+S|StandardManagementPolicyProvider::UserMayInstall (inlined, near jg; Load-Unpacked gate)|near|0x0A3DC86A|4|1|837B50020F8FD4000000488B8B280200008B415080BB080200000075
+E
+M|155-macos-x64|macho-x64
+S|StandardManagementPolicyProvider::MustRemainDisabled|short|0x01CF5558|4|1|837E50027F72498B8E280200008B41504180BE080200000075
+S|IsExtensionAffected (type!=PLATFORM_APP variant)|short|0x028F526E|4|1|837F50027F324180BC2408020000000F85E1000000498B8424
+S|ManifestV2Handler::OnExtensionSystemReady|short|0x0322A6B9|4|1|837950027F30488B91280200008B425080B90802000000750F
+S|ManifestV2Handler::IsExtensionAffected|short|0x0496FB64|4|1|837E50027F32554889E5488B8E280200008B415080BE080200
+S|ManifestV2Handler::ShouldBlockExtensionInstallation|short|0x07806AE8|4|1|837B50027F33488B8B280200008B415080BB0802000000750B
+S|ManifestV2Handler::ShouldBlockExtensionInstallation (2)|short|0x07806CE9|3|1|83FF027F1D83FE087718B90A0100000FA3F1730E83FA050F95
+S|StandardManagementPolicyProvider::UserMayInstall|near|0x0827BE80|4|1|837B50020F8FBA000000488B8B280200008B415080BB080200000075
+E
+M|155-macos-arm64|macho-arm64
+S|StandardManagementPolicyProvider::MustRemainDisabled|bcond|0x022BD404|4|1|1F090071EC040054891641F9285140B98A2248398A000037298940B93F050071
+S|IsExtensionAffected (type!=PLATFORM_APP variant)|bcond|0x026FFEFC|4|1|1F0900718C010054C8224839F75205D0F7123A9148010037C81641F9088940B9
+S|ManifestV2Handler::OnExtensionSystemReady|bcond|0x031F4CA4|4|1|1F090071AC0100542A1541F9485140B929214839C9000037498940B93F050071
+S|ManifestV2Handler::IsExtensionAffected|bcond|0x0403B248|4|1|1F090071CC010054291441F9285140B92A204839CA000037298940B93F050071
+S|ManifestV2Handler::ShouldBlockExtensionInstallation / StandardManagementPolicyProvider::UserMayInstall (shared body)|bcond|0x068F3880|4|2|1F090071AC010054691641F9285140B96A224839CA000037298940B93F050071
+E
+M|155-linux-arm64|elf-arm64
+S|ManifestV2Handler::MaybeReEnableExtension (shared body)|bcond|0x05E7E1E4|4|2|1F0900712C020054691641F96A224839285140B98A000037298940B93F050071
+S|ManifestV2Handler::IsExtensionAffected / ShouldBlockExtensionEnable (shared body)|bcond|0x05E7E3A8|4|1|1F0900710C020054091441F90A204839285140B98A000037298940B93F050071
+S|StandardManagementPolicyProvider::MustRemainDisabled / UserMayInstall (shared body)|bcond|0x06096308|4|2|1F0900718C010054891641F98A224839285140B98A000037298940B93F050071
+S|ManifestV2Handler::OnExtensionSystemReady (shared body)|bcond|0x06B05764|4|1|3F0900718C010054091541F90A214839285140B98A000037298940B93F050071
+S|ManifestV2Handler member gate (additional inlined copy; +0x228/+0x208)|bcond|0x0A2934B4|4|1|7F0900718C0100544B1541F94C2148396A5140B98C0000376B8940B97F050071
+S|IsExtensionAffected (type!=PLATFORM_APP variant)|bcond|0x0A298B7C|4|1|1F0900718C010054C82248395730FCD0F732299148010037C81641F9088940B9
 E
 '
 
@@ -1226,7 +1259,7 @@ report_layout_candidates() {
 #             file inside a signed bundle breaks its seal and a Keystone update
 #             wipes it); for a loose offline Mach-O, "<file>.bak" beside it.
 # ============================================================================
-WORK_FILE=""; WRITE_TMP=""; META_TMP=""; QUIET=false
+WORK_FILE=""; WRITE_TMP=""; META_TMP=""; QUIET=false; NO_REOPEN=false
 
 write_target() {
     local target="$1" source="$2" expected_hash="${3:-}" known_source_hash="${4:-}"
@@ -1562,20 +1595,52 @@ proc_holders_app() {
     if command -v pgrep >/dev/null 2>&1; then pgrep -f "$app/Contents/MacOS/" 2>/dev/null | wc -l | tr -d ' '; else echo 0; fi
 }
 
+# Closes the selected Chrome.app so its framework can be replaced. No question
+# asked: the app is reopened with the same tabs when the work is done (see
+# reopen_browser_macos). --quiet still refuses without --yes, so an unattended
+# run never closes a browser nobody agreed to close.
+#
+# `osascript quit` is the graceful route - Chrome shuts down normally and writes
+# its session out, which is what --restore-last-session brings back. pkill is the
+# fallback for what is still running after that, and it loses the session.
 quit_chrome() {
     local app="$1" assume_yes="$2"
     (( $(proc_holders_app "$app") == 0 )) && return 0
-    if ! $assume_yes && ! $QUIET; then
-        echo -n "${C_BOLD}Chrome ($(basename "$app")) is open. Close it to continue? [y/N]: ${C_RESET}"
-        local line; prompt_read line || return 1
-        case "$line" in y|Y) ;; *) infof "Cancelled - nothing was changed."; return 1 ;; esac
+    if $QUIET && ! $assume_yes; then
+        errf "Chrome ($(basename "$app" .app)) is open."
+        echo "    Close it, or add --yes to close it automatically."
+        return 1
+    fi
+    if $NO_REOPEN; then
+        infof "Closing $(basename "$app" .app) to make the change..."
+    else
+        infof "Closing $(basename "$app" .app) - it reopens with the same tabs when this is done..."
     fi
     command -v osascript >/dev/null 2>&1 && osascript -e "quit app \"$app\"" 2>/dev/null || true
     local i
-    for (( i = 0; i < 20; i++ )); do (( $(proc_holders_app "$app") == 0 )) && return 0; sleep 0.25; done
+    for (( i = 0; i < 60; i++ )); do (( $(proc_holders_app "$app") == 0 )) && return 0; sleep 0.25; done
+    warnf "Chrome is not closing on its own - closing it the hard way."
     command -v pkill >/dev/null 2>&1 && pkill -f "$app/Contents/MacOS/" 2>/dev/null || true
     for (( i = 0; i < 20; i++ )); do (( $(proc_holders_app "$app") == 0 )) && return 0; sleep 0.25; done
     errf "Chrome is still open - close it and try again."; return 1
+}
+
+# Reopens the app that was closed for the write, with the session it had.
+# --restore-last-session is what brings the tabs back after the graceful quit
+# above. Under sudo the launch is dropped back to the user who owns the desktop
+# session: a browser started as root writes root-owned files into their profile
+# and holds the profile lock as a user they are not.
+reopen_browser_macos() {
+    local app="$1"
+    command -v open >/dev/null 2>&1 || return 1
+    if [[ "$(id -u)" == "0" && -n "${SUDO_USER:-}" ]]; then
+        sudo -u "$SUDO_USER" -- open -a "$app" --args --restore-last-session >/dev/null 2>&1 || return 1
+    else
+        open -a "$app" --args --restore-last-session >/dev/null 2>&1 || return 1
+    fi
+    local i
+    for (( i = 0; i < 60; i++ )); do (( $(proc_holders_app "$app") > 0 )) && return 0; sleep 0.25; done
+    return 1
 }
 
 # ============================================================================
@@ -1682,7 +1747,8 @@ proc_holders() {
     echo "$count"
 }
 
-kill_chrome_processes() {
+# Echoes the pid of every process running this exact binary (one per line).
+pids_holding() {
     local bin="$1" want
     want=$(readlink -f "$bin" 2>/dev/null || echo "$bin")
     local pid_dir target pid
@@ -1691,10 +1757,28 @@ kill_chrome_processes() {
         if [[ -z "$target" ]]; then continue; fi
         if [[ "$target" == "$want" || "$target" == "$bin" || "$target" == "${want} (deleted)" || "$target" == "${bin} (deleted)" ]]; then
             pid="${pid_dir#/proc/}"; pid="${pid%%/*}"
-            kill -TERM "$pid" 2>/dev/null || true
+            echo "$pid"
         fi
     done
-    local i
+}
+
+# Closes the processes running this binary. SIGTERM first - Chrome handles it as
+# a normal shutdown and writes its session out, which is what
+# --restore-last-session brings back afterwards (see reopen_browser_linux).
+# SIGKILL only for what is still running after that, which loses the session.
+kill_chrome_processes() {
+    local bin="$1" pid i
+    for pid in $(pids_holding "$bin"); do
+        kill -TERM "$pid" 2>/dev/null || true
+    done
+    for (( i = 0; i < 60; i++ )); do
+        if (( $(proc_holders "$bin") == 0 )); then return 0; fi
+        sleep 0.25
+    done
+    warnf "Chrome is not closing on its own - closing it the hard way."
+    for pid in $(pids_holding "$bin"); do
+        kill -KILL "$pid" 2>/dev/null || true
+    done
     for (( i = 0; i < 20; i++ )); do
         if (( $(proc_holders "$bin") == 0 )); then return 0; fi
         sleep 0.25
@@ -1702,39 +1786,121 @@ kill_chrome_processes() {
     return 1
 }
 
-confirm_force_close() {
-    local channel="$1" holders="$2"
-    echo ""
-    echo "${C_BOLD}${C_YEL}  Chrome ${channel} is open.${C_RESET}"
-    echo "     I need to close it to make the change. Any unsaved tabs will be lost."
-    while true; do
-        echo -n "${C_BOLD}Close Chrome ${channel} and continue? [y/N]: ${C_RESET}"
-        local line; prompt_read line || return 1
-        case "$line" in
-            y|Y) return 0 ;;
-            ""|n|N) infof "Cancelled - nothing was changed."; return 1 ;;
-        esac
-    done
-}
-
+# Closes the selected browser so its binary can be replaced. No question asked:
+# it is reopened with the same tabs when the work is done (reopen_browser_linux).
+# --quiet still refuses without --yes, so an unattended run never closes a
+# browser nobody agreed to close.
 request_target_close() {
-    local target="$1" assume_yes="$2" holders
+    local target="$1" assume_yes="$2" holders label
     holders=$(proc_holders "$target")
     (( holders == 0 )) && return 0
-    if $assume_yes; then
-        warnf "Chrome is open and will be closed (--yes)."
-    elif $QUIET; then
-        errf "Chrome is open."
+    label=$(display_name "$(basename "$(dirname "$target")")")
+    if $QUIET && ! $assume_yes; then
+        errf "Can't make the change while ${label} is open."
         echo "    Close it, or add --yes to close it automatically."
         return 1
+    fi
+    if $NO_REOPEN; then
+        infof "Closing ${label} to make the change..."
     else
-        confirm_force_close "$(basename "$(dirname "$target")")" "$holders" || return 1
+        infof "Closing ${label} - it reopens with the same tabs when this is done..."
     fi
     if ! kill_chrome_processes "$target"; then
         errf "Chrome is still open - close it and try again."
         echo "    Nothing was changed."
         return 1
     fi
+}
+
+# ============================================================================
+# Putting the browser back. The write needs the binary replaced under a browser
+# that is not running, so it has to go down for it; everything here is about
+# making that a restart the user does not have to think about.
+# ============================================================================
+
+# What it takes to start this browser again the way the user had it, read from the
+# running browser process before it is closed:
+#   REOPEN_ARGV  its argv - argv[0] is the binary, the rest are the user's flags
+#   REOPEN_ENV   the session variables a GUI process cannot start without (a
+#                browser relaunched with no DISPLAY/WAYLAND_DISPLAY simply dies)
+#   REOPEN_UID   who owns it, so a sudo run can hand the browser back to them
+# Child processes carry --type=..., so they are skipped: only the browser process
+# says how Chrome was launched.
+REOPEN_ARGV=(); REOPEN_ENV=(); REOPEN_UID=""
+capture_reopen_linux() {
+    REOPEN_ARGV=(); REOPEN_ENV=(); REOPEN_UID=""
+    local bin="$1" pid args a kv is_child
+    for pid in $(pids_holding "$bin"); do
+        [[ -r "/proc/$pid/cmdline" ]] || continue
+        args=()
+        while IFS= read -r -d '' a; do args+=("$a"); done < "/proc/$pid/cmdline" || true
+        (( ${#args[@]} > 0 )) || continue
+        is_child=false
+        for a in "${args[@]}"; do
+            case "$a" in --type=*) is_child=true; break ;; esac
+        done
+        $is_child && continue
+        REOPEN_ARGV=("${args[0]}")
+        # Keep the user's flags; drop Chrome's own bookkeeping (see
+        # Select-BrowserUserArgs in chrome-mv2.ps1 for the same list) and any
+        # positional URL, which was opened once and is not part of how Chrome
+        # starts.
+        local in_flag_block=false n=${#args[@]} k
+        for (( k = 1; k < n; k++ )); do
+            a="${args[$k]}"
+            case "$a" in
+                --flag-switches-begin) in_flag_block=true; continue ;;
+                --flag-switches-end)   in_flag_block=false; continue ;;
+            esac
+            $in_flag_block && continue
+            case "$a" in
+                --restart|--no-startup-window|--restore-last-session) continue ;;
+                --original-process-start-time=*) continue ;;
+                -*) REOPEN_ARGV+=("$a") ;;
+            esac
+        done
+        REOPEN_UID=$(stat -c %u "/proc/$pid" 2>/dev/null || echo "")
+        while IFS= read -r -d '' kv; do
+            case "$kv" in
+                DISPLAY=*|WAYLAND_DISPLAY=*|XAUTHORITY=*|DBUS_SESSION_BUS_ADDRESS=*|XDG_RUNTIME_DIR=*|\
+                XDG_SESSION_TYPE=*|XDG_CURRENT_DESKTOP=*|HOME=*|USER=*|LOGNAME=*|LANG=*|CHROME_WRAPPER=*|\
+                CHROME_DESKTOP=*|CHROME_VERSION_EXTRA=*)
+                    REOPEN_ENV+=("$kv") ;;
+            esac
+        done < "/proc/$pid/environ" 2>/dev/null || true
+        return 0
+    done
+    return 1
+}
+
+# Reopens the browser with the session it had. --restore-last-session is what
+# brings the tabs back after the graceful SIGTERM in kill_chrome_processes; the
+# captured argv goes with it so the profile and any user flags survive.
+#
+# Under sudo the launch is dropped back to the user who owns the desktop session:
+# a browser started as root writes root-owned files into their profile and holds
+# the profile lock as a user they are not. setsid detaches it, so it outlives this
+# script instead of dying with it.
+reopen_browser_linux() {
+    local bin="$1" i
+    (( ${#REOPEN_ARGV[@]} > 0 )) || return 1
+    local argv=("${REOPEN_ARGV[@]}" "--restore-last-session")
+    local runner=()
+    if [[ "$(id -u)" == "0" && -n "$REOPEN_UID" && "$REOPEN_UID" != "0" ]]; then
+        command -v sudo >/dev/null 2>&1 || return 1
+        runner=(sudo -u "#${REOPEN_UID}" --)
+    fi
+    local launcher=()
+    if command -v setsid >/dev/null 2>&1; then launcher=(setsid)
+    elif command -v nohup >/dev/null 2>&1; then launcher=(nohup)
+    fi
+    ${launcher[@]+"${launcher[@]}"} ${runner[@]+"${runner[@]}"} \
+        env ${REOPEN_ENV[@]+"${REOPEN_ENV[@]}"} "${argv[@]}" >/dev/null 2>&1 &
+    for (( i = 0; i < 60; i++ )); do
+        if (( $(proc_holders "$bin") > 0 )); then return 0; fi
+        sleep 0.25
+    done
+    return 1
 }
 
 LNX_CHANNELS=(); LNX_PATHS=(); LNX_VERSIONS=(); LNX_RUNNING=(); LNX_HOLDERS=(); LNX_BACKUPS=(); LNX_STATE=()
@@ -2369,8 +2535,10 @@ Arguments:
                          If left out, an installed browser is found automatically.
 
 Options:
-  -y, --yes              Close a running Chrome without asking.
+  -y, --yes              Allow closing a running Chrome under --quiet.
   -q, --quiet            Don't ask any questions (for scripts).
+      --no-reopen        Leave the browser closed instead of reopening it with
+                         the tabs it had.
       --allow-partial    Developer option: allow an incomplete patch.
       --force-restore    Restore a backup from a different Chrome version.
       --signatures PATH  Use an external signatures file (needs python3).
@@ -2406,11 +2574,13 @@ main() {
     init_colors
     local cmd="patch" target_path="" assume_yes=false allow_partial=false force_restore=false
     QUIET=false
+    NO_REOPEN=false
     local positional=()
     while (( $# > 0 )); do
         case "$1" in
             --yes|-y) assume_yes=true ;;
             --quiet|-q) QUIET=true ;;
+            --no-reopen) NO_REOPEN=true ;;
             --allow-partial) allow_partial=true ;;
             --force-restore) force_restore=true ;;
             --signatures) (( $# >= 2 )) || { errf "--signatures needs a path."; exit 2; }; SIGNATURES_OVERRIDE="$2"; shift ;;
@@ -2527,6 +2697,21 @@ main() {
         fi
     fi
 
+    # Patch and restore close the browser themselves, right before the write, so
+    # note what it takes to put it back while it is still running.
+    local was_running=false
+    if [[ "$cmd" != "check" ]] && ! $NO_REOPEN; then
+        if [[ "$TARGET_CONTAINER" == "macho" ]]; then
+            if [[ -n "${APP_PATH:-}" ]] && (( $(proc_holders_app "$APP_PATH") > 0 )); then was_running=true; fi
+        else
+            if (( $(proc_holders "$TARGET_FILE") > 0 )); then
+                was_running=true
+                capture_reopen_linux "$TARGET_FILE" || true
+            fi
+        fi
+    fi
+
+    local rc=0
     case "$cmd" in
         restore)
             if [[ "$TARGET_CONTAINER" == "elf" ]]; then do_restore_elf "$TARGET_FILE" "$assume_yes" "$force_restore"
@@ -2538,6 +2723,33 @@ main() {
             if [[ "$TARGET_CONTAINER" == "elf" ]]; then do_check_elf "$TARGET_FILE"
             else do_check_macho "$TARGET_FILE"; fi ;;
     esac
+    rc=$?
+
+    # Reopen only what this run actually closed: a browser still running was never
+    # closed (nothing needed writing, or the close was refused).
+    if $was_running; then reopen_browser "$sel_name"; fi
+    return "$rc"
+}
+
+# Reopens the browser closed for the write, unless it is already back up.
+reopen_browser() {
+    local label="$1"
+    if [[ "$TARGET_CONTAINER" == "macho" ]]; then
+        (( $(proc_holders_app "$APP_PATH") > 0 )) && return 0
+        infof "Reopening ${label} with your tabs..."
+        if reopen_browser_macos "$APP_PATH"; then okf "Reopened ${label} with your tabs."; return 0; fi
+    else
+        (( $(proc_holders "$TARGET_FILE") > 0 )) && return 0
+        if (( ${#REOPEN_ARGV[@]} == 0 )); then
+            warnf "Left ${label} closed - start it again when you want it."
+            return 0
+        fi
+        infof "Reopening ${label} with your tabs..."
+        if reopen_browser_linux "$TARGET_FILE"; then okf "Reopened ${label} with your tabs."; return 0; fi
+    fi
+    warnf "Couldn't reopen ${label} - start it yourself."
+    echo "    Your tabs are under History > Recently closed."
+    return 0
 }
 
 if [[ -z "${MV2_TEST_LIBRARY_ONLY:-}" ]]; then

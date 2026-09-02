@@ -4,7 +4,7 @@ Re-enables Manifest V2 extensions in Chrome by patching a few bytes. See [`mv2-r
 
 ## Supported Versions
 
-- ✅ Chrome 151-154
+- ✅ Chrome 151-155
 - ✅ Windows x64, x86
 - ✅ Linux x64
 

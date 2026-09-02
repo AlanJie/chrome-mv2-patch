@@ -440,6 +440,30 @@ def _is_arm64_cmp_imm(word, imm):
     return (word & 0xFFFFFC1F) == (0x7100001F | (imm << 10))
 
 
+# The arm64 mirror of the x86 finder's `cmp byte [reg+disp32], 0` follow-up: the
+# location/flag gate compiles to `ldrb w?, [x?, #imm12]` on a far-out Extension
+# field, then a bit test. Only large displacements qualify, the same way the x86
+# side only accepts the disp32 encoding - a near-zero offset ldrb is ordinary
+# byte loading, not a gate marker. Without this shape the type!=PLATFORM_APP
+# variant (whose fall-through compares the Manifest::Type against 6, never 1/5)
+# is silently dropped on arm64 while the x86 finder keeps it.
+def _is_arm64_flag_load(word, min_disp=0x100):
+    """LDRB Wt, [Xn, #imm12] (unsigned offset) with imm12 >= min_disp."""
+    if (word & 0xFFC00000) != 0x39400000:
+        return False
+    return ((word >> 10) & 0xFFF) >= min_disp
+
+
+def _has_arm64_bit_test(text, start, end):
+    """A TBZ/TBNZ within [start, end) - the `!= 0` half of the flag check."""
+    j = start
+    while j <= end:
+        if (_u32le(text, j) & 0x7E000000) == 0x36000000:   # TBZ/TBNZ
+            return True
+        j += 4
+    return False
+
+
 def find_gates_arm64(img):
     text = img.text
     n = len(text)
@@ -452,6 +476,8 @@ def find_gates_arm64(img):
             w = _u32le(text, j)
             if _is_arm64_cmp_imm(w, 1) or _is_arm64_cmp_imm(w, 5):
                 return True  # cmp w?, #1 / #5  (Manifest::Type enum)
+            if _is_arm64_flag_load(w) and _has_arm64_bit_test(text, j + 4, min(j + 20, n - 4)):
+                return True  # ldrb w?,[x?,#big] ; tbnz/tbz  (the location gate)
             j += 4
         return False
 

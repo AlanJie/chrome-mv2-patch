@@ -1,5 +1,10 @@
 # Changelog
 
+## [1.7.0] - 2026-09-02
+
+- Chrome 155 support.
+- Bug fixes.
+
 ## [1.6.1] - 2026-08-29
 
 - New menu UI.
