@@ -99,9 +99,12 @@ Runtime precedence is an explicitly supplied signature file, then a
 caller's current directory must not be loaded implicitly.
 
 When adding or changing a milestone, update `signatures.json` and the matching
-embedded table in the same change. A release must not depend on an external JSON
-file merely because the embedded copy was forgotten. Keep older milestones so
-the scripts can continue probing supported Chrome versions.
+embedded table in the same change — run `python scripts/sync_embedded.py`, which
+does it per entry (including removals) instead of appending. A release must not
+depend on an external JSON file merely because the embedded copy was forgotten.
+Keep older milestones so the scripts can continue probing supported Chrome
+versions. `python scripts/sync_embedded.py --check` fails when the two drift, and
+`run_tests.py` runs it.
 
 ## Derivation toolkit
 
@@ -120,26 +123,64 @@ See [`scripts/README.md`](../scripts/README.md) for the complete workflow.
   tag). Snapshots are unstripped, so Linux/mac gates are symbol-named from the
   binary itself.
 - `fetch_symbols.py`: fetch the matching PDB (Windows), `chrome.debug` (Linux),
-  or stream the official dSYM's symtab (macOS) into `_scratch/`.
-- `symbols_from_pdb.py`: resolve Windows PDB symbols through `dbghelp`.
+  or stream the official dSYM's symtab (macOS) into `_scratch/`. It verifies the
+  symbols against the binary's own build identity and discards a mismatch —
+  **Chrome-for-Testing artifacts have no published symbols**, and the Linux
+  `debug-info` zip for a given version belongs to the *official* build, so its
+  addresses land in unrelated functions on a CfT binary. Prefer an official
+  installer/MSI build whenever symbol names matter.
+- `symbols_from_pdb.py`: resolve Windows PDB symbols through `dbghelp`. Official
+  `win-arm64` PDBs are published (multi-GB; needs recent SDK debugging tools), so
+  arm64 gates on Windows *can* be symbol-named.
 - `symbols_from_elf.py`: stream Linux `.symtab` data without the cost of `nm -SC`.
 - `derive_milestone.py`: find short/near (`jg`) and arm64 `bcond` gate sites,
   emit a milestone (one per Mach-O slice), and verify a table against a stock
-  binary.
+  binary. This is the low-level finder; it reports every gate-shaped idiom.
+- `port_milestone.py`: **the porting driver — use this, not raw `derive_milestone`.**
+  Learns the Extension field offsets from the build, keeps only candidates carrying
+  the real gate markers, folds linker-shared bodies into one `expectedMatches=N`
+  site, picks the shortest signature that is free of build-specific PC-relative
+  immediates, carries site names over from `--prev`, and can `--merge`/`--sync`.
+- `audit_signatures.py`: audit the table for the defects that silently break
+  patching — equal-rank ties, fragile signatures, weak anchors, malformed sites —
+  and with `--binary` also report which milestone the runtime would select and run
+  a completeness pass that does not use the `cmp,2;jg` finder.
+- `sync_embedded.py`: rewrite both embedded fallback tables from `signatures.json`,
+  replacing/inserting/deleting per entry. `--check` reports drift for CI.
 
-Porting checklist:
+Porting checklist (the scripts do the analysis; do not do it by hand):
 
-1. Fetch a stock binary and its matching symbols (macOS: `fetch_symbols.py`
-   streams the official dSYM's symtab, UUID-matched to consumer Chrome).
-2. Resolve or dump symbols to name/filter candidate gates.
-3. Run `derive_milestone.py --symbols ... --name ... --json`.
-4. Add the entry to `signatures.json` and the correct embedded script table
-   (`chrome-mv2.ps1` pe/pe32/pe-arm64, `chrome-mv2.sh` elf + macho-x64/macho-arm64).
-5. Run `derive_milestone.py <binary> --verify signatures.json` and require
-   `ALL SITES VERIFIED: True`.
-6. Run the script regression suite.
+1. `python scripts/fetch_chrome_binary.py --platform <p> [--version V]` — the file
+   is named after the version the **binary** reports, which is not always the one
+   the release feed advertised.
+2. Optional but preferred: `python scripts/fetch_symbols.py <binary>`, then
+   `symbols_from_pdb.py` / `symbols_from_elf.py`.
+3. `python scripts/port_milestone.py <binary> --name <ver> --prev <prev> --moved old:new`
+   Read its report: it prints the learned field offsets, every folded body, any
+   signature it could not make portable, and which sites still need a name.
+4. Name any site it could not carry a name for, then re-run with `--merge --sync`
+   (or edit `signatures.json` and run `scripts/sync_embedded.py`).
+5. `python scripts/audit_signatures.py --binary <binary>` — require 0 failures.
+   Every marker it reports as needing review must be disassembled before anything
+   is added; the classifier already accounts for the known non-gate shapes
+   (`jne`/`b.ne` equality tests, inverted `b.hs`, branchless `csel`/`cmov`, the
+   Extension initializer, and folded second copies).
+6. `python scripts/run_tests.py` (it now includes the table audit and the
+   embedded-table drift check).
 7. Patch only a scratch copy for byte inspection, then perform a platform GUI
    or runtime test before declaring the milestone supported.
+
+Two table-level failure modes are invisible from any single binary, so never skip
+step 5 or 6:
+
+- **Equal-rank tie.** Two milestones in one container with identical signature
+  sets rank equally, and the runtime declines rather than guess. `152-macos-arm64`
+  and `154-macos-arm64` were byte-identical, so every 152/154 macOS-ARM install was
+  refused. When a new version's gates are unchanged, extend the existing entry
+  instead of adding a duplicate.
+- **Build-specific signatures.** A window holding an `adrp`/`adr` or a
+  `lea rip+disp` encodes a distance within one image, so the site matches only the
+  artifact it was derived from. Two builds of the *same* version differ this way.
 
 Do not hand-patch a live install while deriving signatures. If the
 `cmp <mv>,2 ; jg` skeleton disappears, stop and re-analyze Chrome's gate logic
@@ -153,7 +194,8 @@ Run the full local suite from the repository root:
 python scripts/run_tests.py
 ```
 
-The suite (`scripts/run_tests.py`, pure Python) exercises synthetic PE (incl. an
+The suite (`scripts/run_tests.py`, pure Python) audits `signatures.json` and the
+embedded-table sync, then exercises synthetic PE (incl. an
 arm64 `pe-arm64` fixture), ELF, and Mach-O (fat) fixtures, parses all three
 runtime scripts, and covers patch, restore, check, malformed signatures, partial
 layouts, ambiguity, host-aware slice selection (each Mac patches only its own
@@ -189,7 +231,13 @@ For a real stock artifact, also run:
 
 ```text
 python scripts/derive_milestone.py <stock chrome.dll|chrome|Google Chrome Framework> --verify signatures.json
+python scripts/audit_signatures.py --binary <that same artifact>
 ```
+
+The audit is the stronger of the two: `--verify` only asks whether each recorded
+site still matches, while the audit also reports which milestone the runtime would
+actually select, whether anything ties, and whether a gate exists in the binary
+that no site covers.
 
 Use the read-only runtime diagnostics when appropriate:
 

@@ -47,6 +47,11 @@ REPO = Path(__file__).resolve().parent.parent
 DEFAULT_OUT = REPO / "_scratch"
 
 PDB_SYMBOL_BASE = "https://chromium-browser-symsrv.commondatastorage.googleapis.com"
+
+# These payloads are gigabytes (a win-arm64 chrome.dll.pdb is over 5 GB, and
+# chrome.debug inflates to ~1.4 GiB), so a dropped connection part-way through is
+# routine rather than exceptional. Resume instead of restarting.
+MAX_RESUME_ATTEMPTS = 12
 DEBUG_SYMBOL_BASE = "https://edgedl.me.gvt1.com/chrome/linux/symbols"
 DEBUG_MEMBER = "debug-info/chrome.debug"
 
@@ -354,17 +359,41 @@ def fetch_pdb(data, path, out_dir):
 
     tmp = out_path.with_name(out_path.name + ".part")
     try:
-        with urllib.request.urlopen(url) as resp:
-            total = int(resp.headers.get("Content-Length") or 0)
-            n = 0
-            with open(tmp, "wb") as f:
-                while True:
-                    chunk = resp.read(1 << 20)
-                    if not chunk:
-                        break
-                    f.write(chunk)
-                    n += len(chunk)
-                    _progress(n, total)
+        total = 0
+        # Resume across dropped connections. These payloads run to several GB (a
+        # win-arm64 chrome.dll.pdb is over 5) and a single mid-transfer reset used
+        # to discard everything already written; the retry then re-downloaded the
+        # whole file and often died again at a different offset.
+        for attempt in range(1, MAX_RESUME_ATTEMPTS + 1):
+            have = tmp.stat().st_size if tmp.exists() else 0
+            headers = {"Range": f"bytes={have}-"} if have else {}
+            request = urllib.request.Request(url, headers=headers)
+            try:
+                with urllib.request.urlopen(request) as resp:
+                    if not total:
+                        total = (int(resp.headers.get("Content-Length") or 0)
+                                 + (have if resp.status == 206 else 0))
+                    if have and resp.status != 206:
+                        have = 0                       # server ignored Range: restart
+                    n = have
+                    with open(tmp, "wb" if not have else "ab") as f:
+                        while True:
+                            chunk = resp.read(1 << 20)
+                            if not chunk:
+                                break
+                            f.write(chunk)
+                            n += len(chunk)
+                            _progress(n, total)
+            except (OSError, urllib.error.URLError) as e:
+                if attempt == MAX_RESUME_ATTEMPTS:
+                    raise
+                got = tmp.stat().st_size if tmp.exists() else 0
+                print(f"\n  connection dropped at {got}/{total or '?'} bytes "
+                      f"({type(e).__name__}); resuming (attempt {attempt + 1})")
+                continue
+            if not total or tmp.stat().st_size >= total:
+                break
+            print(f"\n  stream ended early at {tmp.stat().st_size}/{total}; resuming")
         print()
     except urllib.error.HTTPError as e:
         tmp.unlink(missing_ok=True)
@@ -523,17 +552,36 @@ def stream_zip_member(url, local_off, comp, uncomp, method, out_path):
 
     crc = 0
     n = 0
-    with _http_range(url, data_off, data_off + comp - 1) as body, open(out_path, "wb") as f:
-        while True:
-            chunk = body.read(1 << 20)
-            if not chunk:
+    consumed = 0
+    # Resume on a dropped connection instead of restarting. `chrome.debug` inflates
+    # to ~1.4 GiB and a mid-transfer reset used to fail the whole fetch; retrying
+    # from scratch tended to die again at a different offset. The decompressor is
+    # stateful but transport-agnostic, so reconnecting the *compressed* stream at
+    # the exact byte already consumed and feeding the same object resumes cleanly.
+    with open(out_path, "wb") as f:
+        for attempt in range(1, MAX_RESUME_ATTEMPTS + 1):
+            try:
+                with _http_range(url, data_off + consumed, data_off + comp - 1) as body:
+                    while True:
+                        chunk = body.read(1 << 20)
+                        if not chunk:
+                            break
+                        consumed += len(chunk)
+                        out = decomp.decompress(chunk) if decomp else chunk
+                        if out:
+                            f.write(out)
+                            crc = binascii.crc32(out, crc)
+                            n += len(out)
+                            _progress(n, uncomp)
+            except (OSError, urllib.error.URLError) as e:
+                if attempt == MAX_RESUME_ATTEMPTS or consumed >= comp:
+                    raise
+                print(f"\n  connection dropped after {consumed}/{comp} compressed bytes "
+                      f"({type(e).__name__}); resuming (attempt {attempt + 1})")
+                continue
+            if consumed >= comp:
                 break
-            out = decomp.decompress(chunk) if decomp else chunk
-            if out:
-                f.write(out)
-                crc = binascii.crc32(out, crc)
-                n += len(out)
-                _progress(n, uncomp)
+            print(f"\n  stream ended early at {consumed}/{comp} compressed bytes; resuming")
         if decomp:
             tail = decomp.flush()
             if tail:

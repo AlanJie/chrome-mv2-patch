@@ -4,6 +4,7 @@
 
 - Chrome 155 support.
 - Bug fixes.
+- Python scripts updated.
 
 ## [1.6.1] - 2026-08-29
 

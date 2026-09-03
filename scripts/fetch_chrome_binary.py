@@ -245,6 +245,49 @@ def version_key(version):
     return tuple(int(part) if part.isdigit() else -1 for part in version.split("."))
 
 
+def binary_version(path):
+    """The version the artifact itself reports, or None.
+
+    PE: the VS_VERSION_INFO FileVersion, read straight out of the resource
+    directory (no Windows API, so this also works when cross-fetching from
+    Linux/macOS). ELF and Mach-O carry no equivalent record, so they fall back to
+    the caller's value.
+    """
+    try:
+        with open(path, "rb") as handle:
+            head = handle.read(0x400)
+            if head[:2] != b"MZ":
+                return None
+            pe = struct.unpack_from("<I", head, 0x3C)[0]
+            if head[pe:pe + 4] != b"PE\0\0":
+                return None
+            magic = struct.unpack_from("<H", head, pe + 24)[0]
+            fixed = 112 if magic == 0x20B else 96
+            rsrc_rva, rsrc_size = struct.unpack_from("<II", head, pe + 24 + fixed + 2 * 8)
+            if not rsrc_rva:
+                return None
+            nsec = struct.unpack_from("<H", head, pe + 6)[0]
+            sec = pe + 24 + struct.unpack_from("<H", head, pe + 20)[0]
+            for i in range(nsec):
+                off = sec + i * 40
+                vsz, va, rsz, raw = struct.unpack_from("<IIII", head, off + 8)
+                if va <= rsrc_rva < va + max(vsz, rsz):
+                    handle.seek(raw + (rsrc_rva - va))
+                    blob = handle.read(min(rsrc_size, 8 << 20))
+                    break
+            else:
+                return None
+        # VS_FIXEDFILEINFO starts at its 0xFEEF04BD signature; FileVersion is the
+        # next four 16-bit fields, stored most-significant pair first.
+        at = blob.find(b"\xbd\x04\xef\xfe")
+        if at < 0:
+            return None
+        ms_hi, ms_lo, ls_hi, ls_lo = struct.unpack_from("<HHHH", blob, at + 8)
+        return f"{ms_lo}.{ms_hi}.{ls_lo}.{ls_hi}"
+    except (OSError, struct.error, IndexError):
+        return None
+
+
 def release_version(release):
     name = release.get("name", "")
     if "/versions/" in name:
@@ -661,7 +704,16 @@ def fetch(platform, channel, version, out_dir, keep, url_override=None):
             shutil.rmtree(workdir, ignore_errors=True)
         return 1
 
-    dest = os.path.join(out_dir, f"chrome-{fetch_version}-{spec['tag']}{spec['suffix']}")
+    # Name the file after the version the BINARY reports, not the one the release
+    # feed advertised. They disagree in practice: the stable win-arm64 enterprise
+    # MSI has shipped a chrome.dll whose VS_VERSION_INFO reads 152.0.7977.76 while
+    # the feed called the download 153.0.8010.12. A file named for the feed sends
+    # the whole derivation - and the milestone name - to the wrong version.
+    real_version = binary_version(binary) or fetch_version
+    if real_version != fetch_version:
+        print(f"\nnote: the feed advertised {fetch_version}, but this binary reports "
+              f"{real_version}; naming it for the binary.")
+    dest = os.path.join(out_dir, f"chrome-{real_version}-{spec['tag']}{spec['suffix']}")
     shutil.copy2(binary, dest)
     size = os.path.getsize(dest)
     if not keep:

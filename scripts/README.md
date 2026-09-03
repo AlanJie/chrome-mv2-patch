@@ -16,11 +16,14 @@ Full rationale: [`../mv2-reversing.md`](../mv2-reversing.md) §"Porting to a new
 
 | Script | What it does | Deps |
 | :--- | :--- | :--- |
-| `fetch_chrome_binary.py` | Download the stock, gate-bearing binary itself — a channel's current `chrome.dll` (PE64/PE32), Linux `chrome` (ELF), or the macOS universal framework Mach-O (`mac-x64`/`mac-arm64`, always via Chrome for Testing) — unwrap it and drop it in `_scratch/` arch-tagged. `--version` falls back to Chrome for Testing. This is step 1 (below). | stdlib + 7-Zip |
-| `fetch_symbols.py` | Download the symbols matching a binary — PDB (PE) from the Chromium symbol server, `chrome.debug` (ELF) streamed from the per-version zip, or the macOS dSYM's symtab streamed from `dl.google.com/…/dsym/` (emits `nm`-style names directly). Saves to `_scratch/` (gitignored). | stdlib only |
-| `derive_milestone.py` | Find gate sites (`cmp <mv>,2 ; jg`, short **and** near), emit a `signatures.json` entry, and `--verify` an existing table against a binary. | stdlib only |
+| `port_milestone.py` | **Start here to add a version.** One command: learn the build's Extension field offsets, keep only real gates, fold linker-shared bodies into one `expectedMatches=N` site, pick the shortest signature with no build-specific PC-relative immediate, carry site names from `--prev`, and `--merge`/`--sync`. | stdlib only |
+| `audit_signatures.py` | Audit the table for what silently breaks patching: equal-rank ties (two milestones the runtime can't choose between, so it declines), signatures pinned to one build, weak anchors, malformed sites. With `--binary`, also reports which milestone would be selected and runs a completeness pass that does **not** use the `cmp,2;jg` finder. | stdlib only |
+| `sync_embedded.py` | Rewrite both embedded fallback tables from `signatures.json`, per entry (adds, updates **and** removals). `--check` reports drift for CI. | stdlib only |
+| `fetch_chrome_binary.py` | Download the stock, gate-bearing binary itself — a channel's current `chrome.dll` (PE64/PE32), Linux `chrome` (ELF), or the macOS universal framework Mach-O (`mac-x64`/`mac-arm64`, always via Chrome for Testing) — unwrap it and drop it in `_scratch/`, named after the version the **binary** reports (release feeds have advertised a different one). `--version` falls back to Chrome for Testing. | stdlib + 7-Zip |
+| `fetch_symbols.py` | Download the symbols matching a binary — PDB (PE) from the Chromium symbol server, `chrome.debug` (ELF) streamed from the per-version zip, or the macOS dSYM's symtab streamed from `dl.google.com/…/dsym/` (emits `nm`-style names directly). Verifies build identity and discards a mismatch: Chrome-for-Testing builds have no published symbols, and a version's Linux `debug-info` zip belongs to the *official* build. Saves to `_scratch/` (gitignored). | stdlib only |
+| `derive_milestone.py` | The low-level finder: gate sites (`cmp <mv>,2 ; jg`, short **and** near, plus arm64 `bcond`), an unfiltered candidate report, and `--verify` for an existing table. `port_milestone.py` wraps it. | stdlib only |
 | `symbols_from_elf.py` | Linux: dump an ELF's `.symtab` as `nm -S`-style lines, fast and low-memory — a stand-in for `nm -SC` on the multi-GB `chrome.debug` (see note in step 2). | stdlib only |
-| `symbols_from_pdb.py` | Windows only: name gate functions from a PDB via `dbghelp`. Optional — used to filter/name candidates. | Windows + PDB |
+| `symbols_from_pdb.py` | Windows only: name gate functions from a PDB via `dbghelp`. Optional — used to filter/name candidates. Official `win-arm64` PDBs are published too (multi-GB). | Windows + PDB |
 
 The test suite is Python too and lives flat in this folder (no subfolder):
 `run_tests.py` (entry point) drives `test_linux.py` (ELF), `test_macos.py`
@@ -34,9 +37,36 @@ it with `python scripts/run_tests.py`.
 ```
 python scripts/derive_milestone.py <stock chrome.dll|chrome>  --verify
 # -> "ALL SITES VERIFIED: True" when a milestone fully covers the binary
+
+python scripts/audit_signatures.py --binary <stock chrome.dll|chrome>
+# -> which milestone the runtime would SELECT, whether anything ties, and whether
+#    the binary holds a gate no site covers
 ```
 
-## Derive a new milestone (e.g. Chrome 153)
+`--verify` only asks whether each recorded site still matches. The audit is the
+one that catches a table which verifies yet still fails in practice: a milestone
+that ties with another (the runtime declines rather than guess), or a gate that is
+present in the binary and covered by nothing.
+
+## The short version: port a milestone
+
+```
+python scripts/fetch_chrome_binary.py --platform win64 --version 155.0.8038.0
+python scripts/port_milestone.py _scratch/chrome-155.0.8038.0-win64.dll \
+       --name 155 --prev 154 --moved 0x30:0x50 --merge --sync
+python scripts/audit_signatures.py --binary _scratch/chrome-155.0.8038.0-win64.dll
+python scripts/run_tests.py
+```
+
+`port_milestone.py` prints the field offsets it learned, every linker-shared body
+it folded, any signature it could not make build-independent, and which sites it
+could not carry a name for (a gate that is new this version has no previous name
+to inherit — write one by hand). `--moved old:new` tells the name-carry which
+Extension field offsets shifted since `--prev`; omit it if nothing moved.
+
+## Derive a new milestone by hand (e.g. Chrome 153)
+
+The long form, for when `port_milestone.py` reports something it could not resolve.
 
 1. **Get a stock binary** for the new version. `fetch_chrome_binary.py`
    downloads the channel's current installer, unwraps it, and leaves just the

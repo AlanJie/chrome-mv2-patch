@@ -64,17 +64,17 @@ readonly APP_VERSION="1.7.0"
 # ============================================================================
 readonly EMBEDDED_SIGNATURES='
 M|151-linux|elf
-S|MV2DeprecationImpactChecker::IsExtensionAffected (shared predicate)|short|0x041900D4|4|1|837E50027F2F554889E5488B8E280200008B413080BE080200
+S|MV2DeprecationImpactChecker::IsExtensionAffected (shared predicate; covers the ManifestV2Handler thunk, OnExtensionSystemReady and MaybeReEnableExtension, which call it out-of-line)|short|0x041900D4|4|1|837E50027F2F554889E5488B8E280200008B413080BE080200
 S|ManifestV2Handler::ShouldBlockExtensionInstallation|short|0x09972677|3|1|83FE027F1F83FA01751083F9050F95C283F90A0F95C020D05D
 S|ManifestV2Handler::ShouldBlockExtensionEnable|short|0x099726BD|3|1|83FA027F298B493083F801751783F9050F95C283F90A0F95C0
-S|StandardManagementPolicyProvider::UserMayInstall (inlined, near jg)|near|0x0A3B7893|3|1|83FA020F8FBE0000008B493083F8010F856402000083F9050F84A900
+S|StandardManagementPolicyProvider::UserMayInstall (inlined, near jg; Load-Unpacked gate)|near|0x0A3B7893|3|1|83FA020F8FBE0000008B493083F8010F856402000083F9050F84A900
 S|StandardManagementPolicyProvider::MustRemainDisabled (inlined)|short|0x05572994|3|1|83FA027F7A8B493083F80175684531F683F905740583F90A75
 E
 M|152-linux|elf
-S|manifest_v2_util::IsExtensionAffected (free predicate)|short|0x0985B449|3|1|83FF027F1D83FE087718B90A0100000FA3F1730E83FA050F95
-S|ManifestV2Handler::IsExtensionAffected / ShouldBlockExtensionEnable (shared body)|short|0x0985B0F4|4|1|837E50027F2F554889E5488B8E280200008B413080BE080200
+S|manifest_v2_util::IsExtensionAffected (free predicate; covers the ShouldBlockExtensionInstallation thunk, which tail-jumps here)|short|0x0985B449|3|1|83FF027F1D83FE087718B90A0100000FA3F1730E83FA050F95
+S|ManifestV2Handler::IsExtensionAffected / ShouldBlockExtensionEnable (shared body; also covers OnExtensionSystemReady and MaybeReEnableExtensions calls out to it)|short|0x0985B0F4|4|1|837E50027F2F554889E5488B8E280200008B413080BE080200
 S|ManifestV2Handler::MaybeReEnableExtension (inlined)|short|0x0985B238|4|1|837B50027F30488B8B280200008B413080BB08020000007508
-S|StandardManagementPolicyProvider::UserMayInstall (inlined, near jg)|near|0x0A256BAA|4|1|837B50020F8FD1000000488B8B280200008B413080BB080200000075
+S|StandardManagementPolicyProvider::UserMayInstall (inlined, near jg; Load-Unpacked gate)|near|0x0A256BAA|4|1|837B50020F8FD1000000488B8B280200008B413080BB080200000075
 S|StandardManagementPolicyProvider::MustRemainDisabled (inlined, near jg)|near|0x0599A69A|4|1|837E50020F8F8E000000498B8E280200008B41304180BE0802000000
 E
 M|152-chromium-linux|elf
@@ -86,8 +86,8 @@ E
 M|151-chromium-linux-xtradeb|elf
 S|ManifestV2Handler::OnExtensionSystemReady|near|0x07A64A55|4|1|837850020F8FD5000000488B90280200008B4A3080B8080200000075
 S|ManifestV2Handler::MaybeReEnableExtension|short|0x07A65559|4|1|837B50027F2F488B8B280200008B413080BB08020000007512
-S|ManagementSetEnabledFunction::CheckManifestV2Deprecation (inlined)|short|0x07DAC2A3|3|1|83FA027F2083F908771BBA0A0100000FA3CA73118B403083F8
-S|StandardManagementPolicyProvider::MustRemainDisabled (inlined)|short|0x08C5DADA|3|1|83FA027F4683F9087741BA0A0100000FA3CA73378B40304531
+S|ManagementSetEnabledFunction::CheckManifestV2Deprecation (inlined predicate)|short|0x07DAC2A3|3|1|83FA027F2083F908771BBA0A0100000FA3CA73118B403083F8
+S|StandardManagementPolicyProvider::MustRemainDisabled (inlined predicate)|short|0x08C5DADA|3|1|83FA027F4683F9087741BA0A0100000FA3CA73378B40304531
 E
 M|151-linux-arm64|elf-arm64
 S|ManifestV2Handler::ShouldBlockExtensionInstallation|bcond|0x05E6C0CC|4|1|3F0800716C0100545F040071A10000547F14007164184A7AE0079F1AC0035FD6
@@ -136,6 +136,7 @@ S|StandardManagementPolicyProvider::MustRemainDisabled|bcond|0x02218740|4|1|1F09
 S|ManifestV2Handler::OnExtensionSystemReady|bcond|0x0320635C|4|1|1F090071AC0100542A1541F9483140B929214839C9000037496940B93F050071
 S|ManifestV2Handler::IsExtensionAffected|bcond|0x03FFBD84|4|1|1F090071CC010054291441F9283140B92A204839CA000037296940B93F050071
 S|ManifestV2Handler::ShouldBlockExtensionInstallation / StandardManagementPolicyProvider::UserMayInstall (shared body)|bcond|0x066F0E38|4|2|1F090071AC010054691641F9283140B96A224839CA000037296940B93F050071
+S|IsExtensionAffected (type!=PLATFORM_APP variant)|bcond|0x026AC410|8|1|C85240B91F0900718C010054C8224839
 E
 M|154-linux|elf
 S|manifest_v2_util::IsExtensionAffected (free predicate; covers the ShouldBlockExtensionInstallation thunk, which tail-jumps here)|short|0x0991AA29|3|1|83FF027F1D83FE087718B90A0100000FA3F1730E83FA050F95
@@ -161,12 +162,6 @@ S|ManifestV2Handler::ShouldBlockExtensionInstallation (2)|short|0x0778A1B9|3|1|8
 S|StandardManagementPolicyProvider::UserMayInstall|near|0x081B49B0|4|1|837B50020F8FB7000000488B8B280200008B413080BB080200000075
 S|IsExtensionAffected (type!=PLATFORM_APP variant)|short|0x028F0E51|4|1|837F50027F34488B45A880B808020000000F852D010000488B
 E
-M|154-macos-arm64|macho-arm64
-S|StandardManagementPolicyProvider::MustRemainDisabled|bcond|0x02276C2C|4|1|1F090071EC040054891641F9283140B98A2248398A000037296940B93F050071
-S|ManifestV2Handler::OnExtensionSystemReady|bcond|0x0321963C|4|1|1F090071AC0100542A1541F9483140B929214839C9000037496940B93F050071
-S|ManifestV2Handler::IsExtensionAffected|bcond|0x0401B428|4|1|1F090071CC010054291441F9283140B92A204839CA000037296940B93F050071
-S|ManifestV2Handler::ShouldBlockExtensionInstallation / StandardManagementPolicyProvider::UserMayInstall (shared body)|bcond|0x068652D4|4|2|1F090071AC010054691641F9283140B96A224839CA000037296940B93F050071
-E
 M|155-linux|elf
 S|IsExtensionAffected / ShouldBlockExtensionEnable (member, 2nd body)|short|0x041AAAE0|4|1|837950027F30488B91280200008B425080B90802000000750F
 S|IsExtensionAffected (type!=PLATFORM_APP variant)|short|0x0644CEE2|4|1|837F50027F324180BC2408020000000F85D6000000498B8424
@@ -187,7 +182,7 @@ S|StandardManagementPolicyProvider::UserMayInstall|near|0x0827BE80|4|1|837B50020
 E
 M|155-macos-arm64|macho-arm64
 S|StandardManagementPolicyProvider::MustRemainDisabled|bcond|0x022BD404|4|1|1F090071EC040054891641F9285140B98A2248398A000037298940B93F050071
-S|IsExtensionAffected (type!=PLATFORM_APP variant)|bcond|0x026FFEFC|4|1|1F0900718C010054C8224839F75205D0F7123A9148010037C81641F9088940B9
+S|IsExtensionAffected (type!=PLATFORM_APP variant)|bcond|0x026FFEFC|8|1|C85240B91F0900718C010054C8224839
 S|ManifestV2Handler::OnExtensionSystemReady|bcond|0x031F4CA4|4|1|1F090071AC0100542A1541F9485140B929214839C9000037498940B93F050071
 S|ManifestV2Handler::IsExtensionAffected|bcond|0x0403B248|4|1|1F090071CC010054291441F9285140B92A204839CA000037298940B93F050071
 S|ManifestV2Handler::ShouldBlockExtensionInstallation / StandardManagementPolicyProvider::UserMayInstall (shared body)|bcond|0x068F3880|4|2|1F090071AC010054691641F9285140B96A224839CA000037298940B93F050071
@@ -198,7 +193,7 @@ S|ManifestV2Handler::IsExtensionAffected / ShouldBlockExtensionEnable (shared bo
 S|StandardManagementPolicyProvider::MustRemainDisabled / UserMayInstall (shared body)|bcond|0x06096308|4|2|1F0900718C010054891641F98A224839285140B98A000037298940B93F050071
 S|ManifestV2Handler::OnExtensionSystemReady (shared body)|bcond|0x06B05764|4|1|3F0900718C010054091541F90A214839285140B98A000037298940B93F050071
 S|ManifestV2Handler member gate (additional inlined copy; +0x228/+0x208)|bcond|0x0A2934B4|4|1|7F0900718C0100544B1541F94C2148396A5140B98C0000376B8940B97F050071
-S|IsExtensionAffected (type!=PLATFORM_APP variant)|bcond|0x0A298B7C|4|1|1F0900718C010054C82248395730FCD0F732299148010037C81641F9088940B9
+S|IsExtensionAffected (type!=PLATFORM_APP variant)|bcond|0x0A298B7C|8|1|C85240B91F0900718C010054C8224839
 E
 '
 

@@ -30,6 +30,15 @@ def main():
     # Engine + gate-finder unit checks (fast, pure Python).
     step("derivation unit checks (arm64 bcond safety)", py + [str(HERE / "test_derive.py")])
 
+    # Table audits: seconds, no binary needed, and they catch defects no per-binary
+    # test can see - two milestones with identical signature sets make the patcher
+    # decline every build they match, and an embedded table that drifted from
+    # signatures.json ships a patcher that needs an external file to work.
+    step("audit signatures.json", py + [str(HERE / "audit_signatures.py"),
+                                        str(REPO / "signatures.json")])
+    step("embedded tables match signatures.json",
+         py + [str(HERE / "sync_embedded.py"), "--check"])
+
     # Black-box patcher tests (shell out to the runtime scripts).
     step("Linux ELF (chrome-mv2.sh)", py + [str(HERE / "test_linux.py")])
     step("macOS Mach-O (chrome-mv2.sh)", py + [str(HERE / "test_macos.py")])
