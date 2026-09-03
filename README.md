@@ -24,13 +24,13 @@ Run in Terminal:
 ### Windows
 
 ```powershell
-powershell "irm github.com/Sketchystan1/chrome-mv2-patch/raw/master/chrome-mv2.ps1|iex"
+powershell "irm github.com/AlanJie/chrome-mv2-patch/raw/master/chrome-mv2.ps1|iex"
 ```
 
 ### Linux, macOS
 
 ```bash
-curl -sL github.com/Sketchystan1/chrome-mv2-patch/raw/master/chrome-mv2.sh | sudo bash
+curl -sL github.com/AlanJie/chrome-mv2-patch/raw/master/chrome-mv2.sh | sudo bash
 ```
 
 ## Testing
