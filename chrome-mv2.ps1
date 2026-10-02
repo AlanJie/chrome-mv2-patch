@@ -1,31 +1,24 @@
 <#
 .SYNOPSIS
-    Chrome / Chromium Manifest V2 Patcher - single-file, self-contained PowerShell
-    port for Windows (chrome.dll only; x64, x86, and arm64).
+    Google Chrome Manifest V2 Patcher - single-file, self-contained PowerShell
+    tool for Windows chrome.dll (x64, x86, and arm64).
 
 .DESCRIPTION
-    Re-enables Manifest V2 extension support in Google Chrome or Chromium (both
-    ship chrome.dll) by flipping the inlined IsExtensionAffected manifest-version
-    checks. Same milestone engine, same match/decline semantics, same .bak
-    handling. Handles x64/x86 (PE, PE32) and Windows-on-ARM (PE32+ arm64, machine
-    0xAA64).
+    Re-enables Manifest V2 extension support in official Google Chrome by
+    flipping the inlined IsExtensionAffected manifest-version checks. A clean
+    baseline is accepted only when Windows validates its Authenticode signature
+    and the leaf signer is Google LLC.
 
     Self-contained: the Windows signature tables are EMBEDDED in this file
-    ($EmbeddedSignatures below), so the script needs no signatures.json and no
-    other file to run. A signatures.json installed next to the script takes
-    precedence; another file must be selected explicitly with -Signatures.
-    Being self-contained is also what lets
-    it run straight from a URL (see the irm|iex example).
+    ($EmbeddedSignatures below). Runtime patch policy is never loaded from a
+    sidecar file or the network.
 
-    HOW IT PATCHES: for each gate, first probe the RVA recorded in the table -
-    cheap, and exact for the build the table was derived from. On a miss, scan
-    the whole .text section for the gate's byte signature; that is what relocates
-    a gate cleanly across point releases. A site counts as located only when its
-    signature matches EXACTLY expectedMatches times: a different count means the
-    layout moved, so the site is declined rather than guessed at. The milestone
-    with the most located sites wins; one that locates none is declined outright.
-    Then flip the gates, clear the Authenticode directory and recompute the PE
-    checksum.
+    HOW IT PATCHES: for each gate, scan the whole .text section for the gate's
+    byte signature. A site counts as located only when its signature matches
+    EXACTLY expectedMatches times: a different count means the layout changed,
+    so the site is declined rather than guessed at. Partial milestones are never
+    written. Then flip the gates, clear the Authenticode directory, recompute the
+    PE checksum, and verify that no other bytes changed.
 
     CARDINAL RULE: never delete or blank a call and never invent control flow -
     only flip the direction of an existing branch to its EXISTING target.
@@ -69,16 +62,8 @@
     Leave the browser closed after the change instead of reopening it with the
     tabs it had.
 
-    .PARAMETER AllowPartial
-    Developer-only override which permits writing a milestone when only some of
-    its sites were located. The safe default is to decline partial layouts.
-
     .PARAMETER ForceRestore
     Restore even when the backup identity does not match the installed binary.
-
-    .PARAMETER Signatures
-    Explicit external signatures.json path. External data is never loaded from
-    the current directory implicitly.
 
 .EXAMPLE
     .\chrome-mv2.ps1
@@ -87,8 +72,8 @@
 .EXAMPLE
     .\chrome-mv2.ps1 restore
 .EXAMPLE
-    # Run directly from a URL (self-elevates via UAC; keep the window open):
-    powershell -ExecutionPolicy Bypass -c "irm https://example.com/chrome-mv2.ps1 | iex"
+    # Run a locally reviewed copy (self-elevates via UAC when needed):
+    powershell -ExecutionPolicy Bypass -File .\chrome-mv2.ps1
 #>
 
 [CmdletBinding()]
@@ -106,13 +91,9 @@ param(
     [Alias('q')]
     [switch]$Quiet,
 
-    [switch]$AllowPartial,
-
     [switch]$ForceRestore,
 
     [switch]$NoReopen,
-
-    [string]$Signatures,
 
     [Alias('v')]
     [switch]$Version,
@@ -124,8 +105,7 @@ param(
 Set-StrictMode -Version Latest
 $ErrorActionPreference = 'Stop'
 
-$AppVersion      = '1.7.0'
-$SignaturesFile  = 'signatures.json'
+$AppVersion      = '1.7.1'
 $script:CsLoaded = $false
 
 # Embedded Windows signature tables - see the .DESCRIPTION note. An external
@@ -423,6 +403,27 @@ public static class Mv2Native
         return (uint)(checksum + (ulong)data.LongLength);
     }
 
+    // Return changed file offsets that are outside the caller's explicit
+    // whitelist. The hot loop stays in C# because chrome.dll is hundreds of MB.
+    public static long[] UnexpectedDiffs(byte[] before, byte[] after, long[] allowedOffsets, int maxReport)
+    {
+        var bad = new List<long>();
+        if (before == null || after == null || before.LongLength != after.LongLength)
+        {
+            bad.Add(-1);
+            return bad.ToArray();
+        }
+        var allowed = new HashSet<long>(allowedOffsets ?? new long[0]);
+        for (long i = 0; i < before.LongLength; i++)
+        {
+            if (before[i] == after[i]) continue;
+            if (allowed.Contains(i)) continue;
+            bad.Add(i);
+            if (bad.Count >= maxReport) break;
+        }
+        return bad.ToArray();
+    }
+
     // Report-only structural scan for the decline path. Never writes.
     public static long[] SkeletonScan(byte[] buf, long textRaw, long textSize)
     {
@@ -457,46 +458,14 @@ public static class Mv2Native
 }
 
 # ============================================================================
-# Signature loading. The milestone tables are embedded in this
-# file ($EmbeddedSignatures); an external signatures.json overrides them if
-# present, so new data can be shipped without editing the script. Another path
-# must be supplied explicitly with -Signatures.
+# Signature loading. Runtime patch policy is embedded in this reviewed script.
+# The repository's signatures.json remains a development/source-of-truth artifact;
+# it is never loaded by the runtime patcher.
 # ============================================================================
 
-# An explicit -Signatures path wins, followed by signatures.json beside the
-# script. $null means neither exists, so the embedded tables are used.
-function Get-SignaturesPath {
-    if ($Signatures) {
-        if (-not (Test-Path -LiteralPath $Signatures -PathType Leaf)) {
-            throw "signature file does not exist: $Signatures"
-        }
-        return (Resolve-Path -LiteralPath $Signatures).Path
-    }
-
-    # A file installed beside the script is part of the tool distribution and
-    # may override the embedded tables. Never trust an admin's current directory
-    # implicitly: an unrelated signatures.json there must have no effect.
-    if ($PSScriptRoot) {
-        $besideScript = Join-Path $PSScriptRoot $SignaturesFile
-        if (Test-Path -LiteralPath $besideScript -PathType Leaf) { return $besideScript }
-    }
-    return $null
-}
-
-# Reads and parses the active signature document (external file if present,
-# otherwise the embedded copy).
 function Read-SignatureJson {
-    $path = Get-SignaturesPath
-    if ($path) {
-        try   { $raw = Get-Content -LiteralPath $path -Raw }
-        catch { throw "reading ${path}: $_" }
-        $srcLabel = $path
-    } else {
-        $raw = $EmbeddedSignatures
-        $srcLabel = 'embedded tables'
-    }
-    try   { return ($raw | ConvertFrom-Json) }
-    catch { throw "parsing ${srcLabel}: $_" }
+    try   { return ($EmbeddedSignatures | ConvertFrom-Json) }
+    catch { throw "parsing embedded signature tables: $_" }
 }
 
 # "7F34EB" -> [byte[]](0x7F, 0x34, 0xEB). The leading comma on the return is
@@ -679,11 +648,21 @@ function Open-PeImage {
         throw "not a valid Chrome file: .text raw data is out of bounds"
     }
 
-    # PE32+ carries both x64 (machine 0x8664) and Windows-on-ARM arm64 (0xAA64);
-    # the machine field splits them so an arm64 dll matches only pe-arm64
-    # milestones (the arm64 'bcond' flip) and never the x64 'pe' jg tables.
+    # Accept only architectures with an explicit patch encoding. Never treat an
+    # unknown PE32+ machine as x64 by default.
     $machine = [BitConverter]::ToUInt16($Buf, $eLfanew + 4)
-    $format  = if ($is32) { 'pe32' } elseif ($machine -eq 0xAA64) { 'pe-arm64' } else { 'pe' }
+    if ($is32) {
+        if ($machine -ne 0x014C) {
+            throw ("not a supported Chrome file: PE32 machine 0x{0:X4} is not x86" -f $machine)
+        }
+        $format = 'pe32'
+    } else {
+        switch ($machine) {
+            0x8664 { $format = 'pe' }
+            0xAA64 { $format = 'pe-arm64' }
+            default { throw ("not a supported Chrome file: PE32+ machine 0x{0:X4} is not x64/arm64" -f $machine) }
+        }
+    }
 
     return [pscustomobject]@{
         Format     = $format                               # matches a milestone's "container"
@@ -699,13 +678,20 @@ function Open-PeImage {
     }
 }
 
-# A non-zero Security Directory means an untouched, signed stock chrome.dll
-# (this tool zeroes it when patching).
-function Test-LikelyStock {
-    param($Img, [byte[]]$Buf)
-    $va = [BitConverter]::ToUInt32($Buf, $Img.SecDirAt)
-    $sz = [BitConverter]::ToUInt32($Buf, $Img.SecDirAt + 4)
-    return ($va -ne 0 -and $sz -ne 0)
+# Provenance gate for every file that may become or remain the clean baseline.
+# The Security Directory alone is not evidence of provenance: require a valid
+# Windows Authenticode chain and Google LLC as the leaf signer.
+function Test-GoogleAuthenticode {
+    param([string]$Path)
+    try {
+        $sig = Get-AuthenticodeSignature -LiteralPath $Path -ErrorAction Stop
+        if ([string]$sig.Status -ne 'Valid' -or $null -eq $sig.SignerCertificate) { return $false }
+        $simpleName = $sig.SignerCertificate.GetNameInfo(
+            [Security.Cryptography.X509Certificates.X509NameType]::SimpleName, $false)
+        return ($simpleName -eq 'Google LLC')
+    } catch {
+        return $false
+    }
 }
 
 # Clears the Authenticode Security Directory and writes the recomputed checksum
@@ -839,6 +825,9 @@ function Read-ValidatedBackup {
     param([string]$BackupPath)
 
     if (-not (Test-Path -LiteralPath $BackupPath -PathType Leaf)) { throw "No backup found at: $BackupPath" }
+    if (-not (Test-GoogleAuthenticode -Path $BackupPath)) {
+        throw "The backup does not have a valid Google LLC Authenticode signature."
+    }
     $buf = [IO.File]::ReadAllBytes($BackupPath)
     if ($buf.Length -eq 0) { throw 'The backup file is empty.' }
     $img = Open-Image $buf
@@ -913,27 +902,23 @@ function Find-AffectedJgSites {
     param([byte[]]$Buf, $Img, $Site)
 
     $textRVA = [int64]$Img.TextRVA; $textRaw = [int64]$Img.TextRaw; $textSize = [int64]$Img.TextSize
-
-    # Shortcut only when the site is expected to be unique - a shared-body site
-    # (expectedMatches > 1) must always scan so it finds every copy.
-    if ($Site.ExpectedMatches -eq 1 -and
-        $Site.JgRVA -ge $textRVA -and ($Site.JgRVA - $textRVA) -lt $textSize) {
-        $jgRaw = $textRaw + ($Site.JgRVA - $textRVA)
-        $sigStart = $jgRaw - $Site.JgOff
-        if ($sigStart -ge 0 -and (Test-SigAt -Buf $Buf -Start $sigStart -Sig $Site.Sig -JgOff $Site.JgOff -Kind $Site.Kind)) {
-            return [pscustomobject]@{ Found = @([int64]$jgRaw); Relocated = $false }
-        }
-    }
-
     if ($textSize -lt $Site.Sig.Length) {
         return [pscustomobject]@{ Found = @(); Relocated = $false }
     }
 
+    # Always scan the whole code section (stopping only after expectedMatches + 1).
+    # A recorded RVA hit must never hide an additional ambiguous match elsewhere.
     Initialize-NativeHelpers
     $hits = [Mv2Native]::Scan($Buf, $textRaw, $textSize, $Site.Sig, $Site.JgOff, $Site.Kind, $Site.ExpectedMatches)
+
+    $recordedRaw = [int64]-1
+    if ($Site.JgRVA -ge $textRVA -and ($Site.JgRVA - $textRVA) -lt $textSize) {
+        $recordedRaw = $textRaw + ([int64]$Site.JgRVA - $textRVA)
+    }
+    $relocated = ($hits.Count -gt 0 -and -not (@($hits) -contains $recordedRaw))
     return [pscustomobject]@{
         Found     = @($hits)
-        Relocated = ($hits.Count -gt 0)
+        Relocated = $relocated
     }
 }
 
@@ -956,7 +941,6 @@ function Invoke-PatchMilestones {
         [byte[]]$Buf,
         $Img,
         [array]$Milestones,
-        [bool]$AllowPartial = $false,
         [bool]$Apply = $true,
         [string]$Version = ''    # display-only: the target's detected version
     )
@@ -1025,8 +1009,8 @@ function Invoke-PatchMilestones {
         Write-Warn $res.Reason
         return $res
     }
-    if (-not $res.Full -and -not $AllowPartial) {
-        $res.Reason = "only $($res.Located) of $($res.Total) changes matched; a partial patch needs -AllowPartial"
+    if (-not $res.Full) {
+        $res.Reason = "only $($res.Located) of $($res.Total) changes matched; partial patches are refused"
         Write-Warn $res.Reason
         return $res
     }
@@ -1109,27 +1093,44 @@ function Invoke-PatchMilestones {
 }
 
 function Test-PatchOutput {
-    param([byte[]]$Buf, $Img, $Patch)
+    param([byte[]]$Before, [byte[]]$Buf, $Img, $Patch)
+
+    if ($Before.LongLength -ne $Buf.LongLength) { return $false }
+
+    $allowed = [System.Collections.Generic.List[long]]::new()
     foreach ($w in $Patch.Written) {
         $off = [int64]$Img.TextRaw + ([int64]$w.RVA - [int64]$Img.TextRVA)
         if ($off -lt 0 -or $off + $w.Bytes.Length -gt $Buf.LongLength) { return $false }
         for ($i = 0; $i -lt $w.Bytes.Length; $i++) {
             if ($Buf[$off + $i] -ne $w.Bytes[$i]) { return $false }
+            $allowed.Add($off + $i)
         }
     }
-    return ($Patch.Written.Count -gt 0)
+    if ($Patch.Written.Count -eq 0) { return $false }
+
+    # Complete-Image is allowed to alter only the Security Directory entry and
+    # the PE checksum in addition to the audited MV2 branch bytes.
+    for ($i = 0; $i -lt 8; $i++) { $allowed.Add([int64]$Img.SecDirAt + $i) }
+    for ($i = 0; $i -lt 4; $i++) { $allowed.Add([int64]$Img.ChecksumAt + $i) }
+
+    Initialize-NativeHelpers
+    $bad = [Mv2Native]::UnexpectedDiffs($Before, $Buf, $allowed.ToArray(), 16)
+    if ($bad.Count -gt 0) {
+        $where = ($bad | ForEach-Object {
+            if ($_ -lt 0) { '<length mismatch>' } else { '0x{0:X}' -f $_ }
+        }) -join ', '
+        Write-Warn "Unexpected binary differences outside the patch whitelist: $where"
+        return $false
+    }
+    return $true
 }
 
 function Get-CleanStockLayout {
-    param([byte[]]$Buf, $Img, [array]$Milestones, [bool]$AllowPartialLayout = $false)
-    # A read-only validation probe: Invoke-PatchMilestones with -Apply $false
-    # never writes to $Buf, so it is passed through directly (no defensive clone
-    # of the 285 MB buffer). Suppress the per-site "stock jg at RVA ..." host
-    # output (stream 6) - callers print their own one-line summary.
-    $probe = Invoke-PatchMilestones -Buf $Buf -Img $Img -Milestones $Milestones `
-        -AllowPartial $AllowPartialLayout -Apply $false 6>$null
+    param([byte[]]$Buf, $Img, [array]$Milestones)
+    # A clean baseline must match one complete, unambiguous milestone.
+    $probe = Invoke-PatchMilestones -Buf $Buf -Img $Img -Milestones $Milestones -Apply $false 6>$null
     $clean = ($probe.Status -ne 0 -and $probe.Stock -gt 0 -and $probe.Already -eq 0 -and
-        ($probe.Full -or $AllowPartialLayout) -and -not $probe.Reason)
+        $probe.Full -and -not $probe.Reason)
     return [pscustomobject]@{ Clean = $clean; Probe = $probe }
 }
 
@@ -1451,10 +1452,8 @@ function Invoke-SelfElevate {
         if ($ResolvedTargetPath)  { $argv += (Get-QuotedArg $ResolvedTargetPath) }
         if ($Yes)   { $argv += '-Yes' }
         if ($Quiet) { $argv += '-Quiet' }
-        if ($AllowPartial) { $argv += '-AllowPartial' }
         if ($ForceRestore) { $argv += '-ForceRestore' }
         if ($NoReopen) { $argv += '-NoReopen' }
-        if ($Signatures) { $argv += '-Signatures'; $argv += (Get-QuotedArg ([IO.Path]::GetFullPath($Signatures))) }
         $argv += '-Relaunched'
 
         Write-Info 'Asking for admin access...'
@@ -2209,11 +2208,10 @@ function Invoke-Patch {
     # Recognize the build up front so the signature table it uses is reported
     # before the backup policy runs. The matcher accepts stock and already-
     # patched bytes alike, so this works whether or not the target is patched.
-    # Declines (unrecognized / tied / partial without -AllowPartial) stay silent
+    # Declines (unrecognized / tied / partial) stay silent
     # here - the backup policy and the apply pass below print their own reasons.
     Write-Info 'Searching for MV2 signatures...'
-    $recognized = Invoke-PatchMilestones -Buf $buf -Img $img -Milestones $milestones `
-        -AllowPartial $AllowPartial.IsPresent -Apply $false 6>$null
+    $recognized = Invoke-PatchMilestones -Buf $buf -Img $img -Milestones $milestones -Apply $false 6>$null
     if ($recognized.Status -ne 0 -and -not $recognized.Reason) {
         Write-Ok ("Found matching signatures ({0}, {1} gates)." -f $recognized.Milestone, $recognized.Located)
     }
@@ -2222,13 +2220,12 @@ function Invoke-Patch {
     # same PE build. A patched/unsigned target can never become a new baseline.
     $backupPath = Get-BackupPath $Target.Path
     if (-not (Test-Path -LiteralPath $backupPath -PathType Leaf)) {
-        if (-not (Test-LikelyStock -Img $img -Buf $buf)) {
-            Write-Err "There's no backup yet, and this Chrome has already been changed."
-            Write-Host '    Reinstall Chrome first so we can save a clean backup.'
+        if (-not (Test-GoogleAuthenticode -Path $Target.Path)) {
+            Write-Err "There's no backup yet, and this file is not a valid Google-signed Chrome."
+            Write-Host '    Reinstall or update Google Chrome first so we can save a trusted clean backup.'
             return 1
         }
-        $stockLayout = Get-CleanStockLayout -Buf $buf -Img $img -Milestones $milestones `
-            -AllowPartialLayout $AllowPartial.IsPresent
+        $stockLayout = Get-CleanStockLayout -Buf $buf -Img $img -Milestones $milestones
         if (-not $stockLayout.Clean) {
             Write-Err "There's no backup yet, and this doesn't look like an untouched Chrome."
             return 1
@@ -2243,25 +2240,19 @@ function Invoke-Patch {
             Write-Err "The backup couldn't be verified: $_"
             return 1
         }
-        if (-not (Test-LikelyStock -Img $backup.Img -Buf $backup.Buf)) {
-            Write-Err "The backup doesn't look like an original Chrome, so I won't use it."
-            return 1
-        }
-        $backupLayout = Get-CleanStockLayout -Buf $backup.Buf -Img $backup.Img -Milestones $milestones `
-            -AllowPartialLayout $AllowPartial.IsPresent
+        $backupLayout = Get-CleanStockLayout -Buf $backup.Buf -Img $backup.Img -Milestones $milestones
         if (-not $backupLayout.Clean) {
             Write-Err "The backup doesn't look like an untouched Chrome."
             return 1
         }
 
         if (-not (Test-SameBuildIdentity -A $targetIdentity -B $backup.Identity)) {
-            if (-not (Test-LikelyStock -Img $img -Buf $buf)) {
-                Write-Err "Chrome was updated, but this copy has already been changed."
-                Write-Host '    Reinstall or update Chrome so we can start from a clean copy.'
+            if (-not (Test-GoogleAuthenticode -Path $Target.Path)) {
+                Write-Err "Chrome was updated, but the new file is not a valid Google-signed Chrome."
+                Write-Host '    Reinstall or update Google Chrome so we can start from a trusted clean copy.'
                 return 1
             }
-            $newStockLayout = Get-CleanStockLayout -Buf $buf -Img $img -Milestones $milestones `
-                -AllowPartialLayout $AllowPartial.IsPresent
+            $newStockLayout = Get-CleanStockLayout -Buf $buf -Img $img -Milestones $milestones
             if (-not $newStockLayout.Clean) {
                 Write-Err "This updated Chrome isn't fully supported yet."
                 return 1
@@ -2278,8 +2269,7 @@ function Invoke-Patch {
     $img = Open-Image $buf
 
     Write-Info 'Applying patch...'
-    $patch = Invoke-PatchMilestones -Buf $buf -Img $img -Milestones $milestones `
-        -AllowPartial $AllowPartial.IsPresent -Apply $true -Version $chromeVer 6>$null
+    $patch = Invoke-PatchMilestones -Buf $buf -Img $img -Milestones $milestones -Apply $true -Version $chromeVer 6>$null
     if ($patch.Status -eq 0) {
         Write-Err 'Something went wrong while preparing the change - nothing was changed.'
         return 1
@@ -2289,7 +2279,7 @@ function Invoke-Patch {
     Write-Ok $msg
 
     Complete-Image -Img $img -Buf $buf
-    if (-not (Test-PatchOutput -Buf $buf -Img $img -Patch $patch)) {
+    if (-not (Test-PatchOutput -Before $backup.Buf -Buf $buf -Img $img -Patch $patch)) {
         Write-Err 'Something went wrong while preparing the change - nothing was changed.'
         return 1
     }
@@ -2337,16 +2327,9 @@ function Invoke-Restore {
     }
     try { $backup = Read-ValidatedBackup $backupPath }
     catch { Write-Err "The backup couldn't be verified: $_"; return 1 }
-    if (-not (Test-LikelyStock -Img $backup.Img -Buf $backup.Buf)) {
-        Write-Err "The backup doesn't look like an original Chrome, so I won't use it."
-        return 1
-    }
-    $milestones = @(Import-Milestones | Where-Object { $_.Container -eq $backup.Img.Format })
-    $backupLayout = Get-CleanStockLayout -Buf $backup.Buf -Img $backup.Img -Milestones $milestones -AllowPartialLayout $true
-    if (-not $backupLayout.Clean) {
-        Write-Err "The backup doesn't look like an untouched Chrome."
-        return 1
-    }
+    # Read-ValidatedBackup already verified both the saved hash metadata and
+    # Google LLC Authenticode signature. Restore must not depend on whether this
+    # script already knows the Chrome version's MV2 layout.
     Write-Ok 'Backup found.'
 
     $current = [IO.File]::ReadAllBytes($Target.Path)
@@ -2392,7 +2375,7 @@ function Invoke-Check {
     $identity = Get-PeIdentity -Buf $buf -Img $img
 
     $milestones = @(Import-Milestones | Where-Object { $_.Container -eq $img.Format })
-    $probe = Invoke-PatchMilestones -Buf $buf -Img $img -Milestones $milestones -AllowPartial $true -Apply $false -Version $chromeVer 6>$null
+    $probe = Invoke-PatchMilestones -Buf $buf -Img $img -Milestones $milestones -Apply $false -Version $chromeVer 6>$null
     if ($probe.Status -eq 0) {
         if ($probe.Reason -match 'tied') { Write-Warn "Couldn't tell which Chrome version this is." }
         else { Write-Warn "This Chrome version isn't recognized yet." }
