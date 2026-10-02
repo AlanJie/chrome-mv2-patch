@@ -99,8 +99,12 @@ try {
             @{ name='gate'; kind='short'; jgRVA='0x00001044'; jgOff=4; expectedMatches=1; sig='837E50027F2F554889E5' }
         ) }
     )
-    $script:Signatures = $sigPath
-    $script:AllowPartial = [switch]$false
+    Assert-True (-not (Test-GoogleAuthenticode -Path $target)) 'synthetic PE must not pass the Google provenance gate'
+    # Production runtime accepts only the embedded policy and Google-signed input.
+    # White-box tests replace the in-memory embedded JSON and mock provenance only
+    # after confirming the real gate rejects this synthetic fixture.
+    $script:EmbeddedSignatures = Get-Content -LiteralPath $sigPath -Raw
+    function Test-GoogleAuthenticode { param([string]$Path) return $true }
     $script:ForceRestore = [switch]$false
     $targetObj = [pscustomobject]@{ Path=$target; Channel='Test'; Running=$false; Holders=0 }
 
@@ -157,8 +161,20 @@ try {
         [pscustomobject]@{ Name='a'; Container='pe'; Sites=$partialMilestones[0].Sites },
         [pscustomobject]@{ Name='b'; Container='pe'; Sites=$partialMilestones[0].Sites }
     )
-    $ambiguousResult = Invoke-PatchMilestones -Buf ([IO.File]::ReadAllBytes($pePath)) -Img $partialImg -Milestones $ambiguous -AllowPartial $true -Apply $true
+    $ambiguousResult = Invoke-PatchMilestones -Buf ([IO.File]::ReadAllBytes($pePath)) -Img $partialImg -Milestones $ambiguous -Apply $true
     Assert-True ($ambiguousResult.Status -eq 0 -and $ambiguousResult.Reason -match 'tied') 'ambiguous partial layouts should be declined'
+
+    # A recorded RVA hit must not hide a second identical signature elsewhere.
+    $duplicateBuf = [IO.File]::ReadAllBytes($pePath)
+    [Array]::Copy($near, 0, $duplicateBuf, 0x4C0, $near.Length)
+    $duplicateImg = Open-Image $duplicateBuf
+    $uniqueMilestone = @(
+        [pscustomobject]@{ Name='unique'; Container='pe'; Sites=@(
+            [pscustomobject]@{ Name='gate'; Kind=1; JgRVA=[uint32]0x1044; Sig=$near; JgOff=4; ExpectedMatches=1 }
+        ) }
+    )
+    $duplicateResult = Invoke-PatchMilestones -Buf $duplicateBuf -Img $duplicateImg -Milestones $uniqueMilestone -Apply $false
+    Assert-True ($duplicateResult.Status -eq 0) 'a second global signature match must make a unique site fail closed'
 
     # --- Windows on ARM (pe-arm64 / bcond) -----------------------------------
     # arm64 gate: cmp w,#2 ; b.gt ; nop ; cmp w,#1. The flip rewrites ONLY the
@@ -190,7 +206,7 @@ try {
             @{ name='gate'; kind='bcond'; jgRVA='0x00001044'; jgOff=4; expectedMatches=1; sig='1F0900718C0000541F2003D51F050071' }
         ) }
     )
-    $script:Signatures = $armSigPath
+    $script:EmbeddedSignatures = Get-Content -LiteralPath $armSigPath -Raw
     $armObj = [pscustomobject]@{ Path=$armTarget; Channel='Test'; Running=$false; Holders=0 }
     Assert-True ((Invoke-Patch -Target $armObj -AssumeYes $true) -eq 0) 'arm64 synthetic PE patch should succeed'
     Assert-True (([IO.File]::ReadAllBytes($armTarget))[0x444] -eq 0x8E) 'patch should flip b.gt (0x8C) -> b.al (0x8E)'
@@ -201,7 +217,7 @@ try {
     Assert-True ((Invoke-Restore -Target $armObj -AssumeYes $true) -eq 0) 'arm64 restore should succeed'
     Assert-True (([IO.File]::ReadAllBytes($armTarget))[0x444] -eq 0x8C) 'restore should recover the stock b.gt byte'
     Assert-True (-not (Test-Path -LiteralPath "$armTarget.bak")) 'arm64 restore should remove the backup'
-    $script:Signatures = $sigPath
+    $script:EmbeddedSignatures = Get-Content -LiteralPath $sigPath -Raw
 
     # --- window pause decision -----------------------------------------------
     # An interactive run always holds the window open ("Press Enter to exit."),
