@@ -19,18 +19,32 @@ Re-enables Manifest V2 extensions in Chrome by patching a few bytes. See [`mv2-r
 
 ## Usage
 
-Run in Terminal:
-
-### Windows
+For Windows, use a **locally reviewed copy** of the script. Do not pipe a moving
+GitHub branch directly into PowerShell.
 
 ```powershell
-powershell "irm github.com/AlanJie/chrome-mv2-patch/raw/master/chrome-mv2.ps1|iex"
+git clone https://github.com/AlanJie/chrome-mv2-patch.git
+cd chrome-mv2-patch
+powershell -ExecutionPolicy Bypass -File .\chrome-mv2.ps1
 ```
+
+The Windows patcher is intentionally offline at runtime. Before creating or
+refreshing its clean backup, it requires Windows to validate the target
+`chrome.dll` Authenticode signature and requires the leaf signer to be
+`Google LLC`. It also refuses partial signature matches and verifies that the
+prepared output differs from the Google-signed backup only at the audited MV2
+branch bytes plus the PE checksum/security-directory metadata.
 
 ### Linux, macOS
 
+The Unix script is still inherited from the upstream legacy architecture and has
+not yet received the same provenance hardening as the Windows path. Review and
+run a local checkout instead of piping network content into a root shell.
+
 ```bash
-curl -sL github.com/AlanJie/chrome-mv2-patch/raw/master/chrome-mv2.sh | sudo bash
+git clone https://github.com/AlanJie/chrome-mv2-patch.git
+cd chrome-mv2-patch
+sudo bash chrome-mv2.sh
 ```
 
 ## Testing
